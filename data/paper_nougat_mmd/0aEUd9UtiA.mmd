@@ -1,0 +1,479 @@
+# DiffCPS: Diffusion-based Constrained Policy Search for Offline Reinforcement Learning
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Constrained policy search (CPS) is a fundamental problem in offline reinforcement learning, which is generally solved by advantage weighted regression (AWR). However, previous methods may still encounter out-of-distribution actions due to the limited expressivity of Gaussian-based policies. On the other hand, directly applying the state-of-the-art models with distribution expression capabilities (i.e., diffusion models) in the AWR framework is insufficient since AWR requires exact policy probability densities, which is intractable in diffusion models. In this paper, we propose a novel approach called **Diffusion-based Constrained Policy Search** (**DiffCPS**), which tackles the diffusion-based constrained policy search without resorting to AWR. The theoretical analysis reveals our key insights by leveraging the action distribution of the diffusion model to eliminate the policy distribution constraint in the CPS and then utilizing the Evidence Lower Bound (ELBO) of diffusion-based policy to approximate the KL constraint. Consequently, DiffCPS admits the high expressivity of diffusion models while circumventing the cumbersome density calculation brought by AWR. Extensive experimental results based on the D4RL benchmark demonstrate the efficacy of our approach. We empirically show that DiffCPS achieves better or at least competitive performance compared to traditional AWR-based baselines as well as recent diffusion-based offline RL methods.
+
+## 1 Introduction
+
+Offline Reinforcement Learning (offline RL) aims to seek an optimal policy without environmental interactions (Fujimoto et al., 2019; Levine et al., 2020). This is compelling for having the potential to transform large-scale datasets into powerful decision-making tools and avoids costly and risky online data collection, which offers significant application prospects in fields such as healthcare (Nie et al., 2021; Tseng et al., 2017) and autopilot (Yurtsever et al., 2020; Rhinehart et al., 2018).
+
+Notwithstanding its promise, applying contemporary off-policy RL algorithms (Lillicrap et al., 2015; Fujimoto et al., 2018; Haarnoja et al., 2018; b) directly into the offline context presents challenges due to distribution shift (Fujimoto et al., 2019; Levine et al., 2020). Previous methods to mitigate this issue under the model-free offline RL setting generally fall into three categories: 1) value function-based approaches, which implement pessimistic value estimation by assigning low values to out-of-distribution actions (Kumar et al., 2020; Fujimoto et al., 2019), 2) sequential modeling approaches, which casts offline RL as a sequence generation task with return guidance (Chen et al., 2021; Janner et al., 2022; Liang et al., 2023; Ajay et al., 2022), and 3) constrained policy search (CPS) approaches, which regularizes the discrepancy between the learned policy and behavior policy (Peters et al., 2010; Peng et al., 2019; Nair et al., 2020). We focus on the CPS-based offline RL due to its convergence guarantee and outstanding performance in a wide range of tasks.
+
+Prior solutions for CPS (Peters et al., 2010; Peng et al., 2019; Nair et al., 2020) primarily train a parameterized unimodal Gaussian policy through weighted regression. However, recent works (Chen et al., 2022; Hansen-Estruch et al., 2023; Shafullah et al., 2022) show such unimodal Gaussian models in weighted regression will impair the policy performance due to limited distributional expressivity. For example, if we fit a multi-modal distribution with an unimodal Gaussian distribution,it will unavoidably result in covering the low-density area between peaks. Intuitively, we can choose a more expressive model to eliminate this issue. Nevertheless, Ghasemipour et al. (2020) shows that VAEs (Kingma & Welling, 2013) in BCQ (Fujimoto et al., 2019) do not align well with the behavior dataset, which will introduce the biases in generated actions. Chen et al. (2022) utilizes the diffusion probabilistic model (Sohl-Dickstein et al., 2015; Ho et al., 2020; Song & Ermon, 2019) to generate actions and select the action through the action evaluation model under the well-studied AWR framework. However, AWR requires an exact probability density of behavior policy, which is still intractable for the diffusion-based one. Alternatively, they leverage Monte Carlo sampling to approximate the probability density of behavior policy, which inevitably introduces estimation biases and increases the cost of inference. According to motivating examples in Section 3.1, we visually demonstrate how these issues are pronounced even on a simple bandit task.
+
+To solve the above issues, we present **Diffusion-based Constrained Policy Search (**DiffCPS**) which directly solves the constrained policy search problem with a diffusion-based policy. Thereby, we can solve the limited policy expressivity problem and avoid the sampling errors caused by directly using diffusion in AWR. Our proposed method consists of three key parts: 1) We demonstrate that if we use the diffusion model as our policy, we can eliminate the policy distribution constraint in the CPS through the action distribution of the diffusion model; 2) We transform the CPS problem to a convex optimization problem and solve it via Lagrange dual method. We also prove the equivalence between the Lagrange dual problem and the primal convex optimization problem; 3) We approximate the entropy calculation in the Lagrange dual problem with the ELBO of the diffusion-based policy to circumvent the intractable density calculation. Finally, we solve the Lagrange dual problem with gradient descent.
+
+The main contributions of this paper are as follows: 1) We present DiffCPS, which tackles the diffusion-based constrained policy search without resorting to AWR. Thereby, DiffCPS solves the limited policy expressivity problem while avoiding the cumbersome density calculation brought by AWR. 2) We prove that the policy distribution constraint always holds for diffusion-based policy. 3) We prove that the policy constraint can be approximated through the ELBO of diffusion-based policy. 4) Our experimental results illustrate superior or competitive performance compared to existing offline RL methods in D4RL tasks. Even when compared to other diffusion-based methods, DiffCPS also achieves state-of-the-art performance in D4RL MuJoCo locomotion and AntMaze average score. These outcomes substantiate the effectiveness of our method.
+
+## 2 Preliminaries
+
+**Notation:** In this paper, we use \(\mu_{\theta}(\mathbf{a}|\mathbf{s})\) or \(\mu\) to denote the learned policy with parameter \(\theta\) and \(\pi_{b}\) to denote behavior policy that generated the offline data. We use superscripts \(i\) to denote diffusion timestep and subscripts \(t\) to denote RL trajectory timestep. For instance, \(a_{t}^{i}\) denotes the \(t\)-th action in \(i\)-th diffusion timestep.
+
+### Constrained Policy Search in Offline RL
+
+Consider a Markov decision process (MDP): \(M=\{S,\mathcal{A},P,R,\gamma,d_{0}\}\), with state space \(S\), action space \(\mathcal{A}\), environment dynamics \(\mathcal{P}(\mathbf{s}^{\prime}|\mathbf{s},\mathbf{a}):S\times S\times\mathcal{A}\to[0,1]\), reward function \(R:S\times\mathcal{A}\to\mathbb{R}\), discount factor \(\gamma\in[0,1)\), and initial state distribution \(d_{0}\). The action-value or Q-value of policy \(\mu\) is defined as \(Q^{\mu}(\mathbf{s}_{t},\mathbf{a}_{t})=\mathbb{E}_{\mathbf{a}_{t+1},\mathbf{a}_{t+2},\ldots, \mu}\left[\sum_{j=0}^{\infty}\gamma^{j}r(\mathbf{s}_{t+j},\mathbf{a}_{t+j})\right]\). Our goal is to get a policy to maximize the cumulative discounted reward \(J(\theta)=\int_{S}d_{0}(\mathbf{s})Q^{\mu}(\mathbf{s},\mathbf{a})ds\), where \(\rho^{\mu}(\mathbf{s})=\sum_{t=0}^{\infty}\gamma^{t}\rho_{\mu}(\mathbf{s}_{t}=\mathbf{s})\) is the unnormalized discounted state visitation frequencies induced by the policy \(\mu\) and \(p_{\mu}(\mathbf{s}_{t}=\mathbf{s})\) is the likelihood of the policy being in state \(\mathbf{s}\) after following \(\mu\) for \(t\) timesteps (Sutton & Barto, 2018; Peng et al., 2019).
+
+In offline setting (Fujimoto et al., 2019), environmental interaction is not allowed, and a static dataset \(\mathcal{D}\triangleq\{(\mathbf{s},\mathbf{a},\mathbf{r},\mathbf{s}^{\prime},\text{done})\}\) is used to learn a policy. To avoid out-of-distribution actions, we need to restrict the learned policy \(\mu\) to be not far away from the behavior policy \(\pi_{b}\) by the KL divergence constraint. Prior works (Peters et al., 2010; Peng et al., 2019) formulate the above offline RL optimization problem as a constrained policy search and its standard form is as follows
+
+\[\mu^{*}=\arg\max_{\mu}\,J(\mu)=\arg\max_{\mu}\,\int_{\mathcal{S}}d_{0 }(\mathbf{s})\int_{\mathcal{A}}Q^{\mu}(\mathbf{s},\mathbf{a})d\mathbf{a}\mathbf{d}\mathbf{s}\] \[s.t.\quad D_{\mathrm{KL}}(\pi_{b}(\cdot|\mathbf{s})\|\mu(\cdot|\mathbf{s }))\leq\epsilon,\quad\forall\mathbf{s} \tag{1}\] \[\qquad\qquad\int_{\mathbf{a}}\mu(\mathbf{a}|\mathbf{s})d\mathbf{a}=1,\quad\forall \mathbf{s},\]
+
+Previous works (Peters et al., 2010; Peng et al., 2019; Nair et al., 2020) solved Equation 1 through KKT conditions and get the optimal policy \(\pi^{*}\):
+
+\[\pi^{*}(\mathbf{a}|\mathbf{s})=\frac{1}{Z(\mathbf{s})}\,\pi_{b}(\mathbf{a}|\mathbf{s} )\,\exp\left(\alpha Q_{\phi}(\mathbf{s},\mathbf{a})\right), \tag{2}\]
+
+where \(Z(\mathbf{s})\) is the partition function. Intuitively we can use Equation 2 to optimize policy \(\pi\). However, the behavior policy may be very diverse and hard to model. To avoid modeling the behavior policy, prior works (Peng et al., 2019; Wang et al., 2020; Chen et al., 2020) optimize \(\pi^{*}\) through a parameterized policy \(\pi\theta\):
+
+\[\arg\min_{\theta} \mathbb{E}_{\mathbf{s}\sim D^{\mu}}\left[D_{\mathrm{KL}}\left(\pi^{*} (\cdot|\mathbf{s})||\pi_{\theta}(\cdot|\mathbf{s})\right)\right]\] \[= \arg\max_{\theta} \mathbb{E}_{(\mathbf{s},\mathbf{a})\sim D^{\mu}}\left[\frac{1}{Z(\mathbf{s}) }\text{log }\pi_{\theta}(\mathbf{a}|\mathbf{s})\,\exp\left(\alpha Q_{\phi}(\mathbf{s}, \mathbf{a})\right)\right]. \tag{3}\]
+
+Equation 3 is known as AWR, with \(\exp(\alpha Q_{\phi}(\mathbf{s},\mathbf{a}))\) being the regression weights. However, AWR requires the exact probability density of policy, which restricts the use of generative models like diffusion models. In this paper, we directly utilize the diffusion-based policy to address Equation 1. Therefore, our method not only avoids the need for explicit probability densities but also solves the limited policy expressivity problem in AWR.
+
+### Diffusion Probabilistic Model
+
+Diffusion model (Sohl-Dickstein et al., 2015; Ho et al., 2020; Song and Ermon, 2019) is a new type of generative model, which has achieved SOTA results in image generation, outperforming other generative models like GAN (Goodfellow et al., 2020; Dhariwal and Nichol, 2021), VAE(Kingma and Welling, 2013) and Flow-based models (Rezende and Mohamed, 2015). Diffusion models are composed of two processes: the forward diffusion process and the reverse process. In the forward diffusion process, we gradually add Gaussian noise to the data \(\mathbf{x}_{0}\sim q(\mathbf{x}_{0})\) in \(T\) steps. The step sizes are controlled by a variance schedule \(\beta_{i}\):
+
+\[q(\mathbf{x}_{1:T}\,|\,\mathbf{x}_{0}):=\prod_{i=1}^{T}q(\mathbf{x}_{i}\,|\, \mathbf{x}_{i-1}),\quad q(\mathbf{x}_{i}\,|\,\mathbf{x}_{i-1}):=\mathcal{N}(\mathbf{x}_{i}; \sqrt{1-\beta_{i}}\mathbf{x}_{i-1},\beta_{i}\mathbf{I}). \tag{4}\]
+
+In the reverse process, we can recreate the true sample \(\mathbf{x}_{0}\) through \(p(\mathbf{x}^{i-1}|\mathbf{x}^{i})\):
+
+\[p(\mathbf{x})=\int p(\mathbf{x}^{0:T})d\mathbf{x}^{1:T}=\int\mathcal{N}(\mathbf{x}^{T};\mathbf{0}, \mathbf{I})\prod_{i=1}^{T}p(\mathbf{x}^{i-1}|\mathbf{x}^{i})d\mathbf{x}^{1:T}. \tag{5}\]
+
+The training objective is to maximize the ELBO of \(\mathbb{E}_{\mathbf{q}_{\epsilon_{0}}}\left[\log p(\mathbf{x}_{0})\right]\). Following DDPM (Ho et al., 2020), we use the simplified surrogate loss \(\mathcal{L}_{d}(\theta)=\mathbb{E}_{i\sim[1,T],\epsilon\sim\mathcal{N}(\mathbf{0},\mathbf{I}),\mathbf{x}_{0}\sim q}\left[\left|\epsilon-\epsilon_{\theta}(\mathbf{x}_{i},i) \right|\right|^{2}\right]\) to approximate the ELBO. After training, sampling from the diffusion model is equivalent to running the reverse process.
+
+### Conditional Diffusion Probabilistic Model
+
+There are two kinds of conditioning methods: classifier-guided (Dhariwal and Nichol, 2021) and classifier-free (Ho and Salimans, 2021). The former requires training a classifier on noisy data \(\mathbf{x}_{i}\) and using gradients \(\nabla_{\mathbf{x}}\log f_{\phi}(\mathbf{y}|\mathbf{x}_{i})\) to guide the diffusion sample toward the conditioning information \(\mathbf{y}\). The latter does not train an independent \(f_{\phi}\) but combines a conditional noise model \(\epsilon_{\theta}(\mathbf{x}_{i},i,\mathbf{s})\) and an unconditional model \(\epsilon_{\theta}(\mathbf{x}_{i},i)\) for the noise. The perturbed noise \(w\epsilon_{\theta}(\mathbf{x}_{i},i)+(w+1)\epsilon_{\theta}(\mathbf{x}_{i},i,\mathbf{s})\) is used to later generate samples. However Pearce et al. (2023) shows this combination will degrade the policy performance in offline RL. Following Pearce et al. (2023); Wang et al. (2022) we solely employ a conditional noise model \(\epsilon_{\theta}(\mathbf{x}_{i},i,\mathbf{s})\) to construct our noise model (\(w=0\)).
+
+## 3 Method
+
+We propose Diffusion-based Constrained Policy Search (DiffCPS) to address the limited expressivity problem in AWR. Below we first show that the limited policy expressivity in the AWR will degrade the policy performance through a bandit toy experiment. Next, we demonstrate that the sampling errors caused by directly using diffusion within the AWR framework will degrade the performance of the diffusion model. Then we derive our solution to solve this problem from the diffusion model perspective without resorting to AWR. (All proofs are given in Appendix A )
+
+### Toy Experiment
+
+Before showing our method, we first present that the limited policy expressivity in previous Advantage Weighted Regression (AWR) (Peters et al., 2010; Peng et al., 2019; Nair et al., 2020) methods may degrade the performance through a sample 2-D bandit toy experiment with real-valued actions. Our offline dataset is constructed by a unit circle with noise (The first panel of Figure 1). Data on the noisy circle have a positive reward of \(1\). Note that this offline dataset exhibits strong multi-modality since there are many actions (points on the noisy circle) that can achieve the same reward of \(1\) if a state is given. However, if we use unimodal Gaussian to represent the policy, although the points on the noisy circle can all receive the same reward of \(1\), the actions taken by AWR will move closer to the center of the noisy circle (AWR in Figure 1), due to the incorrect unimodal assumption. Experiment results in Figure 1 illustrate that AWR performs poorly in the bandit experiments compared to other diffusion-based methods. We also notice that compared to other diffusion-based methods, actions generated by SfBC include many points that differ significantly from those in the dataset, when \(T=15\). This is due to the sampling error introduced by incorporating diffusion into AWR.
+
+Therefore, we conclude that policy expressivity is important in offline RL since most offline RL datasets are collected from multiple behavior policies or human experts, which exhibit strong multi-modality. To better model behavior policies, we need more expressive generative models to model the policy distribution, rather than using unimodal Gaussians. Furthermore, we also need to avoid the sampling errors caused by using diffusion in AWR, which is the motivation behind our algorithm.
+
+### Apply Diffusion Based Policy in CPS
+
+Firstly, we present the form of constrained policy search:
+
+\[\mu^{*}=\operatorname*{arg\,max}_{\mu} J(\mu)=\operatorname*{arg\,max}_{\mu}\int_{\mathcal{S}}d_{0}( \boldsymbol{s})\int_{\mathcal{A}}Q^{\mu}(\boldsymbol{s},\boldsymbol{a})d \boldsymbol{a}\boldsymbol{s} \tag{6}\] \[s.t. E_{\boldsymbol{s}\sim\rho^{n_{b}(\boldsymbol{s})}}\left[D_{\text{ KL}}(\pi_{b}(\cdot|\boldsymbol{s})\|\mu(\cdot|\boldsymbol{s}))\right]\leq\epsilon,\] (7) \[\int_{\boldsymbol{a}}\mu(\boldsymbol{a}|\boldsymbol{s})d \boldsymbol{a}=1,\quad\forall\boldsymbol{s}, \tag{8}\]
+
+Figure 1: Toy offline experiment on a simple bandit task. We test the performance of AWR and other diffusion-based offline RL algorithms (DQL (Wang et al., 2022) and SfBC (Chen et al., 2022)). The first row displays the actions taken by the trained policy where \(T\) denotes diffusion steps. We note that the AWR fails to capture the multi-modal actions in the offline dataset due to the limited policy expressivity of unimodal Gaussian. The second row shows the effect of different diffusion steps \(T\).
+
+where \(\mu(\mathbf{a}|\mathbf{s})\) denotes our diffusion-based policy, \(\pi_{b}\) denotes the behavior policy. Here we represent our policy \(\mu(\mathbf{a}|\mathbf{s})\) via the conditional diffusion model:
+
+\[\mu(\mathbf{a}|\mathbf{s})=\int\mu(\mathbf{a}^{0:T}|\mathbf{s})d\mathbf{a}^{1:T}=\int\mathcal{N}( \mathbf{a}^{T};\mathbf{0},\mathbf{I})\prod_{i=1}^{T}\mu(\mathbf{a}^{i-1}|\mathbf{a}^{i},\mathbf{s})d\bm {a}^{1:T}, \tag{9}\]
+
+where the end sample of the reverse chain \(\mathbf{a}^{0}\) is the action used for the policy's output and \(\mu(\mathbf{a}^{0:T})\) is the joint distribution of all noisy samples. According to DDPM, we can approximate the reverse process \(\mu(\mathbf{a}^{i-1}|\mathbf{a}^{i},\mathbf{s})\) with a Gaussian distribution \(\mathcal{N}(\mathbf{a}^{i-1};\mathbf{\mu}_{\mathbf{\theta}}(\mathbf{a}^{i},\mathbf{s},i),\mathbf{ \Sigma}_{\mathbf{\theta}}(\mathbf{a}^{i},\mathbf{s},i))\). The training of the diffusion model needs a dataset \(\mathcal{D}\sim\mu(\mathbf{a}|\mathbf{s})\), which is intractable in practice. However, the KL constraint in Equation 7 allows us to train the \(\mu(\mathbf{a}|\mathbf{s})\) with \(\mathcal{D}\sim\pi_{b}(\mathbf{a}|\mathbf{s})\) because the difference between two policies is small. We also follow the DDPM to fix the covariance matrix and predict the mean with a conditional noise model \(\epsilon_{\theta}(\mathbf{a}^{i},\mathbf{s},i)\):
+
+\[\mathbf{\mu}_{\theta}(\mathbf{a}^{i},\mathbf{s},i)=\frac{1}{\sqrt{a_{i}}}\big{(}\mathbf{a}^{i }-\frac{\beta_{i}}{\sqrt{1-a_{i}}}\epsilon_{\theta}(\mathbf{a}^{i},\mathbf{s},i)\big{)}. \tag{10}\]
+
+During the reverse process, \(\mathbf{a}^{T}\sim\mathcal{N}(\mathbf{0},\mathbf{I})\) and then follow the reverse diffusion chain parameterized by \(\theta\) as
+
+\[\mathcal{N}\left\{\mathbf{a}^{i-1}|\mathbf{a}^{i}\right\}\sim\mathcal{N}\left\{a^{i-1} ;\frac{\mathbf{a}^{i}}{\sqrt{\alpha_{i}}}-\frac{\beta_{i}}{\sqrt{\alpha_{i}(1- \alpha_{i})}}\epsilon_{\theta}(\mathbf{a}^{i},\mathbf{s},I),\beta_{i}\right\}\ \ \text{for }i=T,\ldots,1. \tag{11}\]
+
+The reverse sampling in Equation 11 requires iteratively predicting \(\epsilon\)\(T\) times. When \(T\) is large, it will consume much time during the sampling process. To work with small \(T\) (\(T=5\) in our experiment), we follow the previous works (Xiao et al., 2021; Wang et al., 2022) to define
+
+\[\beta_{i}=1-\alpha_{i}=1-e^{-\beta_{\min}(\mathbf{\frac{i}{T}})-0.5(\beta_{\max}- \beta_{\min})\frac{\beta_{i}+1}{T^{2}}},\]
+
+which is a noise schedule obtained under the variance preserving SDE of Song et al. (2020).
+
+**Theorem 3.1**.: _Let \(\mu(\mathbf{a}|\mathbf{s})\) be a diffusion-based policy and \(\pi_{b}\) be the behavior policy. Then, we have_
+
+1. _There exists_ \(\kappa_{0}\in\mathcal{R}\) _such that_ \(\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s})}\left[D_{\mathrm{KL}}(\pi_{b}( \cdot|\mathbf{s})\|\mu(\cdot|\mathbf{s}))\right]\leq\epsilon\) _can be transformed to_ \[H(\pi_{b},\mu)=-\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b} (\cdot|\mathbf{s})}\left[\log\mu(\cdot|\mathbf{s})\right]\leq\kappa_{0},\] _which is a convex function of_ \(\mu\)_._
+2. \(\forall s,\int_{\mathbf{a}}\mu(\mathbf{a}|\mathbf{s})d\mathbf{a}\equiv 1\)_._
+
+**Corollary 3.1.1**.: _The primal problem (Equation 6-Equation 8) can be transformed into the following optimization problem:_
+
+\[\begin{split}\mu^{*}=\operatorname*{arg\,max}_{\mu}J(\mu)= \operatorname*{arg\,max}_{\mu}J(\mu)&=\operatorname*{arg\,max}_{ \mu}\int_{\mathcal{S}}d_{0}(\mathbf{s})\int_{\mathcal{A}}Q^{\mu}(\mathbf{s},\mathbf{a})d \mathbf{a}d\mathbf{s}\\ s.t.&\quad H(\pi_{b},\mu)\leq\kappa_{0}.\end{split} \tag{12}\]
+
+### Diffusion-based Constrained Policy Search
+
+In this section, the duality is used to solve the Equation 12 and derive our method. The Lagrangian of Equation 12 is
+
+\[\mathcal{L}(\mu,\lambda)=J(\mu)+\lambda(\kappa_{0}-H(\pi_{b},\mu)). \tag{13}\]
+
+The Lagrange dual problem associated with the Equation 12 is
+
+\[\min_{\lambda\geq 0}\max_{\mu}J(\mu)+\lambda(\kappa_{0}-H(\pi_{b},\mu)). \tag{14}\]
+
+**Theorem 3.2**.: _Suppose that \(r\) is bounded and that Slaters' condition holds for our offline RL setting. Then, strong duality holds for Equation 12, which has the same optimal policy \(\mu^{*}\) with Equation 14._
+
+According to Theorem 3.2, we can get the optimal policy by solving Equation 14, where \(\lambda\) is the dual variable. We can solve the optimal dual variable \(\lambda\) as
+
+\[\operatorname*{arg\,min}_{\lambda\geq 0}\lambda(\kappa_{0}-H(\pi_{b},\mu^{*})), \tag{15}\]
+
+where \(\mu^{*}\) denotes
+
+\[\operatorname*{arg\,max}_{\mu}\mathbb{E}_{\mathbf{s}\sim d_{0}(\mathbf{s}),\mathbf{a}\sim \mu(\cdot|\mathbf{s})}\left[Q^{\mu}(\mathbf{s},\mathbf{a})\right]-\lambda H(\pi_{b},\mu). \tag{16}\]
+
+In Equation 16, we need to calculate the cross entropy \(H(\pi_{b},\mu)\), which is intractable in practice.
+
+**Proposition 3.1**.: _In the diffusion model, we can approximate the entropy with an MSE-like loss \(\mathcal{L}_{c}(\pi_{b},\mu)\) through ELBO:_
+
+\[H(\pi_{b},\mu)\approx c+\mathcal{L}_{c}(\pi_{b},\mu), \tag{17}\]
+
+_where \(c\) is a constant._
+
+Let \(\kappa=\kappa_{0}-c\), according to Proposition 3.1, the Equation 16 and Equation 15 can be transformed to
+
+\[\arg\max_{\mu}\mathbb{E}_{\mathbf{s}\sim d_{0}(\mathbf{s}),\mathbf{a}\sim\mu(\cdot|\mathbf{s}) }\left[Q^{\mu}(\mathbf{s},\mathbf{a})\right]-\lambda\mathcal{L}_{c}(\pi_{b},\mu), \tag{18}\]
+
+\[\operatorname*{arg\,min}_{\lambda\geq 0}\mathcal{J}(\lambda)=\lambda(\kappa- \mathcal{L}_{c}(\pi_{b},\mu^{*})). \tag{19}\]
+
+In practice, the \(Q^{\mu}(\mathbf{s},\mathbf{a})\) varies in different environments. To normalize \(Q^{\mu}(\mathbf{s},\mathbf{a})\), we follow Fujimoto and Gu (2021); Wang et al. (2022) to divide it by the target Q-net's value. We also clip the \(\lambda\) to keep the constraint \(\lambda\geq 0\) holding by \(\lambda_{\text{clip}}=\max(c,\lambda)\), \(c\geq 0\). So actually \(\mu^{*}\) is
+
+\[\operatorname*{arg\,max}_{\mu}\mathcal{J}(\mu)=\mathbb{E}_{\mathbf{s}\sim d_{0}( \mathbf{s}),\mathbf{a}\sim\mu(\cdot|\mathbf{s})}\left[\frac{Q^{\mu}(\mathbf{s},\mathbf{a})}{Q^{ \mu}_{\text{target}}(\mathbf{s},\mathbf{a})}\right]-\lambda_{\text{clip}}\mathcal{L}_{ c}(\pi_{b},\mu). \tag{20}\]
+
+Theoretically, we need to precisely solve the Equation 20 and Equation 19, but in practice, we can resort to stochastic gradient descent to solve the equations. In this way, we can recursively optimize Equation 12 through Equation 20 and Equation 19. The policy improvement described in Equation 20 and the solution of Equation 19 constitute the core of DiffCPS.
+
+We also find that we can improve the performance of the policy by delaying the policy update (Fujimoto et al., 2018). Finally, we summarize our method in Algorithm 1:
+
+```
+Initialize policy network \(\mu_{\theta}\), critic networks \(Q_{\phi_{1}}\), \(Q_{\phi_{2}}\), and target networks \(\mu_{\theta^{\prime}}\), \(Q_{\phi^{\prime}_{1}}\), \(Q_{\phi^{\prime}_{2}}\),  policy evaluation interval \(d\) and step size \(\eta\). for\(t=1\) to \(T\)do  Sample transition mini-batch \(\mathcal{B}=\{(\mathbf{s}_{t},\mathbf{a}_{t},r_{t},\mathbf{s}_{t+1})\}\sim\mathcal{D}\).  # Critic updating  Sample \(\mathbf{a}_{t+1}\sim\mu_{\theta}(\cdot|\mathbf{s}_{t+1})\) according to Equation 11. \(y=r_{t}+\gamma\min_{i=1,2}Q_{\phi^{\prime}_{i}}\left\{\mathbf{s}_{t+1},\mathbf{a}_{t+ 1}\right\}\).  Update critic \(\phi_{i}\leftarrow\arg\min_{\phi_{i}}N^{-1}\sum(y-Q_{\phi_{i}}(\mathbf{s}_{t},\mathbf{a }_{t}))^{2}\). if\(t\bmod d\)then  Sample \(\mathbf{a}\sim\mu_{\theta}(\cdot|\mathbf{s})\) according to Equation 11.  # Policy updating through Equation 20 \(\mu_{i}\leftarrow\mu_{i}+\eta\nabla_{\theta}\mathcal{J}(\mu)\).  # Lagrange multiplier \(\lambda\) updating through Equation 19 \(\lambda_{i}\leftarrow\lambda_{i}-\eta\nabla_{\lambda}\mathcal{J}(\lambda)\). \(\lambda_{i}\leftarrow\lambda_{\text{clip}}=\max(c,\lambda_{i})\), \(c\geq 0\). endif  # Target Networks updating \(\theta^{\prime}=\rho\theta^{\prime}+(1-\rho)\theta\), \(\phi^{\prime}_{i}=\rho\phi^{\prime}_{i}+(1-\rho)\phi_{i}\) for \(i=\{1,2\}\). endfor
+```
+
+**Algorithm 1** DiffCPS
+
+## 4 Experiments
+
+We evaluate our DiffCPS on the D4RL (Fu et al., 2020) benchmark in Section 4.1. Further, we conduct an ablation experiment to assess the contribution of different parts in DiffCPS in Section 4.2.
+
+### Comparison to other Methods
+
+In Table 1, we compare the performance of DiffCPS to other offline RL methods in D4RL (Fu et al., 2020) tasks. We only focus on the MuJoCo locomotion and AntMaze tasks due to the page limit.
+
+In traditional MuJoCo tasks, DiffCPS outperforms other methods as well as recent diffusion-based method (Wang et al., 2022; Lu et al., 2023; Hansen-Estruch et al., 2023) by large margins in most tasks, especially in the HalfCheetah medium. Note the medium datasets are collected by an online SAC (Haarnoja et al., 2018) agent trained to approximately \(1/3\) the performance of the expert. Hence, the medium datasets contain a lot of suboptimal trajectories, which makes the offline RL algorithms hard to learn.
+
+Compared to the locomotion tasks, the AntMaze tasks are more challenging since the datasets consist of sparse rewards and suboptimal trajectories. Even so, DiffCPS also achieves competitive or SOTA results compared with other methods. In relatively simpler tasks like umaze, DiffCPS can achieve a \(100\pm 0\%\) success rate on some seeds, which shows the powerful ability to learn from suboptimal trajectories of our method. In other AntMaze tasks, DiffCPS also shows competitive performance compared to other state-of-the-art diffusion-based approaches. Overall, DiffCPS outperforms the state-of-the-art algorithms, even the recent diffusion-based state-of-the-art algorithms by a very significant margin.
+
+### Ablation Study
+
+In this section, we analyze why DiffCPS outperforms the other methods quantitatively on D4RL tasks. We conduct an ablation study to investigate the impact of three parts in DiffCPS, \(i.e.\) diffusion steps, the minimum value of Lagrange multiplier \(\lambda_{\text{clip}}\), and policy evaluation interval.
+
+**Diffusion Steps**. We show the effect of diffusion steps \(T\), which is a vital hyperparameter in all diffusion-based methods. In SfBC the best \(T\) is \(15\), while \(T=5\) is best for our DiffCPS. Table 2 shows the average performance of different diffusion steps. Figure 2 shows the training curve of selected D4RL tasks over different diffusion steps \(T\).
+
+We also note that large \(T\) works better for the bandit experiment. However, for D4RL tasks, a large \(T\) will lead to a performance drop. The reason is that compared to bandit tasks, D4RL datasets contain
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c} \hline \hline
+**Dataset** & **Environment** & **CQL** & **DQL-A** & **QFO** & **SINC** & **DD** & **Differer** & **Diffusion-QL** & **IQL** & **DiffCPS(ours)** \\ \hline Medium-Expert & HalfCheetah & 62.4 & **95.9** & \(93.5\) & \(92.6\) & \(90.6\) & \(79.8\) & \(\mathbf{96.8}\) & \(\mathbf{86.7}\) & \(\mathbf{100.3\pm 4.1}\) \\ Medium-Expert & Hopper & 98.7 & 108.6 & 108.0 & 108.6 & 111.8 & 107.2 & 111.1 & 91.5 & \(\mathbf{112.1\pm 0.6}\) \\ Medium-Expert & Walker24.1 & \(110.1\) & \(\mathbf{112.7}\) & \(\mathbf{110.7}\) & 109.8 & 108.8 & 108.4 & \(110.1\) & \(109.6\) & \(\mathbf{113.1\pm 1.8}\) \\ \hline Medium & HalfCheetah & 44.4 & 51.0 & \(\mathbf{54.1}\) & 45.9 & 49.1 & 44.2 & \(\mathbf{51.1}\) & \(47.4\) & \(\mathbf{71.0\pm 0.5}\) \\ Medium & Hopper & 58.0 & 65.4 & \(\mathbf{98.0}\) & 57.1 & 79.3 & 85.5 & \(\mathbf{90.5}\) & \(\mathbf{96.3}\) & \(\mathbf{100.1\pm 3.5}\) \\ Medium & Walker24.0 & \(79.2\) & 82.5 & \(\mathbf{86.0}\) & 77.9 & 82.5 & 79.7 & \(\mathbf{87.0}\) & \(78.3\) & \(\mathbf{90.9\pm 1.6}\) \\ \hline Medium-Replay & HalfCheetah & 46.2 & 45.9 & \(\mathbf{47.6}\) & 37.1 & 39.3 & 42.2 & \(\mathbf{47.8}\) & \(\mathbf{44.2}\) & \(\mathbf{50.5\pm 0.6}\) \\ Medium-Replay & Hopper & 48.6 & 92.1 & \(\mathbf{96.9}\) & 86.2 & 100 & 96.8 & \(\mathbf{101.3}\) & \(\mathbf{94.7}\) & \(\mathbf{101.1\pm 0.2}\) \\ Medium-Replay & Walker24.0 & \(26.7\) & \(\mathbf{85.1}\) & \(84.4\) & 65.1 & 75.0 & 61.2 & \(\mathbf{95.5}\) & \(73.9\) & \(\mathbf{91.3\pm 0.7}\) \\ \hline \multicolumn{2}{l}{**Average (Lomonosovits)**} & 63.9 & 82.1 & 86.6 & 75.6 & 81.8 & 75.3 & \(87.9\) & \(76.9\) & \(\mathbf{92.26}\) \\ \hline Default & AntMaze-umaze & 74.0 & \(\mathbf{94.0}\) & \(\mathbf{96.4}\) & 92.0 & - & - & 93.4 & \(87.5\) & \(\mathbf{97.4\pm 3.7}\) \\ Diverse & AntMaze-umaze & \(\mathbf{84.0}\) & \(\mathbf{80.2}\) & \(\mathbf{74.4}\) & \(\mathbf{85.3}\) & - & - & 66.2 & \(62.2\) & \(\mathbf{87.4\pm 3.8}\) \\ \hline Play & AntMaze-medium & 61.2 & \(\mathbf{84.5}\) & \(\mathbf{83.6}\) & 81.3 & - & - & 76.6 & \(71.2\) & \(\mathbf{88.2\pm 2.2}\) \\ Diverse & AntMaze-medium & 53.7 & \(\mathbf{84.8}\) & \(\mathbf{83.8}\) & 82.0 & - & - & 78.6 & \(70.0\) & \(\mathbf{87.8\pm 0.5}\) \\ \hline Play & AntMaze-large & 15.8 & \(\mathbf{63.5}\) & \(\mathbf{60.6}\) & 93.3 & - & - & 46.4 & \(39.6\) & \(\mathbf{65.6\pm 3.6}\) \\ Diverse & AntMaze-large & 14.9 & \(\mathbf{67.9}\) & \(\mathbf{64.8}\) & 45.5 & - & - & 57.3 & \(47.5\) & \(\mathbf{63.6\pm 3.9}\) \\ \hline \multicolumn{2}{l}{**Average (AntMaze)**} & 50.6 & 79.1 & 78.3 & 74.2 & - & - & 69.8 & \(63.0\) & \(\mathbf{81.67}\) \\ \hline \multicolumn{2}{l}{**\# Diffusion steps**} & - & 5 & 15 & 15 & 100 & 100 & 5 & - & 5 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: The performance of DiffCPS and other SOTA baselines on D4RL tasks. The mean and standard deviation of DiffCPS are obtained by evaluating the trained policy on five different random seeds. We report the performance of baseline methods using the best results reported from their paper. “-A” refers to any number of hyperparameters allowed. Results within \(3\) percent of the maximum in every D4RL task and the best average result are highlighted in boldface.
+
+\begin{table}
+\begin{tabular}{l c c c c c c} \hline \hline
+**D4RL Tasks** & **DiffCPS (T=5)** & **DiffCPS (T=15)** & **DiffCPS (T=20)** & **SIRC (T=10)** & **SIRC (T=15)** & **SIRC (T=25)** \\ \hline
+**Loconotion** & \(\mathbf{92.0}\) & \(87.5\) & \(87.6\) & \(72.9\) & \(\mathbf{75.6}\) & \(74.4\) \\ \hline
+**AntMaze** & \(\mathbf{80.0}\) & \(60.7\) & \(66.7\) & \(65.7\) & \(\mathbf{74.2}\) & \(73.0\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Ablation study of diffusion steps. We conduct an ablation study to investigate the impact of diffusion steps on different algorithms. We only show the average score due to the page limit. The results of DiffCPS are obtained from three random seeds, while the results of SfBC are derived from the original SfBC paper.
+
+a significant amount of suboptimal trajectories. A larger \(T\) implies stronger behavior cloning ability, which can indeed lead to policy overfitting to the suboptimal data, especially when combined with actor-critic methods. Poor policies result in error value estimates, and vice versa, creating a vicious cycle that leads to a drop in policy performance with a large \(T\).
+
+**The Minimum value of Lagrange multiplier \(\lambda_{\text{clip}}\).** In our method, \(\lambda\) serves as the coefficient for the policy constraint term, where a larger \(\lambda\) implies a stronger policy constraint. Although we need to restrict the \(\lambda\geq 0\) according to the definition of Lagrange multiplier, we notice that we could get better results through clip \(\lambda\geq c\) in AntMaze tasks, where \(c\) is a positive number, see full \(\lambda\) ablation results in Figure 3 for details.
+
+**Policy evaluation interval.** We include the ablation of policy evaluation interval in Figure 4. We find that the policy delayed update (Fujimoto et al., 2018) has significant impacts on AntMaze large tasks. However, for other tasks, it does not have much effect and even leads to a slight performance decline. The reason is that infrequent policy updates reduce the variance of value estimates, which is more effective in tasks where sparse rewards and suboptimal trajectories lead to significant errors in value function estimation like AntMaze large tasks.
+
+In a nutshell, the ablation study shows that the combination of these three parts, along with DiffCPS, collectively leads to producing good performance.
+
+Figure 3: Ablation studies of the \(\lambda_{\text{clip}}\) in AntMaze and MuJoCo tasks. We can observe that \(\lambda_{\text{clip}}\) has little impact on MuJoCo tasks but significantly influences AntMaze tasks, especially as the AntMaze datasets become larger. The reason is that the sparse rewards and suboptimal trajectories in the AntMaze datasets make the critic network prone to error estimation, leading to learning poor policy. Therefore, there is a need to enhance learning from the original dataset which means we should increase \(\lambda\) or enhance the KL constraint. We find that increasing \(\lambda_{\text{clip}}\) while maintaining a moderate KL constraint achieves the best results. All the results are obtained by evaluating three random seeds.
+
+Figure 2: Ablation studies of diffusion steps \(T\) on selected Gym tasks (three random seeds). We observe that as \(T\) increases, the training stability improves, but the final performance drops.
+
+## 5 Related Work
+
+**Offline Reinforcement Learning**. Offline RL algorithms need to avoid extrapolation error. Prior works usually solve this problem through policy regularization (Fujimoto et al., 2019; Kumar et al., 2019; Wu et al., 2019; Fujimoto & Gu, 2021), value pessimism about unseen actions (Kumar et al., 2020; Kostrikov et al., 2021), or implicit TD backups (Kostrikov et al., 2021; Ma et al., 2021) to avoid the use of out-of-distribution actions. Another line of research solves the offline RL problem through weighted regression (Peters et al., 2010; Peng et al., 2019; Nair et al., 2020) from the perspective of CPS. Our DiffCPS derivation is related but features with a diffusion model form.
+
+**Diffusion models in RL.** Our model introduces the diffusion model to RL. To that end, we review works that use the diffusion model in RL. Diffuser (Janner et al., 2022) uses the diffusion model to directly generate trajectory guided with gradient guidance or reward. DiffusionQL (Wang et al., 2022) uses the diffusion model as an actor and optimizes it through the TD3+BC-style objective with a coefficient \(\eta\) to balance the two terms. AdaptDiffuser (Liang et al., 2023) uses a diffusion model to generate extra trajectories and a discriminator to select desired data to add to the training set to enhance the adaptability of the diffusion model. DD (Ajay et al., 2022) uses a conditional diffusion model to generate trajectory and compose skills. Unlike Diffuser, DD diffuses only states and trains inverse dynamics to predict actions. QGPO (Lu et al., 2023) uses the energy function to guide the sampling process and proves that the proposed CEP training method can get an unbiased estimation of the gradient of the energy function under unlimited model capacity and data samples. IDQL (Hansen-Estruch et al., 2023) reinterpret IQL as an Actor-Critic method and extract the policy through sampling from a diffusion-parameterized behavior policy with weights computed from the IQL-style critic. DiffCPS is distinct from these methods because we derive it from CPS.
+
+Closest to our work is the method that combines AWR and diffusion models. SfBC (Chen et al., 2022) uses the diffusion model to generate candidate actions and uses the regression weights to select the best action. Our method differs from it as we directly solve the limited policy expressivity problem through the diffusion-based policy without resorting to AWR. This makes DiffCPS simple to implement and tune hyperparameters. As shown in Table 4 we can only tune one hyperparameter to get SOTA results in most tasks.
+
+## 6 Conclusion
+
+In our work, we solve the limited expressivity problem in the weighted regression through the diffusion model. We first simplify the CPS problem with the action distribution of diffusion-based policy. Then we reformulate the CPS problem as a convex optimization problem and solve it by using the Lagrange dual method. Finally, we approximate the entropy with the ELBO of the diffusion model to circumvent the intractable density calculation and approximate solve the Lagrange dual problem by iteratively gradient descent. Experimental results on the D4RL benchmark illustrate the superiority of our method which outperforms previous SOTA algorithms in most tasks, and DiffCPS is easy to tune hyperparameters, which only needs to tune the constraint \(\kappa\) in most tasks. We hope that our work can inspire relative researchers to utilize powerful generative models, especially the diffusion model, for offline reinforcement learning and decision-making.
+
+Figure 4: Ablation studies of the policy evaluation interval in AntMaze and MuJoCo tasks. Delayed policy updates have a relatively minor impact on the MuJoCo locomotion tasks. However, for large-scale sparse reward datasets like AntMaze Large, choosing an appropriate update frequency can greatly increase the final optimal results. The MuJoCo task results are obtained with 2 million training steps (three random seeds), while AntMaze results are obtained with 1 million training steps (three random seeds).
+
+## References
+
+* Ajay et al. (2022) Anurag Ajay, Yilun Du, Abhi Gupta, Joshua B Tenenbaum, Tommi S Jaakkola, and Pulkit Agrawal. Is conditional generative modeling all you need for decision making? In _The Eleventh International Conference on Learning Representations_, 2022.
+* Borkar (1988) Vivek S Borkar. A convex analytic approach to markov decision processes. _Probability Theory and Related Fields_, 78(4):583-602, 1988.
+* Boyd & Vandenberghe (2004) Stephen P Boyd and Lieven Vandenberghe. _Convex optimization_. Cambridge university press, 2004.
+* Chen et al. (2022) Huayu Chen, Cheng Lu, Chengyang Ying, Hang Su, and Jun Zhu. Offline reinforcement learning via high-fidelity generative behavior modeling. In _The Eleventh International Conference on Learning Representations_, 2022.
+* Chen et al. (2021) Lili Chen, Kevin Lu, Aravind Rajeswaran, Kimin Lee, Aditya Grover, Misha Laskin, Pieter Abbeel, Aravind Srinivas, and Igor Mordatch. Decision transformer: Reinforcement learning via sequence modeling. _Advances in neural information processing systems_, 34:15084-15097, 2021.
+* Chen et al. (2020) Xinyue Chen, Zijian Zhou, Zheng Wang, Che Wang, Yanqiu Wu, and Keith Ross. Bail: Best-action imitation learning for batch deep reinforcement learning. _Advances in Neural Information Processing Systems_, 33:18353-18363, 2020.
+* Dhariwal & Nichol (2021) Prafulla Dhariwal and Alexander Nichol. Diffusion models beat gans on image synthesis. _Advances in neural information processing systems_, 34:8780-8794, 2021.
+* Fu et al. (2020) Justin Fu, Aviral Kumar, Ofir Nachum, George Tucker, and Sergey Levine. D4rl: Datasets for deep data-driven reinforcement learning. _arXiv preprint arXiv:2004.07219_, 2020.
+* Fujimoto & Gu (2021) Scott Fujimoto and Shixiang Shane Gu. A minimalist approach to offline reinforcement learning. _Advances in neural information processing systems_, 34:20132-20145, 2021.
+* Fujimoto et al. (2018) Scott Fujimoto, Herke Hoof, and David Meger. Addressing function approximation error in actor-critic methods. In _International Conference on Machine Learning_, pp. 1587-1596. PMLR, 2018.
+* Fujimoto et al. (2019) Scott Fujimoto, David Meger, and Doina Precup. Off-policy deep reinforcement learning without exploration. In _International Conference on Machine Learning_, pp. 2052-2062. PMLR, 2019.
+* Ghasemipour et al. (2020) Seyed Kamyar Seyed Ghasemipour, Dale Schuurmans, and Shixiang Shane Gu. Emaq: Expected-max q-learning operator for simple yet effective offline and online rl. _arXiv preprint arXiv:2007.11091_, 2020.
+* Goodfellow et al. (2020) Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil Ozair, Aaron Courville, and Yoshua Bengio. Generative adversarial networks. _Communications of the ACM_, 63(11):139-144, 2020.
+* Gurlter et al. (2018) Nico Gurlter, Sebastian Blaes, Pavel Kolev, Felix Widmaier, Manuel Wuthrich, Stefan Bauer, Bernhard Scholkopf, and Georg Martius. BENCHMARKING OFFLINE REINFORCEMENT LEARN- ING ON REAL-ROBOT HARDWARE.
+* Haarnoja et al. (2018a) Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine. Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor. In _International Conference on Machine Learning_, pp. 1861-1870. PMLR, 2018a.
+* Haarnoja et al. (2018b) Tuomas Haarnoja, Aurick Zhou, Kristian Hartikainen, George Tucker, Sehoon Ha, Jie Tan, Vikash Kumar, Henry Zhu, Abhishek Gupta, and Pieter Abbeel. Soft actor-critic algorithms and applications. _arXiv preprint arXiv:1812.05905_, 2018b.
+* Hansen-Estruch et al. (2023) Philippe Hansen-Estruch, Ilya Kostrikov, Michael Janner, Jakub Grudzien Kuba, and Sergey Levine. Idql: Implicit q-learning as an actor-critic method with diffusion policies. _arXiv preprint arXiv:2304.10573_, 2023.
+* Ho & Salimans (2021) Jonathan Ho and Tim Salimans. Classifier-free diffusion guidance. In _NeurIPS 2021 Workshop on Deep Generative Models and Downstream Applications_, 2021.
+
+* Ho et al. (2020) Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. _Advances in neural information processing systems_, 33:6840-6851, 2020.
+* Janner et al. (2022) Michael Janner, Yilun Du, Joshua B. Tenenbaum, and Sergey Levine. Planning with diffusion for flexible behavior synthesis. _arXiv preprint arXiv:2205.09991_, 2022.
+* Kidambi et al. (2020) Rahul Kidambi, Aravind Rajeswaran, Praneeth Netrapalli, and Thorsten Joachims. Morel: Model-based offline reinforcement learning. _Advances in neural information processing systems_, 33:21810-21823, 2020.
+* Kingma & Ba (2014) Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. _arXiv preprint arXiv:1412.6980_, 2014.
+* Kingma & Welling (2013) Diederik P Kingma and Max Welling. Auto-encoding variational bayes. _arXiv e-prints_, pp. arXiv-1312, 2013.
+* Kostrikov et al. (2021a) Ilya Kostrikov, Rob Fergus, Jonathan Tompson, and Ofir Nachum. Offline reinforcement learning with fisher divergence critic regularization. In _International Conference on Machine Learning_, pp. 5774-5783. PMLR, 2021a.
+* Kostrikov et al. (2021b) Ilya Kostrikov, Ashvin Nair, and Sergey Levine. Offline reinforcement learning with implicit q-learning. In _International Conference on Learning Representations_, 2021b.
+* Kumar et al. (2019) Aviral Kumar, Justin Fu, Matthew Soh, George Tucker, and Sergey Levine. Stabilizing off-policy q-learning via bootstrapping error reduction. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Kumar et al. (2020) Aviral Kumar, Aurick Zhou, George Tucker, and Sergey Levine. Conservative q-learning for offline reinforcement learning. _Advances in Neural Information Processing Systems_, 33:1179-1191, 2020.
+* Levine et al. (2020) Sergey Levine, Aviral Kumar, George Tucker, and Justin Fu. Offline reinforcement learning: Tutorial, review, and perspectives on open problems. _arXiv preprint arXiv:2005.01643_, 2020.
+* Liang et al. (2023) Zhixuan Liang, Yao Mu, Mingyu Ding, Fei Ni, Masayoshi Tomizuka, and Ping Luo. Adaptdiffuser: Diffusion models as adaptive self-evolving planners. _arXiv preprint arXiv:2302.01877_, 2023.
+* Lillicrap et al. (2015) Timothy P. Lillicrap, Jonathan J. Hunt, Alexander Pritzel, Nicolas Heess, Tom Erez, Yuval Tassa, David Silver, and Daan Wierstra. Continuous control with deep reinforcement learning. _arXiv preprint arXiv:1509.02971_, 2015.
+* Lu et al. (2023) Cheng Lu, Huayu Chen, Jianfei Chen, Hang Su, Chongxuan Li, and Jun Zhu. Contrastive energy prediction for exact energy-guided diffusion sampling in offline reinforcement learning. _arXiv preprint arXiv:2304.12824_, 2023.
+* Ma et al. (2021) Xiaoteng Ma, Yiqin Yang, Hao Hu, Qihan Liu, Jun Yang, Chongjie Zhang, Qianchuan Zhao, and Bin Liang. Offline reinforcement learning with value-based episodic memory. _arXiv preprint arXiv:2110.09796_, 2021.
+* Matsushima et al. (1000) Tatsuya Matsushima, Hiroki Furuta, Yutaka Matsuo, Ofir Nachum, and Shixiang Shane Gu. Deployment-efficient reinforcement learn-ing via model-based offline optimization. _Policy_, 100:1000s.
+* Nair et al. (2020) Ashvin Nair, Abhishek Gupta, Murtaza Dalal, and Sergey Levine. Awac: Accelerating online reinforcement learning with offline datasets. _arXiv preprint arXiv:2006.09359_, 2020.
+* Nie et al. (2021) Xinkun Nie, Emma Brunskill, and Stefan Wager. Learning when-to-treat policies. _Journal of the American Statistical Association_, 116(533):392-409, 2021.
+* Paternain et al. (2019) Santiago Paternain, Luiz Chamon, Miguel Calvo-Fullana, and Alejandro Ribeiro. Constrained reinforcement learning has zero duality gap. _Advances in Neural Information Processing Systems_, 32, 2019.
+
+* Pearce et al. (2023) Tim Pearce, Tabish Rashid, Anssi Kanervisto, Dave Bignell, Mingfei Sun, Raluca Georgescu, Sergio Valcarcel Macua, Shan Zheng Tan, Ida Momennejad, Katja Hofmann, et al. Imitating human behaviour with diffusion models. _arXiv preprint arXiv:2301.10677_, 2023.
+* Peng et al. (2019) Xue Bin Peng, Aviral Kumar, Grace Zhang, and Sergey Levine. Advantage-weighted regression: Simple and scalable off-policy reinforcement learning. _arXiv preprint arXiv:1910.00177_, 2019.
+* Peters et al. (2010) Jan Peters, Katharina Mulling, and Yasemin Altun. Relative entropy policy search. In _Proceedings of the AAAI Conference on Artificial Intelligence_, volume 24, pp. 1607-1612, 2010.
+* Rashidinejad et al. (2021) Paria Rashidinejad, Banghua Zhu, Cong Ma, Jiantao Jiao, and Stuart Russell. Bridging offline reinforcement learning and imitation learning: A tale of pessimism. _Advances in Neural Information Processing Systems_, 34:11702-11716, 2021.
+* Rezende & Mohamed (2015) Danilo Rezende and Shakir Mohamed. Variational inference with normalizing flows. In _International Conference on Machine Learning_, pp. 1530-1538. PMLR, 2015.
+* Rhinehart et al. (2018) Nicholas Rhinehart, Rowan McAllister, and Sergey Levine. Deep imitative models for flexible inference, planning, and control. _arXiv preprint arXiv:1810.06544_, 2018.
+* Rockafellar (1970) RT Rockafellar. Convex analysis. _Princeton Math. Series_, 28, 1970.
+* Shafiullah et al. (2022) Nur Muhammad Shafiullah, Zichen Cui, Ariuntuya Arty Altanzaya, and Lerrel Pinto. Behavior transformers: Cloning \(k\) modes with one stone. _Advances in neural information processing systems_, 35:22955-22968, 2022.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In _International Conference on Machine Learning_, pp. 2256-2265. PMLR, 2015.
+* Song & Ermon (2019) Yang Song and Stefano Ermon. Generative modeling by estimating gradients of the data distribution. _Advances in neural information processing systems_, 32, 2019.
+* Song et al. (2020) Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. _arXiv preprint arXiv:2011.13456_, 2020.
+* Suh et al. (2023) HJ Suh, Glen Chou, Hongkai Dai, Lujie Yang, Abhishek Gupta, and Russ Tedrake. Fighting uncertainty with gradients: Offline reinforcement learning via diffusion score matching. _arXiv preprint arXiv:2306.14079_, 2023.
+* Sutton & Barto (2018) Richard S. Sutton and Andrew G. Barto. _Reinforcement Learning: An Introduction_. MIT press, 2018.
+* Tseng et al. (2017) Huan-Hsin Tseng, Yi Luo, Sunan Cui, Jen-Tzung Chien, Randall K Ten Haken, and Issam El Naqa. Deep reinforcement learning for automated radiation adaptation in lung cancer. _Medical physics_, 44(12):6690-6705, 2017.
+* Wang et al. (2022) Zhendong Wang, Jonathan J. Hunt, and Mingyuan Zhou. Diffusion policies as an expressive policy class for offline reinforcement learning. _arXiv preprint arXiv:2208.06193_, 2022.
+* Wang et al. (2020) Ziyu Wang, Alexander Novikov, Konrad Zolna, Josh S. Merel, Jost Tobias Springenberg, Scott E. Reed, Bobak Shahriari, Noah Siegel, Caglar Gulcehre, and Nicolas Heess. Critic regularized regression. _Advances in Neural Information Processing Systems_, 33:7768-7778, 2020.
+* Wu et al. (2019) Yifan Wu, George Tucker, and Ofir Nachum. Behavior regularized offline reinforcement learning. _arXiv preprint arXiv:1911.11361_, 2019.
+* Xiao et al. (2021) Zhisheng Xiao, Karsten Kreis, and Arash Vahdat. Tackling the generative learning trilemma with denoising diffusion gans. _arXiv preprint arXiv:2112.07804_, 2021.
+* Yu et al. (2020) Tianhe Yu, Garrett Thomas, Lantao Yu, Stefano Ermon, James Y Zou, Sergey Levine, Chelsea Finn, and Tengyu Ma. Mopo: Model-based offline policy optimization. _Advances in Neural Information Processing Systems_, 33:14129-14142, 2020.
+* Yurtsever et al. (2020) Ekim Yurtsever, Jacob Lambert, Alexander Carballo, and Kazuya Takeda. A survey of autonomous driving: Common practices and emerging technologies. _IEEE access_, 8:58443-58469, 2020.
+
+## Appendix A Proofs
+
+### Theorem 3.1
+
+We provide the proof of Theorem 3.1.
+
+Proof.: (1): Since the pointwise KL constraint in Equation 1 at all states is intractable, we follow the Peng et al. (2019) to relax the constraint by enforcing it only in expectation
+
+\[E_{\mathbf{s}\sim\rho^{n_{b}}(\mathbf{s})}\left[D_{\mathrm{KL}}(\pi_{b}(\cdot|\mathbf{s}) \|\mu(\cdot|\mathbf{s}))\right]\leq\epsilon.\]
+
+The LHS can be transformed to
+
+\[E_{\mathbf{s}\sim\rho^{n_{b}}(\mathbf{s})}\left[D_{\mathrm{KL}}(\pi_{b}(\cdot|\mathbf{s})) \|\mu(\cdot|\mathbf{s}))\right]=E_{\mathbf{s}\sim\rho^{n_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b} (\cdot|\mathbf{s})}\left[\log\pi_{b}(\cdot|\mathbf{s})-\log\mu(\cdot|\mathbf{s})\right], \tag{21}\]
+
+where
+
+\[E_{\mathbf{s}\sim\rho^{n_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b}(\cdot|\mathbf{s})}\left[\log\pi _{b}(\cdot|\mathbf{s})\right]\]
+
+is the negative entropy of \(\pi_{b}\) is a constant for \(\mu\). So the constraint in Equation 7 can be transformed to
+
+\[H(\pi_{b},\mu)=-\mathbb{E}_{\mathbf{s}\sim\rho^{n_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b}( \cdot|\mathbf{s})}\left[\log\mu(\cdot|\mathbf{s})\right]\leq\kappa_{0}, \tag{22}\]
+
+where \(\kappa_{0}=\epsilon-E_{\mathbf{s}\sim\rho^{n_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b}(\cdot |\mathbf{s})}\left[\log\pi_{b}(\cdot|\mathbf{s})\right]\).
+
+(2): According to the definition of the diffusion model in Equation 9:
+
+\[\begin{split}\int_{\mathbf{a}}\mu(\mathbf{a}|\mathbf{s})d\mathbf{a}& =\int_{\mathbf{a}}\mu(\mathbf{a}^{0}|\mathbf{s})d\mathbf{a}^{0}\\ &=\int\int\mu(\mathbf{a}^{0:T}|\mathbf{s})d\mathbf{a}^{1:T}d\mathbf{a}^{0}\\ &=\int\mu(\mathbf{a}^{0:T})d\mathbf{a}^{0:T}\\ &=1.\end{split} \tag{23}\]
+
+Equation 23 implies the constraint Equation 8 always holds for the diffusion model, so we can omit this constraint.
+
+According to the above two properties, we can rewrite the diffusion-based CPS problem Equation 6-Equation 8 as
+
+\[\begin{split}\mu^{*}=\operatorname*{arg\,max}_{\mu}J(\mu)= \operatorname*{arg\,max}_{\mu}\int_{\mathcal{S}}d_{0}(\mathbf{s})\int_{\mathcal{A }}Q^{\mu}(\mathbf{s},\mathbf{a})d\mathbf{a}d\mathbf{s}\\ s.t.\quad H(\pi_{b},\mu)\leq\kappa_{0}.\end{split} \tag{24}\]
+
+### Theorem 3.2
+
+Then we prove the Theorem 3.2.
+
+According to Theorem 3.1, the primal problem of DiffCPS is expressed as Equation 24.We first transform the Equation 24 to a more tractable form, and then we prove that the strong duality holds for the simplified Equation 29 via the Fenchel-Moreau perturbation theory. Next, we will transform Equation 24 into a more tractable form. Before we proceed, let's introduce some important concepts.
+
+Defining the occupation measure \(\rho^{\mu}(\mathbf{s},\mathbf{a})=(1-\gamma)\sum_{t=0}^{\infty}\gamma^{t}\rho_{\mu}( \mathbf{s}_{t}=\mathbf{s})\mu(\mathbf{a}|\mathbf{s})\), it follows that \(\rho^{\mu}(\mathbf{s},\mathbf{a})=(1-\gamma)\rho^{\mu}(\mathbf{s})\mu(\mathbf{a}|\mathbf{s})\), where \(1-\gamma\) is the normalized factor and \(\rho^{\mu}(\mathbf{s})\) denotes state visitation probabilities with the following properties
+
+\[\rho^{\mu}(\mathbf{s}^{\prime})=d_{0}(\mathbf{s}^{\prime})+\gamma\int_{\mathcal{S} \times\mathcal{A}}\mathcal{T}(\mathbf{s}^{\prime}|\mathbf{s},\mathbf{a})\mu(\mathbf{a}|\mathbf{s} )\rho^{\mu}(\mathbf{s})d\mathbf{a}d\mathbf{s} \tag{25}\]Then we can get for all \(\mu_{1},\mu_{2}\),
+
+\[\begin{split}&\mathbb{E}_{\mathbf{s}^{\prime}}\left[|\rho_{1}(\mathbf{s}^{ \prime})-\rho_{2}(\mathbf{s}^{\prime})|\right]\\ &=\mathbb{E}\left[\gamma\left[\int_{\mathcal{S}\times\mathcal{A}} \mathcal{T}(\mathbf{s}^{\prime}|\mathbf{s},\mathbf{a})|\mu_{1}(\mathbf{a}|\mathbf{s})\rho_{1}(\mathbf{ s})-\mu_{2}(\mathbf{a}|\mathbf{s})\rho_{2}(\mathbf{s})|d\mathbf{ads}\right]\right]\\ &=\frac{\gamma}{1-\gamma}\mathbb{E}\left[\left[\int_{\mathcal{S} \times\mathcal{A}}\mathcal{T}(\mathbf{s}^{\prime}|\mathbf{s},\mathbf{a})|\rho_{1}(\mathbf{s}, \mathbf{a})-\rho_{2}(\mathbf{s},\mathbf{a})|d\mathbf{ads}\right]\right]\\ &\leq\frac{\gamma}{1-\gamma}\max_{\mathbf{s},\mathbf{a}}\bar{\rho}(\mathbf{s},\mathbf{a}),\end{split} \tag{26}\]
+
+where \(\bar{\rho}(\mathbf{s},\mathbf{a})=|\rho_{1}(\mathbf{s},\mathbf{a})-\rho_{2}(\mathbf{s},\mathbf{a})|\).
+
+Because all feasible policies satisfy the KL divergence constraint, when the KL divergence constraint is sufficiently strong, the differences between the occupancy measures for different policies are small. Therefore, based on Equation 26, we can approximately assume that for all feasible policies \(\rho^{\pi_{b}}(\mathbf{s})\approx\rho^{\mu_{1}}(\mathbf{s})\approx\rho^{\mu_{2}}(\mathbf{s})\). Thus, Constraint \(H(\pi_{b},\mu)\) can be simplified to
+
+\[\begin{split}&\quad-H(\pi_{b},\mu)=\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b} }(\mathbf{s}),\mathbf{a}\sim\pi_{b}(\cdot|\mathbf{s})}\left[\log\mu(\cdot|\mathbf{s})\right]\\ &=\int_{\mathcal{S}\times\mathcal{A}}\rho^{\pi_{b}}(\mathbf{s})\pi_{b} (\mathbf{a}|\mathbf{s})\log\mu(\mathbf{a}|\mathbf{s})d\mathbf{ads}\\ &=\frac{1}{1-\gamma}\int_{\mathcal{S}\times\mathcal{A}}\rho^{\pi_{ b}}(\mathbf{s},\mathbf{a})\log\frac{\rho^{\mu}(\mathbf{s},\mathbf{a})}{\rho^{\mu}(\mathbf{s})}d\mathbf{ ad}\mathbf{s}-\underbrace{\frac{1}{1-\gamma}\int_{\mathcal{S}\times\mathcal{A}}\rho^{\pi_{b}}( \mathbf{s},\mathbf{a})\log(1-\gamma)d\mathbf{ads}}_{C_{0}}\\ &\approx\underbrace{\frac{1}{1-\gamma}\int_{\mathcal{S}\times \mathcal{A}}\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})\log\frac{\rho^{\mu}(\mathbf{s},\mathbf{a})}{ \rho^{\pi_{b}}(\mathbf{s})}d\mathbf{ads}}_{-\bar{H}(\pi_{b},\mu)}-\underbrace{\frac{1} {1-\gamma}\int_{\mathcal{S}\times\mathcal{A}}\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})\log (1-\gamma)d\mathbf{ads}}_{C_{0}},\end{split} \tag{27}\]
+
+where \(C_{0}\) is the constant about \(\mu\). So we can approximate the constraint in Equation 24 with
+
+\[-\bar{H}(\pi_{b},\mu)\geq-\bar{\kappa_{0}}, \tag{28}\]
+
+where \(\bar{\kappa_{0}}=\kappa_{0}-C_{0}\). So we can transform the Equation 24 to
+
+\[\begin{split}\mu^{*}=\operatorname*{arg\,max}_{\mu}& \ J(\mu)=\operatorname*{arg\,max}_{\mu}\int_{\mathcal{S}}d_{0}(\mathbf{s})\int_{ \mathcal{A}}Q^{\mu}(\mathbf{s},\mathbf{a})d\mathbf{a}d\mathbf{s}\\ & s.t.\quad-\bar{H}(\pi_{b},\mu)\geq-\bar{\kappa_{0}}.\end{split} \tag{29}\]
+
+The perturbation function associated to Equation 29 is defined as
+
+\[\begin{split} P(\xi)=&\max_{\mu}\mathcal{J}(\mu)= \max_{\mu}\int_{\mathcal{S}}d_{0}(\mathbf{s})\int_{\mathcal{A}}Q^{\mu}(\mathbf{s},\mathbf{ a})d\mathbf{ads}\\ s.t.\quad-\bar{H}(\pi_{b},\mu)\geq-\bar{\kappa_{0}}+\xi.\end{split} \tag{30}\]
+
+**Lemma A.1**.: _If (i) \(r\) is bounded; (ii) Slater's condition holds for Equation 29 and (iii) its perturbation function \(P(\xi)\) is concave, then strong duality holds for Equation 29._
+
+Proof.: See, e.g., Rockafellar (1970)[Cor. 30.2.2] 
+
+Proof.: (The proof skeleton is essentially based on Paternain et al. (2019) Theorem 1)
+
+Condition (i) and (ii) are satisfied by the hypotheses of Theorem 3.2. To prove the strong duality of Equation 24, it suffices then to show the perturbation function is concave [(iii)], i.e., that for every \(\xi^{1},\xi^{2}\in\mathbb{R}\), and \(t\in(0,1)\),
+
+\[P\left[t\xi^{1}+(1-t)\xi^{2}\right]\geq tP\left(\xi^{1}\right)+(1-t)P\left(\xi^{ 2}\right). \tag{31}\]
+
+If for either perturbation \(\xi^{1}\) or \(\xi^{2}\) the problem becomes infeasible then \(P(\xi^{1})=-\infty\) or \(P(\xi^{2})=-\infty\) and thus Equation 31 holds trivially. For perturbations which keep the problem feasible, suppose \(P(\xi^{1})\) and \(P(\xi^{2})\) are achieved by the policies \(\mu_{1}\in\mathcal{P}(\mathcal{S})\) and \(\mu_{2}\in\mathcal{P}(\mathcal{S})\) respectively. Then,\(P(\xi^{1})=\mathcal{J}(\mu_{1})\) with \(-\bar{H}(\pi_{b},\mu_{1})+\kappa_{0}\geq\xi^{1}\) and \(P(\xi^{2})=\mathcal{J}(\mu_{2})\) with \(-\bar{H}(\pi_{b},\mu_{2})+\kappa_{0}\geq\xi^{2}\). To establish Equation 31 it suffices to show that for every \(t\in(0,1)\) there exists a policy \(\mu_{t}\) such that \(-\bar{H}(\pi_{b},\mu_{t})+\kappa_{0}\geq t\xi^{1}+(1-t)\xi^{2}\) and \(\mathcal{J}(\mu_{t})=t\mathcal{J}(\mu_{1})+(1-t)\mathcal{J}(\mu_{2})\). Notice that any policy \(\mu_{t}\) satisfying the previous conditions is a feasible policy for the slack \(-\kappa_{0}+t\xi^{1}+(1-t)\xi^{2}\). Hence, by definition of the perturbed function Equation 31, it follows that
+
+\[P\left[t\xi^{1}+(1-t)\xi^{2}\right]\geq\mathcal{J}(\mu_{t})=t\mathcal{J}(\mu_{ 1})+(1-t)\mathcal{J}(\mu_{2})=tP\left(\xi^{1}\right)+(1-t)P\left(\xi^{2}\right). \tag{32}\]
+
+If such a policy exists, the previous equation implies Equation 31. Thus, to complete the proof of the result we need to establish its existence. To do so we start by formulating the objective \(\mathcal{J}(\mu)\) as a linear function.
+
+After sufficient training, we can suppose \(Q_{\phi}(\mathbf{s},\mathbf{a})\) as an unbiased approximation of \(Q^{\mu}(\mathbf{s},\mathbf{a})\),
+
+\[Q_{\phi}(\mathbf{s},\mathbf{a})\approx Q^{\mu}(\mathbf{s},\mathbf{a})=\mathbb{E}_{\tau\sim d_{ 0},\mu,\mathcal{T}}\left[\sum_{j=0}^{J}\gamma^{j}r(\mathbf{s}_{j},\mathbf{a}_{j}|\mathbf{s }_{0}=\mathbf{s},\mathbf{a}_{0}=\mathbf{a})\right], \tag{33}\]
+
+where \(\tau\) denotes the trajectory generated by policy \(\mu(\mathbf{a}|\mathbf{s})\), start state distribution \(d_{0}\) and environment dynamics \(\mathcal{T}(\mathbf{s}^{\prime}|\mathbf{s},\mathbf{a})\).
+
+So the objective function Equation 6 can be written as
+
+\[\begin{split} J(\mu)&=\int_{\mathcal{S}}d_{0}(\mathbf{s })\int_{\mathcal{A}}Q^{\mu}(\mathbf{s},\mathbf{a})d\mathbf{a}\mathbf{s}\\ &=\sum_{t=0}^{\infty}\gamma^{t}\mathbb{E}_{\mathbf{s}_{t}\sim p_{\mu} (\mathbf{s}_{t}=s)}\left[\mathbb{E}_{\mathbf{a}\sim\mu(\mathbf{a}_{t}|\mathbf{s}_{t})}r(\mathbf{s }_{t},\mathbf{a}_{t})\right]\\ &=\sum_{t=0}^{\infty}\gamma^{t}\left[\int_{\mathcal{S}\times \mathcal{A}}p_{\mu}(\mathbf{s}_{t}=\mathbf{s})\mu(\mathbf{a}_{t}=\mathbf{a}|\mathbf{s}_{t}=\mathbf{s}) r(\mathbf{s},\mathbf{a})d\mathbf{a}\mathbf{s}\right]\\ &=\int_{\mathcal{S}\times\mathcal{A}}\left[\sum_{t=0}^{\infty} \gamma^{t}p_{\mu}(\mathbf{s}_{t}=\mathbf{s})\mu(\mathbf{a}_{t}=\mathbf{a}|\mathbf{s}_{t}=\mathbf{s})r( \mathbf{s},\mathbf{a})d\mathbf{a}\mathbf{s}\right]\\ &=\frac{1}{1-\gamma}\mathbb{E}_{\mathbf{s},\mathbf{a}\sim\rho^{\mu}(\mathbf{ s},\mathbf{a})}\left[r(\mathbf{s},\mathbf{a})\right]\\ &=\frac{1}{1-\gamma}\int_{\mathcal{S}\times\mathcal{A}}\rho^{\mu} (\mathbf{s},\mathbf{a})r(\mathbf{s},\mathbf{a})d\mathbf{a}\mathbf{s},\end{split} \tag{34}\]
+
+which implies the objective function Equation 6 equivalent to
+
+\[\max_{\rho\in\mathcal{R}}\frac{1}{1-\gamma}\int_{\mathcal{S}\times\mathcal{A}} \rho^{\mu}(\mathbf{s},\mathbf{a})r(\mathbf{s},\mathbf{a})d\mathbf{a}\mathbf{s}, \tag{35}\]
+
+where \(\mathcal{R}\) is the set of occupation measures, which is convex and compact.[ Borkar (1988), Theorem 3.1]
+
+So Equation 35 is a linear function on \(\rho(\mathbf{s},\mathbf{a})\). Let \(\rho_{1}(\mathbf{s},\mathbf{a}),\rho_{2}(\mathbf{s},\mathbf{a})\in\mathcal{R}\) be the occupation measures associated to \(\mu_{1}\) and \(\mu_{2}\). Since, \(\mathcal{R}\) is convex, there exists a policy \(\mu_{t}\) such that its corresponding occupation measure is \(\rho_{t}(\mathbf{s},\mathbf{a})=t\rho_{1}(\mathbf{s},\mathbf{a})+(1-t)\rho_{2}(\mathbf{s},\mathbf{a}) \in\mathcal{R}\) and \(\mathcal{J}(\mu_{t})=t\mathcal{J}(\mu_{1})+(1-t)\mathcal{J}(\mu_{2})\). To prove Equation 31, it suffices to show such \(\mu_{t}\) satisfies \(-\bar{H}(\pi_{b},\mu)+\kappa_{0}\geq t\xi^{1}+(1-t)\xi^{2}\).
+
+\[-\bar{H}(\pi_{b},\mu) =\frac{1}{1-\gamma}\int_{\mathcal{S}\times\mathcal{A}}\rho^{\pi_{b} }(\mathbf{s},\mathbf{a})\log\frac{\rho_{t}^{\mu}(\mathbf{s},\mathbf{a})}{\rho^{\pi_{b}}(\mathbf{s} )}d\mathbf{a}ds \tag{36}\] \[=\frac{1}{1-\gamma}\int_{\mathcal{S}\times\mathcal{A}}\rho^{\pi_{b }}(\mathbf{s},\mathbf{a})\log\frac{\rho_{1}(\mathbf{s},\mathbf{a})+(1-t)\rho_{2}(\mathbf{s},\mathbf{a })}{\rho^{\pi_{b}}(\mathbf{s})}d\mathbf{a}ds\] \[\underbrace{\geq\frac{1}{1-\gamma}t\int_{\mathcal{S}\times \mathcal{A}}\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})\log\frac{\rho_{1}(\mathbf{s},\mathbf{a})}{ \rho^{\pi_{b}}(\mathbf{s})}d\mathbf{a}ds+}_{\text{Jensen's inequality.}}\] \[\underbrace{\frac{1}{1-\gamma}(1-t)\int_{\mathcal{S}\times \mathcal{A}}\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})\log\frac{\rho_{2}(\mathbf{s},\mathbf{a})}{ \rho^{\pi_{b}}(\mathbf{s})}d\mathbf{a}ds}_{\text{Jensen's inequality.}}\] \[\geq t\xi^{1}+(1-t)\xi^{2}-\kappa_{0}\]
+
+This completes the proof that the perturbation function is concave and according to Lemma A.1 strong duality for Equation 12 holds.
+
+Next, we show that Slater's condition in Theorem 3.2 is a mild condition, since for all \(\kappa_{0}>-E_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b}(\cdot|\mathbf{a} )}\left[\log\pi_{b}(\cdot|\mathbf{s})\right]\), we can get \(\mu=\pi_{b}\) is strictly feasible, which meets Slater's conditions.
+
+Finally, we prove Equation 12, which has the same optimal policy \(\mu\) with Equation 14.
+
+For Equation 14, if strong duality holds and a dual optimal solution \(\lambda^{*}\) exists, then any primal optimal point of Equation 12 is also a maximizer of \(\mathcal{L}(\mu,\lambda^{*})\), this is obvious through the KKT conditions.[ Boyd & Vandenberghe (2004) Ch.5.5.5.]
+
+So if we can prove that the solution of the \(\mathcal{L}(\mu,\lambda^{*})\) is unique, we can compute the optimal policy of Equation 12 from a dual problem Equation 14:
+
+\[\mathcal{L}(\mu,\lambda^{*}) =J(\mu)+\lambda^{*}(\kappa_{0}-\bar{H}(\pi_{b},\mu)) \tag{37}\] \[=\frac{1}{1-\gamma}\left[\underbrace{\int_{\mathcal{S}\times \mathcal{A}}\rho^{\mu}(\mathbf{s},\mathbf{a})r(\mathbf{s},\mathbf{a})d\mathbf{a}ds}_{\text{Using Equation \ref{eq:KKT}}}+\lambda^{*}(\bar{\kappa_{0}}-\int_{\mathcal{S}\times \mathcal{A}}\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})\log\frac{\rho^{\mu}(\mathbf{s},\mathbf{a})}{ \rho^{\pi_{b}}(\mathbf{s})}d\mathbf{a}ds)}_{\text{Using Equation \ref{eq:KKT}}}+\lambda^{*}(\bar{\kappa_{0}}-\int_{ \mathcal{S}\times\mathcal{A}}\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})\log\frac{\rho^{\mu }(\mathbf{s},\mathbf{a})}{\rho^{\pi_{b}}(\mathbf{s})}d\mathbf{a}ds)}_{\text{Using Equation \ref{eq:KKT}}}\right].\]
+
+According to Equation 34\(J(\mu)\) is a linear function, and negative relative entropy is concave, this implies that \(\mathcal{L}(\mu,\lambda^{*})\) is a strictly concave function of \(\rho^{\mu}\) with only a unique maximum value and since we have that the occupancy measure \(\rho^{\mu}(\mathbf{s},\mathbf{a})\) has a one-to-one relationship with policy \(\mu\), we can obtain the unique \(\mu\) corresponding to \(\rho^{\mu}\). 
+
+### Proposition 3.1
+
+Finally, we prove the Proposition 3.1.
+
+Proof.: \[\begin{split} H(\pi_{b},\mu)&=-\mathbb{E}_{\mathbf{s} \sim\rho^{\pi_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b}(\cdot|\mathbf{a})}\left[\log\mu( \cdot|\mathbf{s})\right]\\ &=-\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s})}\left[\int\pi_{b} (\mathbf{a}|\mathbf{s})d\mathbf{a}\log\int\pi_{b}(\mathbf{a}^{1:T}|\mathbf{a},\mathbf{s})\frac{\mu( \mathbf{a}^{0:T}|\mathbf{s})}{\pi_{b}(\mathbf{a}^{1:T}|\mathbf{a},\mathbf{s})}d\mathbf{a}^{1:T} \right]\\ &\leq\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s})}\left[\underbrace{ \int\pi_{b}(\mathbf{a}^{0:T})\log[\frac{\pi_{b}(\mathbf{a}^{1:T}|\mathbf{a},\mathbf{s})}{\mu( \mathbf{a}^{0:T}|\mathbf{s})}]d\mathbf{a}^{0:T}}_{\text{Jensen's inequality}}\right]=K. \end{split}\] (38)
+
+\(H(\pi_{b},\mu)=K\) is true if and only if \(\pi_{b}(\mathbf{a}^{1:T}|\mathbf{a}^{0},\mathbf{s})=\mu(\mathbf{a}^{1:T}|\mathbf{a}^{0},\mathbf{s})\). By letting the KL divergence between \(\pi_{b}\) and \(\mu\) be small enough, we can approximate the \(H(\pi_{b},\mu)\) with \(K\). Furthermore, we can use the variational lower bound \(K\) to approximate the KL divergence (Ho et al., 2020):\[H(\pi_{b},\mu)\approx K =\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s})}\left[\mathbb{E}_{\pi_{b }(\mathbf{a}^{0:T})}\Big{[}\log\frac{\pi_{b}(\mathbf{a}^{1:T}|\mathbf{a},\mathbf{s})}{\mu(\mathbf{a }^{0:T}|\mathbf{s})}\Big{]}\right]=\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s})} \left[\mathbb{E}_{\pi_{b}(\mathbf{a}^{0:T})}\Big{[}\log\frac{\pi_{b}(\mathbf{a}^{1:T}| \mathbf{a}^{0},\mathbf{s})}{\mu(\mathbf{a}^{0:T}|\mathbf{s})}\Big{]}\right]\] \[=\mathbb{E}_{\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})}\Big{[}\log\frac{\prod_ {t=1}^{T}\pi_{b}(\mathbf{a}^{t}|\mathbf{a}^{t-1})}{\mu(\mathbf{a}^{T})\prod_{t=1}^{T}\mu( \mathbf{a}^{t-1}|\mathbf{a}^{t})}\Big{]}\] \[=\mathbb{E}_{\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})}\Big{[}-\log\mu(\mathbf{a} ^{T})+\sum_{t=1}^{T}\log\frac{\pi_{b}(\mathbf{a}^{t}|\mathbf{a}^{t-1})}{\mu(\mathbf{a}^{t- 1}|\mathbf{a}^{t})}\Big{]}\] \[=\mathbb{E}_{\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})}\Big{[}-\log\mu(\mathbf{a} ^{T})+\sum_{t=2}^{T}\log\frac{\pi_{b}(\mathbf{a}^{t}|\mathbf{a}^{t-1})}{\mu(\mathbf{a}^{t- 1}|\mathbf{a}^{t})}+\log\frac{\pi_{b}(\mathbf{a}^{1}|\mathbf{a}^{0})}{\mu(\mathbf{a}^{0}|\mathbf{a} ^{1})}\Big{]}\] \[=\mathbb{E}_{\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})}\Big{[}-\log\mu(\mathbf{a} ^{T})+\sum_{t=2}^{T}\log\Big{(}\frac{\pi_{b}(\mathbf{a}^{t-1}|\mathbf{a}^{t},\mathbf{a}^{0 })}{\mu(\mathbf{a}^{t-1}|\mathbf{a}^{t})}\cdot\frac{\pi_{b}(\mathbf{a}^{t}|\mathbf{a}^{0})}{\pi _{b}(\mathbf{a}^{t-1}|\mathbf{a}^{0})}\Big{)}+\log\frac{\pi_{b}(\mathbf{a}^{1}|\mathbf{a}^{0})} {\mu(\mathbf{a}^{0}|\mathbf{a}^{1})}\Big{]}\] \[=\mathbb{E}_{\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})}\Big{[}\log\frac{\pi_{b }(\mathbf{a}^{T}|\mathbf{a}^{0})}{\mu(\mathbf{a}^{T})}+\sum_{t=2}^{T}\log\frac{\pi_{b}(\mathbf{a }^{t-1}|\mathbf{a}^{t},\mathbf{a}^{0})}{\mu(\mathbf{a}^{t-1}|\mathbf{a}^{t})}-\log\mu(\mathbf{a}^{0 }|\mathbf{a}^{1})\Big{]}\] \[=\mathbb{E}_{\rho^{\pi_{b}}(\mathbf{s},\mathbf{a})}\underbrace{\left[D_{ \text{KL}}(\pi_{b}(\mathbf{a}^{T}|\mathbf{a}^{0})\parallel\mu(\mathbf{a}^{T}))\right]}_{L_{ T}}+\sum_{t=2}^{T}\underbrace{D_{\text{KL}}(\pi_{b}(\mathbf{a}^{t-1}|\mathbf{a}^{t},\mathbf{a}^{0 })\parallel\mu(\mathbf{a}^{t-1}|\mathbf{a}^{t})}_{L_{t-1}}\underbrace{-\log\mu(\mathbf{a}^{0 }|\mathbf{a}^{1})}_{L_{0}}\right]\]
+
+So we can approximate the entropy constraint in Equation 12:
+
+\[H(\pi_{b},\mu)\approx K=L_{T}+\sum_{t=2}^{T}L_{t-1}+L_{0}. \tag{39}\]
+
+Following DDPM (Ho et al., 2020) use the random sample to approximate the \(\sum_{t=2}^{T}L_{t-1}+L_{0}\), we have
+
+\[\sum_{t=2}^{T}L_{t-1}+L_{0}\approx\mathcal{L}_{c}(\pi_{b},\mu) \tag{40}\] \[=\mathbb{E}_{i\sim[1:N],\epsilon\sim\mathcal{N}(\mathbf{0},\mathbf{I}),( \mathbf{s},\mathbf{a})\sim\mathcal{D}}\left[||\epsilon-\epsilon_{\theta}(\sqrt{\bar{ \alpha}_{i}}\mathbf{a}+\sqrt{1-\bar{\alpha}_{i}}\epsilon,\mathbf{s},i)||^{2}\right].\]
+
+Let \(L_{T}=c\), combining Equation 39 and Equation 40 we can get
+
+\[H(\pi_{b},\mu)\approx c+\mathcal{L}_{c}(\pi_{b},\mu). \tag{41}\]
+
+## Appendix B Notation Table
+
+## Appendix C Experimental Details
+
+We follow the Wang et al. (2022) to build our policy with an MLP-based conditional diffusion model. Following the DDPM, we recover the action from a residual network \(\epsilon(\mathbf{a}^{i},\mathbf{s},i)\), and we model the \(\epsilon_{\theta}\) as a 3-layers MLPs with Mish activations. All the hidden units have been set to 256. We also follow the Fujimoto et al. (2018) to build two Q networks with the same MLP setting as our critic network. All the networks are optimized through Adam (Kingma & Ba, 2014). We provide all the hyperparameters in Table 4.
+
+We train for \(1000\) epochs (\(2000\) for Gym tasks). Each epoch consists of \(1000\) gradient steps with batch size \(256\). The training in MuJoCo locomotion is usually quite stable as shown in Figure 2. However, the training for AntMaze is relatively unstable due to its sparse reward setting and suboptimal trajectories in the offline datasets.
+
+**Runtime.** We test the runtime of DiffCPS on a RTX 3050 GPU. For algorithm training, the runtime cost of training the gym Locomotion tasks is about 4h26min for \(2000\) epochs (2e6 gradient steps), see Table 5 for details.
+
+\begin{table}
+\begin{tabular}{c l c c c c c c} \hline \hline
+**Dataset** & **Environment** & **Learning Rate** & \(\kappa\) & **Reward Tune** & **max Q backup** & **Policy evaluation interval** & \(\lambda_{\text{tip}}\) \\ \hline Medium-Expert & HalfCheetah & 3e-4 & \(0.04\) & None & False & \(2\) & \(0\) \\ Medium-Expert & Hopper & 3e-4 & \(0.03\) & None & False & \(2\) & \(0\) \\ Medium-Expert & Walker2d & 3e-4 & \(0.04\) & None & False & \(2\) & \(0\) \\ \hline Medium & HalfCheetah & 3e-4 & \(0.06\) & None & False & \(2\) & \(0\) \\ Medium & Hopper & 3e-4 & \(0.05\) & None & False & \(2\) & \(0\) \\ Medium & Walker2d & 3e-4 & \(0.03\) & None & False & \(2\) & \(0\) \\ \hline Medium-Replay & HalfCheetah & 3e-4 & \(0.06\) & None & False & \(2\) & \(0\) \\ Medium-Replay & Hopper & 3e-4 & \(0.03\) & None & False & \(2\) & \(0\) \\ Medium-Replay & Walker2d & 3e-4 & \(0.03\) & None & False & \(2\) & \(0\) \\ \hline Default & AnMax-unze & 3e-4 & \(0.2\) & CQL & False & \(2\) & \(0.3\) \\ Diverse & AnMax-unze & 3e-4 & \(0.09\) & CQL & True & \(2\) & \(0.3\) \\ \hline Play & AnMax-medium & 1e-3 & \(0.3\) & CQL & True & \(2\) & \(0.3\) \\ Diverse & AnMax-medium & 3e-4 & \(0.2\) & CQL & True & \(2\) & \(0.3\) \\ \hline Play & AnMax-large & 3e-4 & \(0.2\) & CQL & True & \(4\) & \(0.3\) \\ Diverse & AnMax-large & 3e-4 & \(0.2\) & CQL & True & \(4\) & \(0.3\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: Hyperparameter settings of all selected tasks. Reward Tune with CQL means that we use the reward tuning method in Kumar et al. (2020). We also use max Q backup to improve performance in AntMaze tasks. In offline reinforcement learning, it’s common to fine-tune rewards for the AntMaze tasks. Additionally, we have observed that some other diffusion-based methods, such as SfBC, perform more reward engineering compared to our method. \(\lambda_{\text{clip}}\) in our paper means that \(\lambda\geq\lambda_{\text{clip}}\).
+
+\begin{table}
+\begin{tabular}{r c c} \hline \hline \(H(\pi_{b},\mu)\) & \(\triangleq\) & \(-\mathbb{E}_{\mathbf{s}\sim\rho^{\pi_{b}}(\mathbf{s}),\mathbf{a}\sim\pi_{b}(\cdot|\mathbf{s})} \left[\log\mu(\cdot|\mathbf{s})\right]\). \\ \(\mu\), \(\mu(\mathbf{a}|\mathbf{s})\) & \(\text{or }\mu(\cdot|\mathbf{s})\) & \(\triangleq\) & policy. \\ \(\pi_{b}\), \(\pi_{b}(\mathbf{a}|\mathbf{s})\) & \(\text{or }\pi_{b}(\cdot|\mathbf{s})\) & \(\triangleq\) & behavior policy. \\ \(p_{\mu}(\mathbf{s}_{t}=\mathbf{s})\) & \(\triangleq\) & Probability of landing in state \(\mathbf{s}\) at time \(t\), when following policy \(\mu\) from an initial state sampled from \(d_{0}\), in an environment with transition dynamics. \\ \(\mathcal{T}\), \(\mathcal{P}(\mathbf{s}^{\prime}|\mathbf{s},\mathbf{a})\) & \(\text{or }p(\mathbf{s}^{\prime}|\mathbf{s},\mathbf{a})\) & \(\triangleq\) & transition dynamics. \\ \(d_{0}(\mathbf{s})\) & \(\triangleq\) & initial state distribution of behavior policy. \\ \(\rho^{\mu}(\mathbf{s})\) & \(\triangleq\) & \(\rho^{\mu}(\mathbf{s})=\sum_{t=0}^{\infty}\gamma^{t}p_{\mu}(\mathbf{s}_{t}=\mathbf{s})\) is the unnormalized discounted state visitation frequencies. \\ \(\rho^{\mu}(\mathbf{s},\mathbf{a})\) & \(\triangleq\) & \(\rho^{\mu}(\mathbf{s},\mathbf{a})=(1-\gamma)\sum_{t=0}^{\infty}\gamma^{t}p_{\mu}(\mathbf{s }_{t}=\mathbf{s})\mu(\mathbf{a}|\mathbf{s})=(1-\gamma)\rho^{\mu}(\mathbf{s})\mu(\mathbf{a}|\mathbf{s})\) is the occupation measure of policy \(\mu\). \\ \(Q_{\phi}(\mathbf{s},\mathbf{a})\) & \(\triangleq\) & parameterized state action function. \\ \(Q_{\phi^{\prime}}(\mathbf{s},\mathbf{a})\) & \(\triangleq\) & parameterized target state action function. \\ \(\mu_{\theta}(\mathbf{a}|\mathbf{s})\) & \(\triangleq\) & parameterized policy. \\ \(\mu_{\theta^{\prime}}(\mathbf{a}|\mathbf{s})\) & \(\triangleq\) & parameterized target policy. \\ \(\epsilon_{\theta}(\mathbf{x}_{i},i)\) & \(\triangleq\) & parameterized Gaussian noise predict network in diffusion model. \\ \(f_{\phi}(\mathbf{y}|\mathbf{x}_{i})\) & \(\triangleq\) & parameterized classifier. \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: Table of Notation in paper From Table 5, it's evident that the runtime of DiffCPS is comparable to other diffusion model-based methods. Further optimization like using Jax and incorporating other diffusion model acceleration tricks can improve the runtime of DiffCPS.
+
+## Appendix D More Toy experiments
+
+In this chapter, we provide further detailed information about the toy experiments. The noisy circle is composed of a unit circle with added Gaussian noise \(\mathcal{N}(0,0.05)\). The offline data \(\mathcal{D}=\{(\mathbf{a}_{i})\}_{i=1}^{5000}\) are collected from the noisy circle. We train all methods with 20,000 steps to ensure convergence. The network framework of SfBC remains consistent with the original SfBC paper. Both DQL and DiffCPS use the same MLP architecture. The code for DQL and SfBC is sourced from the official code provided by the authors, while the code for AWR is adopted from a PyTorch implementation available on GitHub.
+
+In Figure 6, we put the full results of diffusion-based methods and Figure 5 displays the scores of diffusion-based algorithms under different diffusion steps, denoted as \(T\). The score calculation involves a modified Jaccard Index, which computes how many actions fall into the offline dataset (the minimum distance is less than 1e-8). The dashed line represents the score of AWR.
+
+Figure 5: Evaluation performance of DiffCPS and other baselines on toy bandit experiments. The dashed line represents the score of AWR. We also observe that as \(T\) increases, diffusion-based algorithms all experience a certain degree of performance decline, especially SfBC. The reason could be that as \(T\) increases, the increased model capacity leads to overfitting the data in the dataset. In the case of SfBC, the presence of sampling errors exacerbates this phenomenon.
+
+Figure 6: Evaluation effect of different diffusion steps on diffusion-based algorithms.
+
+In Figure 7, we compare DiffCPS with prior offline RL methods, including the TD3+BC (Fujimoto and Gu, 2021) with Gaussian policy, BCQ (Fujimoto et al., 2019), and BEAR (Kumar et al., 2019). Note that both BCQ and BEAR use the VAE to model behavior policy, and then get the policy by regularizing the cloned behavior policy. However, results in Figure 7 show that VAE cannot exactly model the multi-modal data in offline datasets. TD3+BC with Gaussian policy also fails to model the optimal behavior due to the limited policy expressivity described in Section 3.1.
+
+In Figure 8, we show the results of diffusion-based behavior clone. The results in Figure 8 and Figure 7 show that the diffusion model can model multi-modal distribution while other methods struggle to capture the multi-modal behavior policy.
+
+## Appendix E Extra Related Work
+
+**Offline Model-based RL.** Model-based RL methods represent another approach to address offline reinforcement learning. Similar to model-free offline RL, model-based RL also needs to address extrapolation error. Kidambi et al. (2020); Yu et al. (2020) perform pessimistic planning in the learned model, which penalizes the reward for uncertainty. BREMEN (Matsushima et al.) uses trust region constraint to update policy in an ensemble of dynamic models to avoid the extrapolation error. VL-LCB (Rashidinejad et al., 2021) employs offline value iteration with lower confidence bound to address the extrapolation error. SGP (Suh et al., 2023) uses the score function of the diffusion model to approximate the gradient of the proposed uncertainty estimation. Our method differs from them for DiffCPS tackles the diffusion-based constrained policy search problem in offline RL through Lagrange dual and recursive optimization.
+
+## Appendix F Extra Experiments
+
+### Trajectory Stitching
+
+The offline dataset is depicted in the Figure 9. The reward function is the sum of the negative Euclidean distance from the point \((1,1)\) and a constant, with both actions and states represented as 2D coordinates. The dataset consists only of trajectories forming an X shape. During the evaluation, the starting point is at \((-1,1)\). To achieve maximum reward, the policy needs to stitch together offline data to reach the goal. The trajectories generated by our policy are shown in Figure 10. We note that DiffCPS successfully combines trajectories from the dataset to reach the vicinity of the target point \((1,1)\) while avoiding low-reward areas.
+
+### TriFinger Dataset Experiment
+
+The TriFinger dataset (Gurtler et al.) is an offline dataset for the TriFinger robotic arm that includes both real and simulated data. The dataset primarily focuses on two tasks: Push and Lift. We utilize the Push-Sim-Expert dataset to train our DiffCPS, and the network architecture is consistent with the details provided in Appendix C. The goal of the push task is to move the cube to a target location.
+
+Figure 8: Results of diffusion behavior clone.
+
+Figure 7: Evaluation effect of prior offline methods.
+
+This task does not require the agent to align the orientation of the cube; the reward is based only on the desired and the achieved position.
+
+When trained with 2e6 training steps (gradient steps) on the sim-expert dataset, DiffCPS (\(T=45\), target_kl \(=0.01\), \(\lambda_{\text{min}}=0\)) achieves a success rate of \(0.906\pm 0.001\) in the push task based on 100 evaluation episodes and 5 random seeds, as detailed in the Table 6.
+
+## Appendix G Augmented Lagrangian Method
+
+In Algorithm 1, we utilize alternating optimization (dual ascent) to solve the dual problem in Equation 14. In practice, we can employ the Augmented Lagrangian Method (ALM) to enhance the stability of the algorithm. ALM introduces a strongly convex term (penalty function) into the Lagrangian function to improve convergence. Our experimental results suggest that ALM can enhance training stability but may lead to a performance decrease. This could be attributed to (i) the introduction of the penalty function altering the optimal KL divergence constraint value and (ii) the penalty function making the policy too conservative, thereby preventing the adoption of high-reward actions. We believe that further research will benefit our algorithm by incorporating ALM and other optimization algorithms.
+
+\begin{table}
+\begin{tabular}{c c c c c} \hline \hline
+**TrifFinger-Push** & **BC** & **CRR** & **IQL** & **DiffCPS (Ours)** \\ \hline
+**Sim-Expert** & \(0.83\pm 0.02\) & \(\mathbf{0.94\pm 0.04}\) & \(0.88\pm 0.04\) & \(\mathbf{0.906\pm 0.001}\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: The success rate of DiffCPS and other baselines on TriFinger Push task. Results for other baselines are sourced from Gürtler et al. and have been carefully tuned. It’s worth noting that our DiffCPS still utilizes a simple MLP to represent the policy, suggesting potential benefits from more powerful network architectures.
+
+Figure 10: Trajectory of DiffCPS.
+
+Figure 9: Offline Dataset.

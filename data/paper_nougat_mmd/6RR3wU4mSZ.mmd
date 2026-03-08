@@ -1,0 +1,326 @@
+# IceFormer: Accelerated Inference with Long-Sequence Transformers on CPUs
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+One limitation of existing transformer-based models is that they cannot handle very long sequences as input since their self-attention operations exhibit quadratic time and space complexity. This problem becomes especially acute when transformers are deployed on hardware platforms equipped only with CPUs. To address this issue, we propose a novel method for accelerating self-attention at inference time that works with pretrained transformer models out-of-the-box without requiring retraining. We experiment using our method to accelerate various long-sequence transformers on various benchmarks and demonstrate a greater speedup compared to the baselines.
+
+## 1 Introduction
+
+Transformers (Vaswani et al., 2017) have powered incredible advances in NLP, as exemplified by large language models (LLMs) such as GPT-4 and LLaMa 2. Increasingly LLMs are applied to exceptionally long input sequences, which enables many exciting applications such as long-form content creation, extended conversations, and large document search and analysis (OpenAI, 2023; Anthropic, 2023). While LLMs can be feasibly trained with expensive hardware accelerators (e.g. GPUs), they need to be deployed on a variety of devices, some of which are only equipped with CPUs.
+
+However, it is currently challenging to deploy LLMs on CPUs due to their high computation cost (Dice and Kogan, 2021). A significant computational bottleneck arises from the self-attention mechanism that is integral to Transformers - both time and space complexity are quadratic in the sequence length. This problem is exacerbated in the context of LLMs, which are often used on very long sequences.
+
+To handle long input sequences, there has been substantial research into reducing the quadratic time complexity of self-attention - these methods are collectively known as _efficient Transformers_. However, many do not meet the needs of LLMs and are therefore difficult to apply to LLMs.
+
+An ideal acceleration method for LLMs should meet four criteria:
+
+**No retraining** The method should not require the model retraining since LLMs are very expensive and time-consuming to train.
+
+**Generality** The method can be applied to a broad range of LLMs rather those trained with particular constraints built-in.
+
+**High accuracy** The method should not introduce large approximation errors, since LLMs have many attention layers and so errors from earlier layers can compound.
+
+**Fast inference** The method should enable fast inference with LLMs.
+
+Meeting all these criteria simultaneously is difficult, and to our knowledge no existing methods can do so. For example, Transformers with fixed attention patterns (e.g., Longformer (Beltagy et al., 2020)) also require retraining the model before they can be used. Reformer (Nikita et al., 2020) requires keys to be normalized, which is not the case in most pretrained models. Nystroffermer (Xiong et al., 2021) and LARA (Zheng et al., 2022) do not support causal masks, which are common in LLMs. Low-rank methods such as Performer (Choromanski et al., 2020) have poor approximation accuracy without finetuning.
+
+In this paper, we propose an acceleration method named **IceFormer** that simultaneously meets the above four criteria. In particular, (1) IceFormer does not require retraining; (2) it can be applied to most LLMs; (3) it can approximate vanilla attention accurately; (4) it achieves faster inference compared with other methods. We illustrate our method in Figure 1. As shown, unlike the vanilla self-attention, which requires inner-product calculations for each pair of query (\(Q\)) and key (\(K\)) vectors (phase 1), as well as for every pair of attention weights (\(a\)) and value (\(V\)) vectors (phase 2), our method takes advantage of the sparsity property of the attention matrix and optimizes both its time and space complexity by only computing the multiplication of limited pairs of query & key and limited pairs of attention weights & value, utilizing \(k\)-Nearest Neighbor Search (\(k\)-NNS).
+
+We conduct experiments on CPUs on the LRA benchmark (Tay et al., 2020), the ZeroSCROLLS benchmark (Shaham et al., 2023) as well as the LongEval benchmark (Dacheng et al., 2023). Across all these three benchmarks, our method demonstrates compelling performance during inference when provided with well-trained weights compared with other baseline models. Notably, our approach not only achieves accuracy close to that obtained using the vanilla Transformer, but also surpasses the efficiency of all baseline methods. Our code will be released upon acceptance.
+
+## 2 Related Work
+
+Efficient transformers can be categorized along two axes: method type and compatibility with pretrained models. Along the first axis are sparsity-based methods and low-rank methods. Along the second axis are methods that can and cannot be applied to pretrained unmodified Transformer models without retraining.
+
+Sparsity-based methods employ a sparsified attention mechanism to capture global information and integrate it with local attention results. Some approaches aim to improve the space complexity compared to the vanilla attention mechanism without improving the time complexity, e.g., top-\(k\) Attention (Gupta et al., 2021). Other approaches aim to improve both, e.g., Sparse Transformer (Child et al., 2019), Longformer (Beltagy et al., 2020), and ETC (Ainslie et al., 2020). A substantial limitation of these models is that the tokens that are attended to are predefined and remain static, which do not adapt to varying input sequences. Because the original attention operation is permitted to attend to any token, these models must be trained with their respective predefined constraints on tokens to be attended to. Reformer (Nikita et al., 2020) can attend to different sets of tokens for different input sequences by using Locality Sensitive Hashing (LSH) (Andoni et al., 2015) to group tokens into chunks and subsequently attending only to tokens within the same chunk as each query and adjacent chunks. However, Reformer imposes two constraints that are not in the original attention operation: keys must be normalized and queries and keys must be the same. Therefore,
+
+Figure 1: Overview of the vanilla attention (Vaswani et al., 2017) (top row) and the proposed method, IceFormer (bottom row). We illustrate with one query and \(k=2\) in \(k\)-NNS. In the two attention matrices presented, the top-2 largest attention weights in each row are represented by a dark color. The remaining attention weights are shown in a pale color in the vanilla attention matrix, and are set to zero (depicted in white) in the reduced attention matrix.
+
+Reformer must be trained with these constraints built-in. As a result, these methods cannot be applied to pretrained, non-modified, models directly; instead, the models must be retrained with the required constraints before these methods can be used.
+
+Low-rank methods approximate the attention weight matrix with a low-rank matrix to reduce the quadratic time and space complexity. Examples of low-rank transformers include Linformer (Wang et al., 2020) and Performer (Choromanski et al., 2020), which decompose the attention weight matrix into a product of tall and wide matrices consisting of learned linear features or random features of the keys and queries, respectively. However, these transformers typically introduce significant approximation errors because attention weight matrices produced by the original attention operation, especially in the case of long input sequences, typically have high rank. Consequently, models that use these approaches must be trained with low-rank approximations built-in, in order to learn to be robust to the associated approximation errors. As a result, these approaches cannot be applied to pretrained, non-modified, models directly; instead, the models must be retrained with the required approximations before these methods can be used. Other approaches provide more general methodologies that can leverage weights pretrained with standard transformers without retraining. These transformers accelerate the execution of the standard attention operation without altering the underlying architecture. Two examples are Nystromformer (Xiong et al., 2021) and LARA (Zheng et al., 2022), which replace the softmax structure in the self-attention mechanism with the product of separately activated query and key matrices. Nystromformer utilizes the Nystrom method, while LARA combines randomized attention (RA) and random feature attentions (RFA) (Peng et al., 2021) to reconstruct the attention weight matrix. In another example, H-Transformer-1D (Zhu and Soricut, 2021) recursively divides the attention weight matrix into blocks and truncates the small singular values of each off-diagonal blocks. All these approaches leverage low-rank approximations, as opposed to sparsity.
+
+Other works propose hardware-specific optimizations without aiming to improve the computational complexity. Examples include Flash-attention (Dao et al., 2022), which optimizes reads and writes between levels of GPU memory, and H2O (Zhang et al., 2023), which dynamically retains a balance of recent and heavy hitters tokens by a KV cache eviction policy. These strategies are dependent on implementation and are specific to particular hardware platforms (e.g. GPU).
+
+## 3 Notation and Preliminaries
+
+Mathematically, the attention operation takes three matrices as input, \(\mathbf{K}\in\mathbb{R}^{m\times d}\), \(\mathbf{Q}\in\mathbb{R}^{n\times d}\), \(\mathbf{V}\in\mathbb{R}^{m\times d^{\prime}}\), which denote keys, queries and values respectively, and outputs a matrix \(\mathbf{O}\in\mathbb{R}^{n\times d^{\prime}}\). Optionally, it may also take in a mask as input, \(\mathbf{S}\in\mathbb{R}^{n\times m}\), whose entries are either 0 or 1. The \(i\)th rows of \(\mathbf{K}\), \(\mathbf{Q}\), \(\mathbf{V}\) and \(\mathbf{O}\), denoted as \(\mathbf{k}_{i}\), \(\mathbf{q}_{i}\), \(\mathbf{v}_{i}\) and \(\mathbf{o}_{i}\), represent the \(i\)th key, query, value and output respectively. The entry of \(\mathbf{S}\) in the \(i\)th row and \(j\)th column, denoted as \(s_{i,j}\), represents whether the \(i\)th query is allowed to attend to the \(j\)th key -- if it is \(1\), it would be allowed; if it is \(0\), it would not be. When the mask \(\mathbf{S}\) is not specified, all its entries are assumed to be 1. Keys and queries have the same dimension \(d\), and each key is associated with a value, and so the number of keys and values is the same and denoted as \(m\).
+
+First the attention operation computes the attention weight matrix \(\mathbf{A}\in\mathbb{R}^{n\times m}\). Its entry in the \(i\)th row and \(j\)th column, denoted as \(a_{i,j}\), is computed with the following formula:
+
+\[a_{i,j}=\frac{s_{i,j}\exp\left(\frac{\mathbf{q}_{i}^{\top}\mathbf{k}_{j}}{ \sqrt{d}}\right)}{\sum_{j^{\prime}=1}^{m}s_{i,j^{\prime}}\exp\left(\frac{ \mathbf{q}_{i}^{\top}\mathbf{k}_{j^{\prime}}}{\sqrt{d}}\right)} \tag{1}\]
+
+Then the attention operation combines the values with the attention weights in the following way:
+
+\[\mathbf{o}_{i}=\sum_{j=1}^{m}a_{i,j}\mathbf{v}_{j} \tag{2}\]
+
+Notably, from previous literature (Nikita et al., 2020; Gupta et al., 2021), it is known that the attention matrix \(\mathbf{A}\) is sparse, i.e., in each row of \(\mathbf{A}\), only a few attention weights have significant (large) values,while the majority of the remaining values are close to zero. Suppose we can somehow identify the \(k\) unmasked keys that receive the highest attention weights for each query \(\mathbf{q}_{i}\) without computing the attention weights for all keys. Then, the original attention matrix \(\mathbf{A}\) can be approximated by only computing the inner product for the identified keys, which can save significant amount of time and computational resource.
+
+## 4 IceFormer: Accelerated Self-Attention for General Keys without Retraining
+
+In order to build a general-purpose acceleration method that does not require retraining, our approach must not require modifications to the attention mechanism to change attention patterns or the introduction of new model parameters to capture regularities in the attention patterns. This precludes popular strategies such as attention mechanisms with predefined sparse attention patterns (e.g., Child et al. (2019); Beltagy et al. (2020); Ainslie et al. (2020)) and learned dimensionality reduction of keys and queries (e.g., Wang et al. (2020); Choromanski et al. (2020)).
+
+Consequently, it is difficult to design an acceleration method that exploits known regularities in the attention patterns without imposing the retraining requirement. We therefore aim to design an acceleration method that does not make assumptions on the existence of regularity in the attention patterns. In order to improve on the \(O(mn)\) complexity of vanilla attention, we need to adaptively identify the most important keys (i.e., those that receive the highest attention weights) without computing all attention weights. This seems like a chicken-and-egg problem: how can we know which attention weights are highest without comparing them to all the other attention weights?
+
+Remarkably, in the special case of normalized keys, as proposed in Nikita et al. (2020), this can be done by leveraging \(k\)-nearest neighbour search (\(k\)-NNS) to identify the \(k\) most important keys for each query. This relies on the following mathematical fact, whose derivation is in included in Sect. B.1 of the appendix: if \(\|\mathbf{k}_{j}\|_{2}=1\) for all \(j\), \(\arg\max_{j}a_{i,j}=\arg\min_{j}\|\mathbf{q}_{i}-\mathbf{k}_{j}\|_{2}^{2}\).
+
+However, this fact only holds when all the keys have the same norm - it is not true when different keys differ in their norms. Intuitively, this is because the norms of keys can modulate the attention weights they receive, all else being equal. So if key \(\mathbf{A}\) has a larger norm than key \(\mathbf{B}\), key \(\mathbf{A}\) can receive a higher attention weight than key \(\mathbf{B}\) even if key \(\mathbf{A}\) is farther from the query than key \(\mathbf{B}\). As a result, naively applying \(k\)-NNS in the general case would fail to identify the most important keys.
+
+In this paper, we develop an acceleration method that does not require retraining or impose any constraints on keys. It is both accurate and computationally efficient, and can also work with attention masks that are common in Transformers, such as causal masks. We will describe the details in the following subsections.
+
+### General Retraining-Free Accelerated Attention
+
+Instead of applying \(k\)-NNS to the original keys directly, we will first embed the keys and queries into a higher dimensional space. Inspired by Neyshabur & Srebro (2015), we choose the following key and query embedding functions, which we denote as \(T_{K}:\mathbb{R}^{d}\rightarrow\mathbb{R}^{d+1}\) and \(T_{Q}:\mathbb{R}^{d}\rightarrow\mathbb{R}^{d+1}\):
+
+\[T_{K}(\mathbf{k}_{j}) =\left[\mathbf{k}_{j}/c\quad\sqrt{1-\|\mathbf{k}_{j}\|_{2}^{2}/c ^{2}}\right]^{\top} \tag{3}\] \[T_{Q}(\mathbf{q}_{i}) =\left[\mathbf{q}_{i}/\|\mathbf{q}_{i}\|_{2}\quad 0\right]^{\top} \tag{4}\]
+
+where \(c\geq\max_{j^{\prime}}\|\mathbf{k}_{j^{\prime}}\|_{2}\) is at least the maximum norm across all keys.
+
+It turns out that the \(k\) most important keys can be identified by performing \(k\)-NNS on the key embeddings using the query embedding. We will show this below:\[\arg\max_{j}a_{i,j} =\arg\max_{j}\mathrm{softmax}_{j}\left(\left\{\frac{\mathbf{q}_{i}^{ \top}\mathbf{k}_{j^{\prime}}}{\sqrt{d}}\right\}_{j^{\prime}=1}^{m}\right) \tag{5}\] \[=\arg\max_{j}\frac{\mathbf{q}_{i}^{\top}\mathbf{k}_{j}}{\sqrt{d}}\] (6) \[=\arg\min_{j}1-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}/c\|\mathbf{q} _{i}\|_{2}+1\] (7) \[=\arg\min_{j}\mathbf{q}_{i}^{\top}\mathbf{q}_{j}/\|\mathbf{q}_{i} \|_{2}^{2}-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}/c\|\mathbf{q}_{i}\|_{2}+ \mathbf{k}_{j}^{\top}\mathbf{k}_{j}/c^{2}+1-\|\mathbf{k}_{j}\|_{2}^{2}/c^{2}\] (8) \[=\arg\min_{j}\|\mathbf{q}_{i}/\|\mathbf{q}_{i}\|_{2}-\mathbf{k}_{ j}/c\|_{2}^{2}+1-\|\mathbf{k}_{j}\|_{2}^{2}/c^{2}\] (9) \[=\arg\min_{j}\|T_{Q}(\mathbf{q}_{i})-T_{K}(\mathbf{k}_{j})\|_{2}^ {2} \tag{10}\]
+
+### Accurate \(k\)-NNS for Accelerated Attention
+
+The problem of \(k\)-NNS is one of the most well studied problems in theoretical computer science. Many algorithms have been developed, and often significant speedups can be obtained by allowing for mistakes with some probability. Such algorithms are known as randomized algorithms.
+
+In the context of LLMs, the number of attention layers is typically high and so errors from earlier layers can compound. Therefore, it is essential for the \(k\)-NNS algorithm to achieve high accuracy. Choosing an appropriate \(k\)-NNS algorithm is therefore crucial.
+
+Most \(k\)-NNS algorithms are bucketing-based, which places keys into discrete buckets and searches over buckets that contain the query. On the other hand, ranking-based algorithms compares the rankings of different keys relative to the query and searches over highly ranked keys. A bucketing-based algorithm effectively uses a fixed threshold on similarity, and so a variable number (including zero) of keys can meet the threshold; on the other hand, a ranking-based algorithm returns a fixed number of keys, which effectively amounts to choosing a variable threshold on similarity based on the distribution of keys, as shown in Figure 2. An example of a bucketing-based algorithm is locality-sensitive hashing (LSH) (Indyk & Motwani, 1998), and an example of a ranking-based algorithm is Prioritized DCI (Li & Malik, 2017). As shown in Figure 2, LSH hashes each key into a bucket associated with the hash value, whereas Prioritized DCI ranks keys along random directions.
+
+For accelerating attention, we posit that ranking-based algorithms are better suited than bucketing-based algorithms, because attention weights depend on how different keys compare to one another, rather than an absolute evaluation of each key against a fixed threshold. Therefore, ranking-based algorithms is better aligned with how attention weights are calculated and so can yield better recall of truly important keys.
+
+### Fast \(k\)-NNS for Accelerated Attention
+
+In a Transformer, the keys in an attention layer depend on the output from the preceding attention layer. Therefore, a database needs to be constructed for each attention layer. Therefore, it is important to choose a \(k\)-NN algorithm that attains both fast construction and querying.
+
+Moreover, in the context of LLMs, many popular models use decoder-only architectures. The attention layers in such architectures use causal masks to prevent the currently generated token to
+
+Figure 2: Difference between ranking-based and bucketing-based \(k\)-NNS.
+
+depend on future yet-to-be-generated tokens. Such masked attention is equivalent to excluding the masked out keys from the set of keys the \(k\)-NNS algorithm operates over. So each time a token is generated, one key becomes unmasked. Instead of constructing a new database each time a token is generated, it is more efficient to add keys incrementally to the database for \(k\)-NNS.
+
+Fortunately, Prioritized DCI is efficient at both the construction and querying stages. If the number of random projection directions \(p\) is nearly as large as the intrinsic dimensionality of the data \(d^{\prime}\geq 1\) and the number of nearest neighbours \(k\) to look for is small, Prioritized DCI can return the exact \(k\)-nearest neighbours for a query with high probability within approximately \(\tilde{O}(dk^{p/\tilde{d}}m^{1-p/\tilde{d}})\) time, where \(\tilde{O}(\cdot)\) suppresses log factors. Its preprocessing is lightweight, and so only needs \(O(dpm)\) time. If we compare this to the computational complexity of vanilla attention of \(\tilde{O}(dmn)\), observe that there is no longer a term that depends on \(mn\), and so there is no longer the quadratic dependence on sequence length. Later in section 5.1, we also empirically validate the efficiency of Prioritized DCI and found it to be faster than eleven other leading \(k\)-NNS algorithms.
+
+To support causal masking, we extended the implementation of Prioritized DCI to support incremental updates to the database. This can be done efficiently, since the data structure consists of sorted lists, so insertions and deletions can be performed in \(O(\log m)\) time if they are implemented as binary search trees.
+
+## 5 Experiments
+
+In this section, we first compare the recall-latency trade-off between different \(k\)-NNS algorithms and then analyze the performance of IceFormer on the LRA benchmark (Tay et al., 2020) which is under the long-context scenario and is evaluated in lots of previous literature (Zhu and Soricut, 2021; Xiong et al., 2021; Zheng et al., 2022). Moreover, we also demonstrate the advantages of IceFormer in the LLM setting with long prompts as input using the ZeroSCROLLS benchmark (Shaham et al., 2023) and LongEval benchmark (Dacheng et al., 2023). We run all the experiment under CPU setting, and the machine we use for LRA benchmark is Intel(R) Core(TM) i7-6850K, and for LLM experiments is AMD Ryzen 9 5900X.
+
+### Different \(k\)-NNS algorithms comparison
+
+We compare the recall of true nearest neighbors and total construction and querying time of twelve \(k\)-NNS algorithms including Prioritized-DCI on fashion-mnist-784 dataset in Figure 3. As shown, Prioritized-DCI can achieve the best recall-latency trade-off across all the tested algorithms, which illustrates its suitability in the setting when the construction and querying time are both important.
+
+### Evaluation on Long Range Arena (LRA) Benchmark
+
+Datasets and Metrics.LRA consists of five different tasks: ListOps (Nangia and Bowman, 2018), document retrieval (Retrieval) (Radev et al., 2013), text classification (Text) (Maas et al., 2011), CIFAR-10 image classification (Image) (Krizhevsky et al., 2009) and Pathfinder (Linsley et al., 2018). Specifically, all the five tasks consist of sequences with at most 4k tokens. We summarize the dataset information in the appendix for more details. In this experiment, we follow the raint/test splits from Tay et al. (2020) and report the test dataset classification accuracy, average running time of the attention module, and CPU memory usage during inference for each task.
+
+Figure 3: Comparison between twelve \(k\)-NNS algorithms on fashion-mnist-784 dataset. There are in total 60,000 keys and 10,000 queries with 784 dimensions. The task is to find top-10 closest neighbors from the entire set of keys for every query. X-axis: Average recall across all the queries; Y-axis: Total latency (seconds) including database construction and querying.
+
+Baselines.In addition to the vanilla Transformer, we compare with Nystromformer (Xiong et al., 2021), H-Transformer-1D (Zhu and Soricut, 2021), LARA (Zheng et al., 2022), Reformer (Nikita et al., 2020), Longformer (Beltagy et al., 2020), Performer (Choromanski et al., 2020), and Linformer (Wang et al., 2020). In order to compare with Reformer, we train a Transformer model with shared \(\mathbf{Q}\) and \(\mathbf{K}\) according to Nikita et al. (2020). And for Longformer and Linformer, as they introduce additional parameters, we randomly initialize these parameters when loading the pre-trained weight from the vanilla Transformer. For fair comparisons, we use the LRA evaluation benchmark implemented in PyTorch by (Xiong et al., 2021), and only replace the self-attention module while making other parts of each model exactly the same as the vanilla Transformer.
+
+Implementation Details.For each task, we begin by training a base model using GPU with a vanilla Transformer architecture. Then we replace the vanilla attention module with one of the five efficient attention modules mentioned earlier and directly apply the pre-trained weights for inference. To ensure fair comparison, we adjust the batch size to 1, eliminating the need for a padding mask since our proposed IceFormer automatically ignores padding masks during inference. Note that because of the additional shared-KQ constraint, for the Pathfinder task, our attempts to train a shared-KQ Transformer were unsuccessful. As a result, we have excluded the corresponding results from the subsequent analysis. Additionally, during the inference, we utilize a total of 4 CPU threads. For more comprehensive details, please refer to the appendix.
+
+Inference Results.We conducted a comparison of IceFormer with five baseline methods on eight LRA tasks. Ideally, the accuracy of the vanilla Transformer (non-shared-KQ) serves as an upper bound for the approximated accuracy of the other four models (IceFormer (non-shared-KQ), Nystromformer, H-Transformer-1D, LARA, Longformer, Performer, and Linformer). Similar for the shared-KQ Transformer. Also, the attention module inference time of the vanilla Transformer would be the longest, with other efficient Transformers achieving shorter inference times at the cost of sacrificing prediction accuracy. Table 1 presents the prediction accuracy and inference time of the attention module for each method. The hyper-parameter settings are listed in the appendix. In general, our proposed IceFormer consistently outperforms all efficient Transformers, offering the best accuracy approximation while requiring the least inference time across all five tasks. This demonstrates the generalizability and effectiveness of our model.
+
+Speed & Accuracy Trade-off.For IceFormer, increasing the extent of approximation generally improves model efficiency but can lead to a decrease in prediction performance. Here, we study how the extent of approximation affects inference speed and accuracy by varying the number of returned candidates of IceFormer, \(k\), from 3 to 10 for each task and present the results in Figure 4. From the figure, we observe that across all tasks, when \(k\) becomes larger, IceFormer achieves improved prediction accuracy but becomes less efficient.
+
+Memory Complexity Analysis.Table 2 summarizes the maximum memory usage for each method during inference. We employ the same hyper-parameters as in Table 1 and maintain a batch size of 1 to eliminate the need for padding masks. The table reveals that IceFormer consistently exhibits the lowest peak memory usage across all tasks. In comparison to the vanilla Transformer, IceFormer achieves memory savings of up to 0.862 GB.
+
+\begin{table}
+\begin{tabular}{c|c|c|c c c|c c|c c c} \hline \hline \multirow{2}{*}{Method} & \multirow{2}{*}{dured \(\mathbf{KQ}\)} & \multicolumn{2}{c|}{Listops} & \multicolumn{2}{c|}{Text} & \multicolumn{2}{c|}{Retrieval} & \multicolumn{2}{c}{Image} & \multicolumn{2}{c}{Pathfinder} \\ \cline{3-14}  & & Acc & Time (s) & Acc & Time (s) & Acc & Time (s) & Acc & Time (s) & Acc & Time (s) \\ \hline \hline Transformer (Vaswani et al., 2017) & ✗ & 0.4255 & 2.9208 & 0.6019 & 0.6933 & 0.6586 & 8.3588 & 0.4132 & 4.9303 & 0.7514 & 0.9620 \\  & ✓ & 0.4145 & 1.8608 & 0.5986 & 0.6603 & 0.6681 & 6.7946 & 0.3844 & 5.9804 & / & / \\ \hline \hline Redformer (Nikita et al., 2020) & ✓ & 0.4121 & 1.4281 & 0.9491 & 0.2288 & 0.6467 & 1.4751 & 0.3726 & 3.6927 & / & / \\ LARA (Zheng et al., 2022) & ✗ & 0.4125 & 0.6146 & 0.5831 & 0.2483 & 0.6401 & 1.8005 & 3.0944 & 2.6720 & 0.7380 & 0.5961 \\ Nystromformer (Xiong et al., 2021) & ✗ & 0.4128 & 0.7994 & 0.5838 & 0.3542 & 0.6640 & 2.4479 & 0.3754 & 1.7644 & 0.6788 & 0.3211 \\ H-Transformer-1D (Zhu and Soricut, 2021) & ✗ & 0.3266 & 1.9301 & 0.5944 & 0.4411 & 0.5808 & 3.5605 & 0.2286 & 1.2586 & 0.5286 & 0.5708 \\ Lengformer (Beltagy et al., 2020) & ✗ & 0.2070 & 0.7305 & 0.4337 & 0.3231 & 0.3410 & 0.1384 & 0.0701 & 0.5309 & 0.3923 & 0.5314 \\ Performer (Choromanski et al., 2020) & ✗ & 0.2191 & 0.6477 & 0.4831 & 0.6137 & 0.5144 & 1.2071 & 0.0811 & 0.6223 & 0.4415 & 0.5233 \\ Linformer (Wang et al., 2020) & ✗ & 0.2265 & 0.8790 & 0.4339 & 0.1299 & 0.4578 & 0.9486 & 0.0802 & 0.6897 & 0.5630 & 0.5766 \\ \hline IceFormer (ours) & ✗ & **0.4153** & **0.3766** & **0.5978** & **0.0921** & **0.6481** & **0.8347** & **0.4046** & **0.3076** & **0.7424** & **0.3058** \\  & ✓ & **0.4124** & **0.4678** & **0.001** & **0.9033** & **0.6620** & **0.5880** & **0.3752** & **0.9581** & / & / \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: The IceFormer and baselines (Reformer, LARA, Nystromformer, H-Transformer-1D, Longformer, Performer and Linformer) on the LRA benchmarks.
+
+### Evaluation on Large Language Model (LLM)
+
+We evaluate IceFormer in the LLM setting as well. Specifically, we utilize IceFormer to accelerate the prompt processing process in LLMs. We pick Vicuna-7b-v1.5-16k (Zheng et al., 2023), which is fine-tuned from LLaMa \(2\)(Touvron et al., 2023) and is one of the top-performing open-source LLMs with a context length up to 16K tokens, for the following experiment. During the inference, we utilize a total of 24 CPU threads. For more comprehensive details including the choice of \(k\) in \(k\)-NNS, please refer to the appendix.
+
+For the following LLM experiments, we do not compare IceFormer with Reformer, Longformer, LARA and Nystromformer for the following reasons: Reformer requires keys and queries to be shared, which is not the case in pre-trained LLMs; Longformer only proposed a way to speed up the encoder part of the Transformer, thus cannot be applied to decoder-only LLMs; LARA and Nystromformer group different tokens into different clusters and so cannot handle causal masks in LLMs, which use decoder-only architectures. This is because different numbers of tokens within the same cluster need to be masked out for different queries. More details can be found in the appendix.
+
+ZeroSCROLLS Results.We compare IceFormer with the vanilla Vicuna-7b-v1.5-16k model, Linformer, Performer and H-Transformer-1D applied to Vicuna-7b-v1.5-16k on the ZeroSCROLLS benchmark (Shaham et al., 2023) which is specifically designed for LLMs and contains ten diverse natural language tasks that require understanding long input contexts, including summarization, question answering, aggregated sentiment classification and information reordering. Each task has a different sequence length varying between 3k and 10k. We measure ZeroSCROLLS scores and latency of the attention module. Table 3 shows that IceFormer achieves up to \(2.7\times\) speed-up compared to standard self-attention while attaining at least 99.0% of the vanilla unaccelerated model performance at the same time. Linformer performs poorly because it introduces additional projection layers, which combine together different keys to reduce the number of keys. Without retraining, these new keys cannot capture the information present in the original keys, which causes the self-attention to attend to arbitrary keys.
+
+LongEval Results & Scalability Analysis.To provide a more comprehensive analysis of IceFormer's scalability in the LLM setting, we conducted additional experiments on the LongEval
+
+\begin{table}
+\begin{tabular}{c|c|c|c|c|c|c} \hline \hline Method & shared \&Q & LisCon & Test & Retrieval & Image & Pathfinder \\ \hline \hline Transformer (Vaswani et al., 2017) & ✓ & 3.729 & 4.327 & 5.031 & 3.778 & 3.926 \\  & ✓ & 3.631 & 4.265 & 4.827 & 3.740 & / \\ \hline \hline Redformer (Nakita et al., 2020) & ✓ & 3.623 & 3.963 & 4.250 & 3.687 & / \\ LARA (Zheng et al., 2023) & ✗ & 3.584 & 4.129 & 4.566 & 3.772 & 3.943 \\ Nystromformer (Coag et al., 2021) & ✗ & 3.748 & 3.920 & 4.375 & 3.463 & 3.845 \\ H-Transformer-1D (Zhu & 8.557 & 3.883 & 4.338 & 4.543 & 3.553 & 3.603 \\ \hline \hline IceFormer (ours) & ✗ & **3.374** & **3.834** & **4.169** & **3.304** & **3.465** \\  & ✓ & **3.306** & **3.756** & **4.053** & **3.286** & / \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Peak memory usage (GB) on LRA benchmark. The peak memory usage is the total memory usage of the whole program, which includes the memory for the Prioritized DCI database/index.
+
+Figure 4: Changes of speed and accuracy on five LRA tasks. X-axis: the averaged wall clock time of attention module. Y-axis: the model prediction accuracy. We test different values of k: {3, 5, 8, 10}.
+
+benchmark (Dacheng et al., 2023), which is designed to measure long-context performance and consists of two tasks: topic retrieval task with prompt length varying from 3k to 16k, and line retrieval task with prompt length varying from 5k to 16k. In Figure 5, we present the averaged latency of the attention module corresponding to different input prompt length as well as the inference accuracy using the vanilla Vicuna-7b-v1.5-16k model and IceFormer.
+
+From Figure 5, IceFormer can achieve nearly identical inference accuracy compared with the vanilla Vicuna-7b-v1.5-16k model. As the prompt length increases, there is a corresponding increase in the inference latency for both methods and for both tasks. However, even with very long prompt lengths, IceFormer maintains its scalability and consistently outperforms the vanilla Transformer. Furthermore, as the length of the prompt increases, the difference in the latency (wall clock time) between IceFormer and the vanilla Transformer becomes larger, demonstrating the superior scalability and efficiency of IceFormer in the context of LLMs.
+
+\begin{table}
+\begin{tabular}{l l|l|l|l|l|l} \hline \hline Task (Indexes) & Metrics & Vicuna-7b-v1.5-16k & H-Trandformer-10 & Lahformer & Performance & **Lofformer** \\ \hline \hline Gykp (5k) & \(R_{post}\) & 11.0 (100\%) & 6.8 (61.8\%) & 0.1 (0.9\%) & 8.6 (0.2\%) & **11.0 (100\%)** \\  & Time (s) & 5.99 (10.3) & 4.52 (12.3\%) & 3.6 (1.5\%) & 4.9 (1.2\%) & **2.2 (2.4\%)** \\ \hline \hline SSPD (5k) & \(R_{post}\)\(\uparrow\) & 13.5 (100\%) & 6.3 (46.7\%) & 0.0 (0.0\%) & 9.5 (70.4\%) & **13.5 (100\%)** \\  & Time (s) & 5.75 (10.4) & 4.98 (12.3\%) & 3.6 (1.6\%) & 4.6 (1.2\%) & **2.14 (21.7\%)** \\ \hline Qkim (5k) & \(R_{post}\)\(\uparrow\) & 16.9 (100\%) & 10.7 (10.3\%) & 0.0 (0.0\%) & 9.8 (0.4\%) & **16.8 (0.9\%)** \\  & Time (s) & 7.11 (10.6\%) & 5.17 (14.0\%) & 4.1 (11.7\%) & 5.30 (1.4\%) & **2.67 (2.7\%)** \\ \hline SQL(5k) & \(R_{post}\)\(\uparrow\) & 18.9 (100\%) & 7.3 (0.8\%) & 0.0 (0.0\%) & 12.8 (0.7\%) & **19.8 (100\%)** \\  & Time (s) & 5.12 (10.6\%) & 23.2 (12.5\%) & 3.7 (12.4\%) & 4.7 (11.8\%) & **2.1 (24.4\%)** \\ \hline Qpr (5k) & F1 \(\uparrow\) & 34.2 (100\%) & 6.2 (18.1\%) & 0.0 (0.0\%) & 11.7 (0.2\%) & **34.0 (99.6\%)** \\  & Time (s) & 2.49 (10.6\%) & 2.13 (12.2\%) & 2.41 (10.9\%) & 2.8 (0.9\%) & **1.66 (2.3\%)** \\ \hline Nrv (10k) & F1 \(\uparrow\) & 14.7 (10.0\%) & 2.0 (15.4\%) & 0.0 (0.0\%) & 4.5 (14.7\%) & **14.7 (100\%)** \\  & Time (s) & 7.64 (10.5\%) & 5.02 (15.5\%) & 4.75 (16.5\%) & 5.89 (13.3\%) & **3.39 (23.3\%)** \\ \hline QkLT (7k) & AC\(\uparrow\) & 4.88 (100\%) & 6.8 (13.9\%) & 0.1 (0.2\%) & 26.8 (0.1\%) & **4.6 (99.6\%)** \\  & Time (s) & 4.17 (10.6\%) & 23.1 (18.5\%) & 3.2 (13.3\%) & 3.9 (10.8\%) & **18.3 (23.3\%)** \\ \hline MuSO (3k) & F1 \(\uparrow\) & 18.6 (100\%) & 16.9 (0.9\%) & 0.0 (0.0\%) & 14.7 (0.5\%) & **18.5 (0.9\%)** \\  & Time (s) & 0.20 (10.6\%) & 0.66 (11.1\%) & 1.0 (17.0\%) & 1.87 (0.4\%) & **4.0 (0.1\%)** \\ \hline SpSp2 (7.5k) & S2 & 42.5 (100\%) & 2.9 (18.0\%) & 0.0 (0.0\%) & 33.9 (0.4\%) & **42.3 (99.5\%)** \\  & Time (s) & 4.72 (10.8\%) & 2.36 (20.2\%) & 3.55 (13.3\%) & 4.25 (11.1\%) & **2.09 (23.3\%)** \\ \hline BkSS (7.5k) & C\(\downarrow\) & 19.5 (100\%) & 11.7 (0.0\%) & 0.0 (0.0\%) & 7.6 (0.9\%) & **19.3 (0.9\%)** \\  & Time (s) & 4.77 (10.6\%) & 24.1 (20.5\%) & 3.47 (14.4\%) & 4.17 (11.1\%) & **19.6 (24.4\%)** \\ \hline \hline Avg. (7.5k) & \(\uparrow\)\(\uparrow\) & 23.9 (100\%) & 7.8 (22.5\%) & 0.0 (0.0\%) & 12.7 (0.3\%) & **23.8 (0.9\%)** \\  & Time (s) & 4.79 (10.6\%) & 3.19 (15.5\%) & 3.40 (14.4\%) & 4.23 (11.1\%) & **2.00 (24.4\%)** \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: The performance of the vanilla Vicuna-7b-v1.5-16k model, H-Transformer-10, Linformer, Performer and IceFormer on the ZeroSCROLLS benchmarks. Numbers in parentheses indicate the relative comparison to the vanilla unaccelerated model, denoted as Vicuna-7b-v1.5-16k. We employ the same abbreviations for metric and task names as specified in the original paper (Shaham et al., 2023). We refer interested readers to the original paper for the details.
+
+Figure 5: Scalability analysis for IceFormer on the LongEval benchmark. The left figure shows the results of the topic retrieval task; the right figure shows the results of the line retrieval task. X-axis: length of the input prompt; Y-axis (Left): retrieval accuracy; Y-axis (Right): averaged process wall clock time (second) of the attention module.
+
+## 6 Conclusion
+
+In this paper, we present IceFormer, a new method for improving the inference time efficiency of unmodified pretrained Transformers on the CPU. The experimental findings on three benchmarks compellingly illustrate the effectiveness of our approach in reducing the quadratic time and space complexity of vanilla Transformers.
+
+## References
+
+* Ainslie et al. (2020) Joshua Ainslie, Santiago Ontanon, Chris Alberti, Vaclav Cvicek, Zachary Fisher, Philip Pham, Anirudh Ravula, Sumit Sanghai, Qifan Wang, and Li Yang. Etc: Encoding long and structured inputs in transformers. _arXiv preprint arXiv:2004.08483_, 2020.
+* Andoni et al. (2015) Alexandr Andoni, Piotr Indyk, Thijs Laarhoven, Ilya Razenshteyn, and Ludwig Schmidt. Practical and optimal lsh for angular distance. _Advances in neural information processing systems_, 28, 2015.
+* Anthropic (2023) Anthropic. 100k context windows, 2023. URL [https://www.anthropic.com/index/100k-context-windows](https://www.anthropic.com/index/100k-context-windows).
+* Beltagy et al. (2020) Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer. _arXiv preprint arXiv:2004.05150_, 2020.
+* Child et al. (2019) Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse transformers. _arXiv preprint arXiv:1904.10509_, 2019.
+* Choromanski et al. (2020) Krzysztof Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Davis, Afroz Mohiuddin, Lukasz Kaiser, et al. Rethinking attention with performers. _arXiv preprint arXiv:2009.14794_, 2020.
+* Dacheng et al. (2023) Li Dacheng, Shao Rulin, Xie Anze, Sheng Ying, Zheng Lianmin, Gonzalez Joseph E., Stoica Ion, Ma Xuezhe, and Zhang Hao. How long can open-source llms truly promise on context length?, June 2023. URL [https://lmsys.org/blog/2023-06-29-longchat](https://lmsys.org/blog/2023-06-29-longchat).
+* Dao et al. (2022) Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Re. Flashattention: Fast and memory-efficient exact attention with io-awareness. _Advances in Neural Information Processing Systems_, 35:16344-16359, 2022.
+* Dice & Kogan (2021) Dave Dice and Alex Kogan. Optimizing inference performance of transformers on cpus. _arXiv preprint arXiv:2102.06621_, 2021.
+* Gupta et al. (2021) Ankit Gupta, Guy Dar, Shaya Goodman, David Ciprut, and Jonathan Berant. Memory-efficient transformers via top-\(k\) attention. _arXiv preprint arXiv:2106.06899_, 2021.
+* Indyk & Motwani (1998) Piotr Indyk and Rajeev Motwani. Approximate nearest neighbors: towards removing the curse of dimensionality. In _Proceedings of the thirtieth annual ACM symposium on Theory of computing_, pp. 604-613, 1998.
+* Krizhevsky et al. (2009) Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+* Li & Malik (2017) Ke Li and Jitendra Malik. Fast k-nearest neighbour search via prioritized dci. In _International conference on machine learning_, pp. 2081-2090. PMLR, 2017.
+* Linsley et al. (2018) Drew Linsley, Junkyung Kim, Vijay Veerabadran, Charles Windolf, and Thomas Serre. Learning long-range spatial dependencies with horizontal gated recurrent units. _Advances in neural information processing systems_, 31, 2018.
+* Maas et al. (2011) Andrew L. Maas, Raymond E. Daly, Peter T. Pham, Dan Huang, Andrew Y. Ng, and Christopher Potts. Learning word vectors for sentiment analysis. In _Proceedings of the 49th Annual Meeting of the Association for Computational Linguistics: Human Language Technologies_, pp. 142-150, Portland, Oregon, USA, June 2011. Association for Computational Linguistics. URL [http://www.aclweb.org/anthology/P11-1015](http://www.aclweb.org/anthology/P11-1015).
+
+* Nangia and Bowman (2018) Nikita Nangia and Samuel R Bowman. Listops: A diagnostic dataset for latent tree learning. _arXiv preprint arXiv:1804.06028_, 2018.
+* Neyshabur and Srebro (2015) Behnam Neyshabur and Nathan Srebro. On symmetric and asymmetric lshs for inner product search. In _International Conference on Machine Learning_, pp. 1926-1934. PMLR, 2015.
+* Nikita et al. (2020) Kitaev Nikita, Kaiser Lukasz, Levskaya Anselm, et al. Reformer: The efficient transformer. In _Proceedings of International Conference on Learning Representations (ICLR)_, 2020.
+* OpenAI (2020) OpenAI. Openai gpt-4, 2023. URL [https://openai.com/gpt-4](https://openai.com/gpt-4).
+* Peng et al. (2021) Hao Peng, Nikolaos Pappas, Dani Yogatama, Roy Schwartz, Noah A Smith, and Lingpeng Kong. Random feature attention. _arXiv preprint arXiv:2103.02143_, 2021.
+* Radev et al. (2013) Dragomir R Radev, Pradeep Muthukrishnan, Vahed Qazvinian, and Amjad Abu-Jbara. The acl anthology network corpus. _Language Resources and Evaluation_, 47:919-944, 2013.
+* Shaham et al. (2023) Uri Shaham, Maor Ivgi, Avia Efrat, Jonathan Berant, and Omer Levy. Zeroscrolls: A zero-shot benchmark for long text understanding, 2023.
+* Tay et al. (2020) Yi Tay, Mostafa Dehghani, Samira Abnar, Yikang Shen, Dara Bahri, Philip Pham, Jinfeng Rao, Liu Yang, Sebastian Ruder, and Donald Metzler. Long range arena: A benchmark for efficient transformers. _arXiv preprint arXiv:2011.04006_, 2020.
+* Touvron et al. (2023) Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. _arXiv preprint arXiv:2307.09288_, 2023.
+* Vaswani et al. (2017) Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In _Advances in neural information processing systems_, pp. 5998-6008, 2017.
+* Wang et al. (2020) Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention with linear complexity. _arXiv preprint arXiv:2006.04768_, 2020.
+* Xiong et al. (2021) Yunyang Xiong, Zhanpeng Zeng, Rudrasis Chakraborty, Mingxing Tan, Glenn Fung, Yin Li, and Vikas Singh. Nystromformer: A nystrom-based algorithm for approximating self-attention. In _Proceedings of the AAAI Conference on Artificial Intelligence_, volume 35, pp. 14138-14148, 2021.
+* Zhang et al. (2023) Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Re, Clark Barrett, et al. H _2 o: Heavy-hitter oracle for efficient generative inference of large language models. _arXiv preprint arXiv:2306.14048_, 2023.
+* Zheng et al. (2023) Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric. P Xing, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. Judging llm-as-a-judge with mt-bench and chatbot arena, 2023.
+* Zheng et al. (2022) Lin Zheng, Chong Wang, and Lingpeng Kong. Linear complexity randomized self-attention mechanism. In _International Conference on Machine Learning_, pp. 27011-27041. PMLR, 2022.
+* Zhu and Soricut (2021) Zhenhai Zhu and Radu Soricut. H-transformer-1D: Fast one-dimensional hierarchical attention for sequences. In _Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers)_, pp. 3801-3815, Online, August 2021. Association for Computational Linguistics. doi: 10.18653/v1/2021.acl-long_294. URL [https://aclanthology.org/2021.acl-long_294](https://aclanthology.org/2021.acl-long_294).
+
+Pseudocode for IceFormer
+
+We provide the pseudocode below for IceFormer. For completeness, we include the pseudocode of Prioritized DCI, which we adapted from (Li & Malik, 2017) and added our modifications. In the following pseudocode below, \(T_{K}\) and \(T_{\text{Q}}\) are the key and query embedding functions, respectively.
+
+```
+0: A set \(S_{\theta}\) of \(n\) points \(q^{1},\dots,q^{n}\in\mathbb{R}^{d}\), a set \(S_{k}\) of \(n\) keys \(k^{1},\dots,k^{n}\in\mathbb{R}^{d}\), a set \(S_{v}\) of \(n\) values \(v^{1},\dots,v^{n}\in\mathbb{R}^{d}\), the number of simple indices \(m\) that constitute a composite index, the number of composite indices \(L\), the number of points to retrieve \(k_{0}\) and the number of points to visit \(k_{1}\) in each composite index function IceFormer_Attention(\(S_{q}\), \(S_{k}\), \(S_{v}\), \(m\), \(L\), \(k_{0}\), \(k_{1}\)) \(\mathbf{O}\leftarrow\) zero matrix \(\in\mathbb{R}^{n\times d^{\prime}}\) with rows \(\mathbf{o}_{i}\in\mathbb{R}^{d^{\prime}}\) \(S_{p}\leftarrow\) CONSTRUCT(\(S_{k}\), \(m\), \(L\)) for\(i=1\) to \(\mathbf{h}\)do \(S_{t}\leftarrow\)QUERY(\(q^{i},S_{p},k_{0},k_{1}\)) for\(j=1\) to \(\mathbf{h}\)do if\(j\in S_{l}\)then \(\tilde{s}_{ij}\leftarrow\frac{q^{i}k_{j}}{\sqrt{d}}\) else \(\tilde{s}_{ij}\gets 0\) endif endfor for\(j=1\) to \(\mathbf{h}\)do if\(j\in S_{l}\)then \(\tilde{a}_{i,j}\leftarrow\operatorname{softmax}_{j}\left(\tilde{s}_{ij}\right)= \frac{\exp\left(i_{i,j}\right)}{\sum_{k\in S_{l}}\exp\left(i_{k,k}\right)}\) else \(\tilde{a}_{ij}\gets 0\) endif endfor \(\mathbf{o}_{i}\leftarrow\sum_{j\in S_{l}}\tilde{a}_{i,j}v_{j}\) endfor return\(\mathbf{O}\) endfunction
+```
+
+**Algorithm 1** IceFormer attention
+
+```
+0: A dataset \(D\) of \(n\) points \(k^{1},\dots,k^{n}\), the number of simple indices \(m\) that constitute a composite index and the number of composite indices \(L\) functionConstruct(\(D\), \(m\), \(L\)) \(\{u_{jl}\}_{j\in[m],l\in[L]}\gets mL\) random unit vectors in \(\mathbb{R}^{d}\) \(\{T_{jl}\}_{j\in[m],l\in[L]}\gets mL\) empty binary search trees or skip lists for\(j=1\) to \(\mathbf{m}\)do for\(l=1\) to \(\mathbf{l}\)do for\(i=1\) to \(\mathbf{n}\)do \(\overline{k}_{jl}\leftarrow\langle T_{K}(k^{i}),u_{jl}\rangle\)  Insert \((\overline{k}_{jl},i)\) into \(T_{jl}\) with \(\overline{k}_{jl}^{i}\) being the key and \(i\) being the value endfor endfor return\(\{(T_{jl},u_{jl})\}_{j\in[m],l\in[L]}\) endfunction
+```
+
+**Algorithm 2** Data structure construction procedure
+```
+Query point \(q\) in \(\mathbb{R}^{d}\), binary search trees/skip lists and their associated projection vectors \(\{(T_{jl},u_{jl})\}_{j\in[m],l\in[L]}\), the number of points to retrieve \(k_{0}\) and the number of points to visit \(k_{1}\) in each composite index functionOutput(\(q\), \(\{(T_{jl},u_{jl})\}_{j,l},k_{0},k_{1}\)) \(C_{l}\leftarrow\) array of size \(n\) with entries initialized to \(0\)\(\forall l\in[L]\) \(\overline{q}_{jl}\leftarrow\langle T_{Q}(q),u_{jl}\rangle\)\(\forall j\in[m],l\in[L]\) \(S_{l}\leftarrow\emptyset\)\(\forall l\in[L]\) \(P_{l}\leftarrow\) empty priority queue \(\forall l\in[L]\) for\(l=1\)to\(L\)do for\(j=1\)to\(m\)do \((\overline{p}_{jl}^{(1)},h_{jl}^{(1)})\leftarrow\) the node in \(T_{jl}\) whose key is the closest to \(\overline{q}_{jl}\)  Insert \((\overline{p}_{jl}^{(1)},h_{jl}^{(1)})\) with priority \(-|\overline{p}_{jl}^{(1)}-\overline{q}_{jl}|\) into \(P_{l}\) endfor endfor for\(i^{\prime}=1\)to\(k_{1}-1\)do for\(l=1\)to\(L\)do if\(|S_{l}|<k_{0}\)then \((\overline{p}_{jl}^{(i)},h_{jl}^{(i)})\leftarrow\) the node with the highest priority in \(P_{l}\)  Remove \((\overline{p}_{jl}^{(i)},h_{jl}^{(i)})\) from \(P_{l}\) and insert the node in \(T_{jl}\) whose key is the next closest to \(\overline{q}_{jl}\),  which is denoted as \((\overline{p}_{jl}^{(i+1)},h_{jl}^{(i+1)})\), with priority \(-|\overline{p}_{jl}^{(i+1)}-\overline{q}_{jl}|\) into \(P_{l}\) \(C_{l}[h_{jl}^{(i)}]\gets C_{l}[h_{jl}^{(i)}]+1\) if\(C_{l}[h_{jl}^{(i)}]=m\)then \(S_{l}\gets S_{l}\cup\{h_{jl}^{(i)}\}\) endif endif endfor return\(k\) points in \(\bigcup_{l\in[L]}S_{l}\) that have the maximum inner-product value with \(q\) endfunction
+```
+
+**Algorithm 3**\(k\)-nearest neighbour querying procedure
+
+## Appendix B Proofs
+
+### Proof 1
+
+Here, we provide the full step-by-step derivation of the mathematical equivalence between conducting \(k\)-nearest neighbor search on normalized keys and identifying the keys that obtain the highest attention weight.
+
+\[\arg\max_{j}a_{i,j} =\arg\max_{j}\operatorname*{softmax}_{j}\left(\left\{\frac{\mathbf{ q}_{i}^{\top}\mathbf{k}_{j^{\prime}}}{\sqrt{d}}\right\}_{j^{\prime}=1}^{m}\right) \tag{11}\] \[=\arg\max_{j}\frac{\mathbf{q}_{i}^{\top}\mathbf{k}_{j}}{\sqrt{d}}\] (12) \[=\arg\min_{j}\|\mathbf{q}_{i}\|_{2}^{2}-2\mathbf{q}_{i}^{\top} \mathbf{k}_{j}+1 \tag{13}\]
+
+Since \(\|\mathbf{k}_{j^{\prime}}\|_{2}=1\) for all \(j^{\prime}\), \(\|\mathbf{q}_{i}\|_{2}^{2}-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}+1=\|\mathbf{q }_{i}\|_{2}^{2}-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}+\|\mathbf{k}_{j}\|_{2}^{ 2}=\|\mathbf{q}_{i}-\mathbf{k}_{j}\|_{2}^{2}\),
+
+\[\arg\max_{j}a_{i,j} =\arg\min_{j}\|\mathbf{q}_{i}\|_{2}^{2}-2\mathbf{q}_{i}^{\top} \mathbf{k}_{j}+1 \tag{14}\] \[=\arg\min_{j}\|\mathbf{q}_{i}-\mathbf{k}_{j}\|_{2}^{2} \tag{15}\]
+
+### Proof 2
+
+Here, we provide the full step-by-step derivation of the result in 4.1 establishing the mathematical equivalence between conducting \(k\)-nearest neighbor search on transformed keys and identifying the keys that obtain the highest attention weight.
+
+\[\arg\max_{j}a_{i,j} =\arg\max_{j}\operatorname*{softmax}_{j}\left(\left\{\frac{\mathbf{ q}_{i}^{\top}\mathbf{k}_{j^{\prime}}}{\sqrt{d}}\right\}_{j^{\prime}=1}^{m}\right) \tag{16}\] \[=\arg\max_{j}\frac{\mathbf{q}_{i}^{\top}\mathbf{k}_{j}}{\sqrt{d}}\] (17) \[=\arg\max_{j}\mathbf{q}_{i}^{\top}\mathbf{k}_{j}\] (18) \[=\arg\min_{j}-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}\] (19) \[=\arg\min_{j}2-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}/c\|\mathbf{q }_{i}\|_{2}\] (20) \[=\arg\min_{j}1-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}/c\|\mathbf{q }_{i}\|_{2}+1\] (21) \[=\arg\min_{j}\|\mathbf{q}_{i}\|_{2}^{2}/\|\mathbf{q}_{i}\|_{2}^{ 2}-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}/c\|\mathbf{q}_{i}\|_{2}+\|\mathbf{k}_{ j}\|_{2}^{2}/c^{2}+1-\|\mathbf{k}_{j}\|_{2}^{2}/c^{2}\] (22) \[=\arg\min_{j}\mathbf{q}_{i}^{\top}\mathbf{q}_{i}/\|\mathbf{q}_{i} \|_{2}^{2}-2\mathbf{q}_{i}^{\top}\mathbf{k}_{j}/c\|\mathbf{q}_{i}\|_{2}+ \mathbf{k}_{j}^{\top}\mathbf{k}_{j}/c^{2}+1-\|\mathbf{k}_{j}\|_{2}^{2}/c^{2}\] (23) \[=\arg\min_{j}(\mathbf{q}_{i}/\|\mathbf{q}_{i}\|_{2}-\mathbf{k}_{j }/c)^{\top}(\mathbf{q}_{i}/\|\mathbf{q}_{i}\|_{2}-\mathbf{k}_{j}/c)+1-\| \mathbf{k}_{j}\|_{2}^{2}/c^{2}\] (24) \[=\arg\min_{j}\|\mathbf{q}_{i}/\|\mathbf{q}_{i}\|_{2}-\mathbf{k}_{ j}/c\|_{2}^{2}+1-\|\mathbf{k}_{j}\|_{2}^{2}/c^{2}\] (25) \[=\arg\min_{j}\|\mathbf{q}_{i}/\|\mathbf{q}_{i}\|_{2}-\mathbf{k}_{ j}/c\|_{2}^{2}+\left(0-\sqrt{1-\|\mathbf{k}_{j}\|_{2}^{2}/c^{2}}\right)^{2}\] (26) \[=\arg\min_{j}\|T_{Q}(\mathbf{q}_{i})-T_{K}(\mathbf{k}_{j})\|_{2}^ {2}\] (27) \[=\arg\min_{j}\|T_{Q}(\mathbf{q}_{i})-T_{K}(\mathbf{k}_{j})\|_{2} \tag{28}\]
+
+## Appendix C More Details on the LRA Experimental Setting
+
+### Dataset Details
+
+In our LRA experiments, for Retrieval, Text and Pathfinder (\(64\times 64\) version), we directly use the dataset from LRA codebase1. Because the original datasets for ListOps and Image only contain short sequences, we generate longer samples for ListOps using the same code from the LRA codebase with 4000 as the maximum length; for Image task, we use a version of the CIFAR-10 dataset super-resolved to \(64\times 64\)2 instead of the original low-resolution \(32\times 32\) CIFAR-10 dataset. We follow the exact same train/test split as the original LRA paper (Tay et al., 2020). The details of the LRA dataset is listed in Table 4.
+
+Footnote 1: [https://github.com/google-research/long-range-arena/tree/main](https://github.com/google-research/long-range-arena/tree/main)
+
+Footnote 2: [https://www.kaggle.com/datasets/joaopauloschuler/cifar10-64x64-resized-via-cai-super-resolution](https://www.kaggle.com/datasets/joaopauloschuler/cifar10-64x64-resized-via-cai-super-resolution)
+
+### Base Model Configuration
+
+We follow the experimental setup of prior work (Zhu and Soricut, 2021) for training the base model. However, since we were not able to successfully train base Transformer models to satisfactory accuracy on Image and Pathfinder datasets using the original setting, we decreased the number of heads and layers for these two tasks. The details of the base model for each task are outlined in Table 5.
+
+\begin{table}
+\begin{tabular}{c|c|c|c|c|c} \hline Task & ListOps & Text & Retrieval & Image & Pathfinder \\ \hline \hline Max length & 3.991 & 4.000 & 4.000 & 4.096 & 4.096 \\ Avg. length & 2.232 & 1.267 & 3.197 & 4.096 & 4.096 \\ number of classes & 10 & 2 & 2 & 10 & 2 \\ Accuracy by chance & 0.100 & 0.500 & 0.500 & 0.100 & 0.500 \\ \hline \end{tabular}
+\end{table}
+Table 4: LRA Dataset Details.
+
+### Hyperparameters for the Baselines and the Proposed Method
+
+For LARA and Nystromformer, we tuned the parameter _num_landmarks_ by optimizing over the range {64, 128, 256, 512, 1024}. For H-Transformer-1D, we tuned the parameter _block_size_ by optimizing over the range {64, 128, 256, 512, 1024}. For Reformer, we tuned the parameters _num_hash_ and _bucket_size_: we considered the values of _num_hash_ in range {1, 2, 4} and the values of _bucket_size_ in range {64, 128, 256, 512, 1024}. For IceFormer, we tuned the parameter _top_k_ over the range {3, 5, 8, 10, 15, 20}. In general, a larger value for _bucket_size_, _num_landmarks_, _block_size_, or _top_k_ indicates less aggressive approximation, meaning that the model performance is closer to that of the vanilla Transformer. We select the values of the hyperparameters that lead to the best accuracy-time trade-off for each model, and list them in Table 6.
+
+## Appendix D Additional Experiments on LRA
+
+Approximation Quality.In order to assess how well various efficient Transformers approximate the outputs of the vanilla modified attention module, we measure the approximation error by computing the L2-norm of the difference between their attention module outputs and those of the standard vanilla attention module (\(\mathbf{o}_{i}\) in Equation 2). The averaged approximation errors for different efficient Transformers, utilizing the same hyper-parameter settings of Table 6, are summarized in Table 7. As indicated in the table, IceFormer consistently achieves the lowest approximation errors across all LRA tasks, providing further evidence of its approximation efficacy.
+
+Visualization of Tables 1&2.The results from Table 1 and Table 2 are visually represented in Figures 6 and 7, respectively.
+
+\begin{table}
+\begin{tabular}{c|c|c|c|c|c|c|c} \hline Method & hyper-parameter & ListOps & Text & Retrieval & Image & Pathfinder \\ \hline \hline Reformer (Nikita et al., 2020) & \multicolumn{1}{c|}{num\_hash} & 1 & 1 & 1 & 1 & / \\  & bucket\_size & 512 & 128 & 256 & 1024 & / \\ \hline LARA (Zheng et al., 2022) & \multicolumn{1}{c|}{num\_landmarks} & 256 & 256 & 512 & 1024 & 1024 \\ \hline Nystromformer (Xiong et al., 2021) & \multicolumn{1}{c|}{num\_landmarks} & 256 & 256 & 512 & 512 & 1024 \\ \hline H-Transformer-1D (Zhu \& Seoter, 2012) & \multicolumn{1}{c|}{block\_size} & 1024 & 512 & 1024 & 256 & 1024 \\ \hline Longformer (Heidays et al., 2020) & attention\_window & 2048 & 10024 & 2048 & 2048 & 2048 \\ \hline Performer (Chacomanski et al., 2020) & \multicolumn{1}{c|}{num\_rand\_features} & 2048 & 10024 & 2048 & 2048 & 2048 \\ \hline Livermore (Wang et al., 2020) & \multicolumn{1}{c|}{num\_pool\_dim} & 512 & 128 & 512 & 2048 & 1024 \\ \hline IceFormer & top\_k & 8 & 3 & 10 & 10 & 10 \\ \hline IceFormer (shared-QK) & top\_k & 10 & 3 & 10 & 20 & / \\ \hline \end{tabular}
+\end{table}
+Table 6: Hyperparameter settings for different methods.
+
+\begin{table}
+\begin{tabular}{c|c|c|c|c|c|c} \hline Method & shared-KQ & ListOps & Text & Retrieval & Image & Pathfinder \\ \hline \hline Reformer (Nikita et al., 2020) & ✓ & 3.823 & 3.926 & 5.452 & 2.130 & / \\ LARA (Zheng et al., 2022) & ✗ & 2.395 & 9.456 & 10.025 & 22.060 & 9.261 \\ Nystromformer (Xiong et al., 2021) & ✗ & 5.758 & 10.269 & 6.523 & 18.789 & 10.422 \\ H-Transformer-1D (Zhu \& Seoter, 2021) & ✗ & 6.110 & 10.605 & 5.676 & 53.926 & 12.228 \\ \hline IceFormer (ours) & ✗ & **2.140** & **3.891** & **1.825** & **6.873** & **8.740** \\  & ✓ & **1.562** & **1.486** & **2.499** & **2.127** & / \\ \hline \end{tabular}
+\end{table}
+Table 7: Quality of the approximation on LRA benchmark. The approximation error of the attention module output is reported for each method across all the tasks.
+
+\begin{table}
+\begin{tabular}{c|c|c|c|c|c} \hline Task & ListOps & Text & Retrieval & Image & Pathfinder \\ \hline \hline head embedding size & 512 & 512 & 512 & 512 & 512 \\ feed-forward size & 2048 & 2048 & 2088 & 1024 & 1024 \\ number of heads & 8 & 8 & 8 & 4 & 4 \\ number of layers & 6 & 6 & 6 & 4 & 4 \\ \hline \end{tabular}
+\end{table}
+Table 5: Configurations of the base models for different tasks.
+
+## Appendix E More Details on the LLM Experiment
+
+### LLM Experiment Setting
+
+We use vicuna-7b-v1.5-16k as the tested LLM in section 5.3. It contains 32 attention layers, each of which contains 32 attention heads with dimensionality equals to 128. Its maximum input sequence length is 16,384. We observe varying levels of sparsity across different layers of LLMs, and this sparsity remains consistent across different prompts. Therefore, in all the LLMs experiments in section 5.3, we apply IceFormer to approximate relatively sparse layers ranging from the sixteenth to the thirty-first in vicuna-7b-v1.5-16k. This selection encompassed a total of 16 layers, equivalent to half of the total number of layers in the model.
+
+The \(k\) in the \(k\)-NNS of IceFormer for each task of the ZeroSCROLLS benchmark and the LongEval benchmark is defined as:
+
+\[k=\max(\min(\lfloor n*\alpha\rfloor,50),30) \tag{29}\]
+
+where \(n\) is the number of input tokens, \(\lfloor x\rfloor\) is the floor function, and \(\alpha\) is a hyper-parameter set by the users. In the ZeroSCROLLS benchmark, we set \(\alpha\) equals to 4e-3 for tasks SSFD and QMsm; 5e-3 for tasks GvRp, SQAL, Qspr, Nrtv, MusQ and BkSS; 6e-3 for tasks QALT and SpDg. In the LongEval benchmark, we set \(\alpha\) equals to 5e-3 for all the settings of both two tasks.
+
+### Causal Masks and Other Inference-Time Efficient Transformers
+
+In the main paper, we did not compare IceFormer with LARA and Nystromformer on LLMs. In this section, we elaborate on the problems of causal masks for these two methods.
+
+Most random-feature-based models such as LARA and Nystromformer group different tokens into different clusters, known as _landmarks_. In order to enable causal masking in these models, not only does the masking need to be applied at the landmark level to prevent the leakage of information from future tokens, an additional set of masks is also required to mask out different numbers of tokens within the same landmark for different queries. The latter is not supported natively and is especially
+
+Figure 6: The performance of IceFormer and the baselines (vanilla Transformer, Reformer, LARA, Nyströmer, H-Transformer-1D) on the LRA benchmark (the closer a point is to the top-left corner the better).
+
+Figure 7: Peak memory usage (GB) on the LRA benchmark. The peak memory usage is the total memory usage of the whole program, which includes the memory for the Prioritized DCI database/index (the smaller the better).
+
+[MISSING_PAGE_EMPTY:122982]
+
+**Prompt (8k tokens)**
+
+A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Please help me to summarize the following:
+
+Rapidly growing population along with digitalization and globalization re-sult in constantly increasing number of internet users. (ITU 2019) Closely relat-ed to this development is the expansion of coemmerce business. Especially in the times of isolation, caused by the Corona crisis, which we currently live, in we spend much more time on the internet than we used to, and this seems to be great oppor-tunity for the growth of online shopping industry. Lockdowns in the countries across the whole world have had considerable influence on the numbers of online purchases. The statistics compiled by the Organisation for Economic Co-operation and Development confirm this assumption showing that the e-commerce retail in the United States and in the United Kingdom rose between the first quarter and the second quarter of 2020 (first lockdown in the UK on the 26th March 2020, in the U.S. on the 19th March 2020 (from 11.8% to 16.1% respectively from 20.3% to 31.3%. The increasing numbers of online purchases signify higher revenues and at the same time add the importance to this sector.
+
+[...]
+
+If advertisers wish to be successful in their OBA practices, they should also attempt to find out more about users' reasons for being online. According to the interactive advertising model (Rogers and Thorson 2000), advertisements, which address these motives can achieve better results, because consumers tend to pay more attention towards them, and they are also considered to be easier to remember-ber. (Boerman et al. 2017) Consumers are more willing to accept OBA practices, if they feel that they might support them in the pursuit of their objectives. (Kirmani and Campbell 2004)
+
+**Keyformer Output Example (8-40)**
+
+The rapidly growing population and digitalization have led to an increasing number of internet users, with the commerce business expanding in particular during the Corona crisis. Online purchases have risen, and retail volumes have decreased due to lockdowns. Companies are investing more capital in online marketing and advertising, but users often feel irritated by online advertisements, especially when they are not relevant. Online behavioral advertising (OBA) targets consumers based on collected personal information, but it can be effective only if it is highly personalized. However, this can also cause feelings of anxiety and fear, and there have been several scandals related to the misuse of personal data collected online. The importance of the commerce sector and the scandals related to online marketing have led to a need to discuss and investigate OBA practices and their influence on consumers.
+
+Figure 9: Output of IceFormer (Top-40) + LLM with 8k input tokens. We ask the LLM to summarize an article titled “Research of How Online Behavioral Advertising Influences Consumers”.

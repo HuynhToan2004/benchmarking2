@@ -1,0 +1,639 @@
+# Bespoke Solvers for Generative Flow Models
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Diffusion or flow-based models are powerful generative paradigms that are notoriously hard to sample as samples are defined as solutions to high-dimensional Ordinary or Stochastic Differential Equations (ODEs/SDEs) which require a large Number of Function Evaluations (NFE) to approximate well. Existing methods to alleviate the costly sampling process include model distillation and designing dedicated ODE solvers. However, distillation is costly to train and sometimes can deteriorate quality, while dedicated solvers still require relatively large NFE to produce high quality samples. In this paper we introduce _"Bespoke solvers"_, a novel framework for constructing custom ODE solvers tailored to the ODE of a given pre-trained flow model. Our approach optimizes an order consistent and parameter-efficient solver (_e.g._, with 80 learnable parameters), is trained for roughly 1% of the GPU time required for training the pre-trained model, and significantly improves approximation and generation quality compared to dedicated solvers. For example, a Bespoke solver for a CIFAR10 model produces samples with Frechet Inception Distance (FID) of 2.73 with 10 NFE, and gets to 1% of the Ground Truth (GT) FID (2.59) for this model with only 20 NFE. On the more challenging ImageNet-64\(\times\)64, Bespoke samples at 2.2 FID with 10 NFE, and gets within 2% of GT FID (1.71) with 20 NFE.
+
+## 1 Introduction
+
+Diffusion models (Sohl-Dickstein et al., 2015; Ho et al., 2020), and more generally flow-based models (Song et al., 2020; Lipman et al., 2022; Albergo and Vanden-Eijnden, 2022), have become prominent in generation of images (Dhariwal and Nichol, 2021; Rombach et al., 2021), audio (Kong et al., 2020; Le et al., 2023), and molecules (Kong et al., 2020). While training flow models is relatively scalable and efficient, sampling from a flow-based model entails solving a Stochastic or Ordinary Differential Equation (SDE/ODE) in high dimensions, tracing a velocity field defined with the trained neural network. Using off-the-shelf solvers to approximate the solution of this ODE to a high precision requires a large Number (_i.e._, 100s) of Function Evaluations (NFE), making sampling one of the main standing challenges in flow models. Improving the sampling complexity of flow models, without degrading sample quality, will open up new applications that require fast sampling, and will help reducing the carbon footprint and deployment cost of these models.
+
+Current approaches for efficient sampling of flow models divide into two main groups: (i) _Distillation_: where the pre-trained model is fine-tuned to predict either the final sampling (Luhman and Luhman, 2021) or some intermediate solution steps (Salimans and Ho, 2022) of the ODE. Distillation does not guarantee sampling from the pre-trained model's distribution, but, when given access to the training data during distillation training, it is shown to empirically generate samples of comparable quality to the original model (Salimans and Ho, 2022; Meng et al., 2023). Unfortunately, the GPU time required to distill a model is comparable to the training time of the original model Salimans and Ho (2022), which is often considerable. (ii) _Dedicated solvers_: where the specific structure of the ODE is used to design a more efficient solver (Song et al., 2020; Lu et al., 2022; 20) and/or employ a suitable solver family from the literature of numerical analysis (Zhang and Chen, 2022; Zhang et al., 2023). The main benefit of this approach is two-fold: First, it is _consistent_, _i.e._, as the number of steps (NFE) increases, the samples converge to those of the pre-trained model. Second, it does not require further training/fine-tuning of the pre-trained model, consequently avoiding long additional training times and access to training data. Related to our approach, some works have tried to learn an ODE solver within a certain class (Watson et al., 2021; Duan et al., 2023); however, they do not guarantee consistency and usually introduce moderate improvements over generic dedicated solvers.
+
+In this paper, we introduce _Bespoke solvers_, a framework for learning consistent ODE solvers _custom-tailored_ to pre-trained flow models. The main motivation for Bespoke solvers is that different models exhibit sampling paths with different characteristics, leading to local truncation errors that are specific to each instance of a trained model. A key observation of this paper is that optimizing a solver for a particular model can significantly improve quality of samples for low NFE compared to existing dedicated solvers. Furthermore, Bespoke solvers use a very small number of learnable parameters and consequently are efficient to train. For example, we have trained \(n\in\{5,8,10\}\) steps Bespoke solvers for a pre-trained ImageNet-64\(\times\)64 flow model with \(\{40,64,80\}\) learnable parameters (resp.) producing images with Frechet Inception Distances (FID) of \(2.2\), \(1.79\), \(1.71\) (resp.), where the latter is within 2% from the Ground Truth (GT) FID (1.68) computed with \(\sim 180\) NFE. The Bespoke solvers were trained (using a rather naive implementation) for roughly 1% of the GPU time required for training the original model. Figure 1 compares sampling at 10 NFE from a pre-trained AFHQ-256\(\times\)256 flow model with order 2 Runge-Kutta (RK2) and its Bespoke version (RK2-Bes), along with the GT sample that requires \(\sim 180\) NFE.Our work brings the following contributions:
+
+1. A differentiable parametric family of consistent ODE solvers.
+2. A tractable loss that bounds the global truncation error while allowing parallel computation.
+3. An algorithm for training a Bespoke \(n\)-step solver for a specific pre-trained model.
+4. Significant improvement over dedicated solvers in generation quality for low NFE.
+
+## 2 Bespoke solvers
+
+We consider a pre-trained flow model taking some prior distribution (noise) \(p\) to a target (data) distribution \(q\) in data space \(\mathbb{R}^{d}\). The flow model (Chen et al., 2018) is represented by a time-dependent Vector Field (VF) \(u:[0,1]\times\mathbb{R}^{d}\rightarrow\mathbb{R}^{d}\) that transforms a noise sample \(x_{0}\sim p(x_{0})\) to a data sample \(x_{1}\sim q(x_{1})\) by solving the ODE
+
+\[\dot{x}(t)=u_{t}(x(t)), \tag{1}\]
+
+with the initial condition \(x(0)=x_{0}\sim p(x_{0})\), from time \(t=0\) until time \(t=1\), and \(\dot{x}(t):=\frac{d}{dt}x(t)\). The solution at time \(t=1\), _i.e._, \(x(1)\sim q(x(1))\), is the generated target sample.
+
+**Numerical ODE solvers.** Solving equation 1 is done in practice with numerical ODE solvers. A numerical solver is defined by an update rule:
+
+\[(t_{\text{next}},x_{\text{next}})=\text{step}(t,x;u_{t}). \tag{2}\]
+
+The update rule takes as input current time \(t\) and approximate solution \(x\), and outputs the next time step \(t_{\text{next}}\) and the corresponding approximation \(x_{\text{next}}\) to the true solution \(x(t_{\text{next}})\) at time \(t_{\text{next}}\). To approximate the solution at some desired end time, _i.e._, \(t=1\), one first initializes the solution at \(t=0\) and repeatedly applies the update rule in equation 2 \(n\) times, as presented in Algorithm 1. The step is designed so that \(t_{n}=1\).
+
+An ODE solver (step) is said to be of _order_\(k\) if its local truncation error is
+
+\[\|x(t_{\text{next}})-x_{\text{next}}\|=O\left((t_{\text{next}}-t)^{k+1}\right), \tag{3}\]
+
+asymptotically as \(t_{\text{next}}\to t\), where \(t\in[0,1)\) is arbitrary but fixed and \(t_{\text{next}},x_{\text{next}}\) are defined by the solver, equation 2. A popular family of solvers that offers a wide range of orders is the Runge-Kutta (RK) family (Iserles, 2009). Two of the most popular members of the RK family are (set \(h=n^{-1}\)):
+
+\[\text{RK1 (Euler - order 1):}\qquad\text{step}(t,x;u_{t}) =(t+h\,,\,x+hu_{t}(x))\,, \tag{4}\] \[\text{RK2 (Midpoint - order 2):}\quad\text{step}(t,x;u_{t}) =\left(t+h\,,\,x+hu_{t+\frac{h}{2}}\left(x+\frac{h}{2}u_{t}(x) \right)\right). \tag{5}\]
+
+Figure 1: Using 10 NFE to sample using our Bespoke solver improves fidelity w.r.t. the baseline (RK2) solver. Visualization of paths was done with the 2D PCA plane approximating the noise and end sample points.
+
+**Approach outline.** Given a pre-trained \(u_{t}\) and a target number of time steps \(n\) our goal is to find a custom (Bespoke) solver that is optimal for approximating the samples \(x(1)\) defined via equation 1 from initial conditions sampled according to \(x(0)=x_{0}\sim p(x_{0})\). To that end we develop two components: (i) a differentiable parametric family of update rules step\({}^{\theta}\), with parameters \(\theta\in\mathbb{R}^{p}\) (where \(p\) is _very_ small), where sampling is done by replacing step with step\({}^{\theta}\) in Algorithm 1, see Algorithm 2; and (ii) a tractable loss bounding the _global truncation error_, _i.e._, the Root Mean Square Error (RMSE) between the approximate sample \(x_{n}^{\theta}\) and the GT sample \(x(1)\),
+
+\[\text{Global truncation error:}\quad\mathcal{L}_{\text{RMSE}}(\theta)=\mathbb{ E}_{x_{0}\sim p(x_{0})}\left\|x(1)-x_{n}^{\theta}\right\|, \tag{6}\]
+
+where \(x_{n}^{\theta}\) is the output of Algorithm 2, and \(\left\|x\right\|=(\frac{1}{d}\sum_{j=1}^{d}[x^{(j)}]^{2})^{1/2}\).
+
+### Parametric family of ODE solvers through transformed sampling paths
+
+Our strategy for defining the parametric family of solvers step\({}^{\theta}\) is using a generic base ODE solver, such as RK1 or RK2, applied to a parametric family of _transformed paths_.
+
+**Transformed sampling paths.** We transform the sample trajectories \(x(t)\) by applying two components: a time reparametrization and an arbitrary invertible transformation. That is,
+
+\[\bar{x}(r)=\varphi_{r}(x(t_{r})),\quad r\in[0,1], \tag{7}\]
+
+where \(t_{r},\varphi_{r}(x)\) are arbitrary functions in a family \(\mathcal{F}\) defined by the following conditions: (i) _Smooothness_: \(t_{r}:\,[0,1]\rightarrow[0,1]\) is a diffeomorphism1, and \(\varphi:[0,1]\times\mathbb{R}^{d}\rightarrow\mathbb{R}^{d}\) is \(C^{1}\) and a diffeomorphism in \(x\). We also assume \(r_{t}\) and \(\varphi_{r}^{-1}\) are Lipschitz continuous with a constant \(L>0\). (ii) _Boundary conditions_: \(t_{r}\) satisfies \(t_{0}=0\) and \(t_{1}=1\), and \(\varphi_{0}(\cdot)\) is the identity function, _i.e._, \(\varphi_{0}(x)=x\) for all \(x\in\mathbb{R}^{d}\). Figure 2 depicts a transformation of a path, \(x(t)\). Note that \(\bar{x}(0)=x(0)\), however the end point \(\bar{x}(1)\) does not have to coincide with \(x(1)\). Furthermore, as \(t_{r}:[0,1]\rightarrow[0,1]\) is a diffeomorphism, \(t_{r}\) is strictly monotonically increasing.
+
+Footnote 1: A diffeomorphism is a \(C^{1}\) continuously differentiable function with a \(C^{1}\) continuous differentiable inverse.
+
+The motivation behind the definition of the transformed trajectories is that it allows reconstructing \(x(t)\) from \(\bar{x}(r)\). Indeed, denoting \(r=r_{t}\) the inverse function of \(t=t_{r}\) we have
+
+\[x(t)=\varphi_{r_{t}}^{-1}(\bar{x}(r_{t})). \tag{8}\]
+
+Our hope is to find a transformation that simplifies sampling paths and allows the base solver to provide better approximations of the GT samples. The transformed trajectory \(\bar{x}_{r}\) is defined by a VF \(\bar{u}_{r}(x)\) that can be given an explicit form as follows (proof in Appendix A):
+
+**Proposition 2.1**.: _Let \(x(t)\) be a solution to equation 1. Denote \(\dot{\varphi}_{r}:=\frac{d}{dr}\varphi_{r}\) and \(\dot{t}_{r}:=\frac{d}{dr}t_{r}\). Then \(\bar{x}(r)\) defined in equation 7 is a solution to the ODE (equation 1) with the VF_
+
+\[\bar{u}_{r}(x)=\dot{\varphi}_{r}(\varphi_{r}^{-1}(x))+\dot{t}_{r}\partial_{x} \varphi_{r}(\varphi_{r}^{-1}(x))u_{t_{r}}(\varphi_{r}^{-1}(x)). \tag{9}\]
+
+**Solvers via transformed paths.** We are now ready to define our parametric family of solvers step\({}^{\theta}(t,x;u_{t})\): First we transform the input sample \((t,x)\) according to equation 7 to
+
+\[(r,\bar{x})=(r_{t},\varphi_{r_{t}}(x)). \tag{10}\]
+
+Next, we perform a step with the base solver of choice,
+
+\[(r_{\text{neat}},\bar{x}_{\text{neat}})=\text{step}(r,\bar{x};\bar{u}_{r}), \tag{11}\]
+
+and lastly, transform back using equation 8 to define the parametric solver step\({}^{\theta}\) via
+
+\[(t_{\text{next}},x_{\text{next}})=\text{step}^{\theta}(x,t;u_{t})=\left(t_{r_ {\text{max}}},\varphi_{r_{\text{max}}}^{-1}(\bar{x}_{\text{next}})\right). \tag{12}\]
+
+The parameters \(\theta\) denote the parameterized transformations \(t_{r}\) and \(\varphi_{r}\) satisfying the properties of \(\mathcal{F}\) and the choice of a base solver step. In Section 2.2 we derive the explicit rules we use in this paper.
+
+Figure 2: Transformed paths.
+
+Consistency of solvers.An important property of the parametric solver step\({}^{\theta}\) is _consistency_. Namely, due to the properties of \(\mathcal{F}\), regardless of the particular choice of \(t_{r},\varphi_{r}\in\mathcal{F}\), the solver step\({}^{\theta}\) has the same local truncation error as the base solver.
+
+**Theorem 2.2**.: _(Consistency of parametric solvers) Given arbitrary \(t_{r},\varphi_{r}\) in the family of functions \(\mathcal{F}\) and a base ODE solver of order \(k\), the corresponding ODE solver step\({}^{\theta}\) is also of order \(k\), i.e.,_
+
+\[\|x(t_{\text{next}})-x_{\text{next}}\|=O((t_{\text{next}}-t)^{k+1}). \tag{13}\]
+
+The proof is provided in Appendix B. Therefore, as long as \(t_{r},\varphi_{r}(x)\) are in \(\mathcal{F}\), decreasing the base solver's step size \(h\to 0\) will result in our approximated sample \(x_{n}^{\theta}\) converging to the exact sample \(x(1)\) of the trained model in the limit, _i.e._, \(x_{n}^{\theta}\to x(1)\) as \(n\to\infty\).
+
+### Two use cases
+
+We instantiate the Bespoke solver framework for two cases of interest (a full derivation is in Appendix E), and later prove that our choice of transformations in fact covers all "noise scheduler" configurations used in the standard diffusion model literature. In our use cases, we consider a time-dependent scaling as our invertible transformation \(\varphi_{r}\),
+
+\[\varphi_{r}(x)=s_{r}x,\text{ and its inverse }\varphi_{r}^{-1}(x)=x/s_{r}, \tag{14}\]
+
+where \(s:[0,1]\to\mathbb{R}_{>0}\) is a strictly positive \(C^{1}\) scaling function such that \(s_{0}=1\) (_i.e._, satisfying the boundary condition of \(\varphi\)). The transformation of trajectories, _i.e._, equations 7 and 8, take the form
+
+\[\bar{x}(r)=s_{r}x(t_{r}),\text{ and }x(t)=\bar{x}(r_{t})/s_{t_{r}}, \tag{15}\]
+
+and we name this transformation: _scale-time_. The transformed VF \(\bar{u}_{r}\) (equation 9) is thus
+
+\[\bar{u}_{r}(x)=\frac{\dot{s}_{r}}{s_{r}}x+\dot{t}_{r}s_{r}u_{t_{r}}\left(\frac{ x}{s_{r}}\right). \tag{16}\]
+
+Use case I: RK1-Bespoke.We consider RK1 (Euler) method (equation 4) as the base solver step and denote \(r_{i}=ih\), \(i\in[n]\), where \([n]=\{0,1,\dots,n\}\) and \(h=n^{-1}\). Substituting equation 4 in equation 11, we get from equation 12 that
+
+\[\text{step}^{\theta}(t_{i},x_{i};u_{t}):=\left(t_{i+1},\frac{s_{i}+h\dot{s}_{i }}{s_{i+1}}x_{i}+h\dot{t}\frac{s_{i}}{s_{i+1}}u_{t_{i}}(x_{i})\right), \tag{17}\]
+
+where we denote \(t_{i}=t_{r_{i}}\), \(i_{i}=\frac{d}{\dot{t}}|_{r=r,t_{r}}\), \(s_{i}=s_{r_{i}}\), \(\dot{s}_{i}=\frac{d}{\dot{d}}|_{r=r,t}s_{r}\), and \(i\in[n-1]\). The learnable parameters \(\theta\in\mathbb{R}^{p}\) and their constraints are derived from the fact that the functions \(t_{r},\varphi_{r}\) are members of \(\mathcal{F}\). There are \(p=4n-1\) parameters in total: \(\theta=(\theta^{t},\theta^{s})\), where
+
+\[\theta^{t}:\begin{cases}0=t_{0}<t_{1}<\dots<t_{n-1}<t_{n}=1\\ \dot{t}_{0},\dots,\dot{t}_{n-1}>0\end{cases},\quad\theta^{s}:\begin{cases}s_ {1},\dots,s_{n}>0\\ s_{0},\dots,\dot{s}_{n-1}\end{cases},\;\;s_{0}=1\quad. \tag{18}\]
+
+Note that we ignore the Lipschitz constant constraints in \(\mathcal{F}\) when deriving the constraints for \(\theta\).
+
+Use case II: RK2-Bespoke.Here we choose the RK2 (Midpoint) method (equation 5) as the base solver step. Similarly to the above, substituting equation 5 in equation 11, we get
+
+\[\text{step}^{\theta}(t_{i},x_{i};u_{t}):=\left(t_{i+1},\frac{s_{i}}{s_{i+1}}x_ {i}+\frac{h}{s_{i+1}}\left\{\frac{\dot{s}_{i+\frac{1}{2}}}{s_{i+\frac{1}{2}} }z_{i}+\dot{t}_{i+\frac{1}{2}}s_{i+\frac{1}{2}}u_{t_{i+\frac{1}{2}}}\left( \frac{z_{i}}{s_{i+\frac{1}{2}}}\right)\right\}\right), \tag{19}\]
+
+where we set \(r_{i+\frac{1}{2}}=r_{i}+\frac{h}{2}\), and accordingly \(t_{i+\frac{1}{2}},\dot{t}_{i+\frac{1}{2}},\dot{s}_{i+\frac{1}{2}}\), and \(\dot{s}_{i+\frac{1}{2}}\) are defined, and
+
+\[z_{i}=\left(s_{i}+\frac{h}{2}\dot{s}_{i}\right)x_{i}+\frac{h}{2}s_{i}\dot{t}_{ i}u_{t_{i}}(x_{i}). \tag{20}\]
+
+In this case there are \(p=8n-1\) learnable parameters, \(\theta=(\theta^{t},\theta^{s})\in\mathbb{R}^{p}\), where
+
+\[\theta^{t}:\begin{cases}0=t_{0}<t_{\frac{1}{2}}<\dots<t_{n}=1\\ \dot{t}_{0},\dot{t}_{\frac{1}{2}},\dots,\dot{t}_{n-1},\dot{t}_{n-\frac{1}{2}}> 0\end{cases},\quad\theta^{s}:\begin{cases}s_{\frac{1}{2}},s_{1},\dots,s_{n}>0 \\ \dot{s}_{0},\dot{s}_{\frac{1}{2}},\dots,\dot{s}_{n-\frac{1}{2}}\end{cases}. \tag{21}\]Equivalence of scale-time transformations and Gaussian Paths.We note that our _scale-time_ transformation covers _all_ possible trajectories used by diffusion and flow models trained with Gaussian distributions. Denote by \(p_{t}(x)\) the probability density function of the random variable \(x(t)\), where \(x(t)\) is defined by a random initial sampling \(x(0)=x_{0}\sim p(x_{0})\) and solving the ODE in equation 1.
+
+When training a Diffusion or Flow Matching models, \(p_{t}\) has the form \(p_{t}(x)=\int p_{t}(x|x_{1})q(x_{1})dx_{1}\), where \(p_{t}(x|x_{1})=\mathcal{N}(x|\alpha_{t}x_{1},\sigma_{t}^{2}I)\). A pair of functions \(\alpha,\sigma:[0,1]\rightarrow[0,1]\) satisfying
+
+\[\alpha_{0}=0=\sigma_{1},\ \ \alpha_{1}=1=\sigma_{0},\ \ \text{and strictly monotonic}\ \mathrm{snr}(t)=\alpha_{t}/\sigma_{t} \tag{22}\]
+
+is called a _scheduler2_. We use the term _Gaussian Paths_ for the collection of probability paths \(p_{t}(x)\) achieved by different schedulers. The velocity vector field that generates \(p_{t}(x)\) and results from zero Diffusion/Flow Matching training loss is
+
+Footnote 2: We use the convention of noise at time \(t=0\) and data at time \(t=1\).
+
+\[u_{t}(x)=\int u_{t}(x|x_{1})\frac{p_{t}(x|x_{1})q(x_{1})}{p_{t}(x)}dx_{1}, \tag{23}\]
+
+where \(u_{t}(x|x_{1})=\frac{\sigma_{t}}{\sigma_{t}}x+\left[\dot{\alpha}_{t}-\dot{ \sigma}_{t}\frac{\sigma_{t}}{\sigma_{t}}\right]x_{1}\), as derived in Lipman et al. (2022). Next, we generalize a result by Kingma et al. (2021) and Karras et al. (2022) to consider marginal sampling paths \(x(t)\) defined by \(u_{t}(x)\), and show that any two such paths are related by a scale-time transformation:
+
+**Theorem 2.3**.: _(Equivalence of Gaussian Paths and scale-time transformation) Consider a Gaussian Path defined by a scheduler \((\alpha_{t},\sigma_{t})\), and let \(x(t)\) denote the solution of equation 1 with \(u_{t}\) defined in equation 23 and initial condition \(x(0)=x_{0}\). Then,_
+
+1. _[label=()]_
+2. _For every other Gaussian Path defined by a scheduler_ \((\bar{\alpha}_{r},\bar{\sigma}_{r})\) _with trajectories_ \(\bar{x}(r)\) _there exists a scale-time transformation with_ \(s_{1}=1\) _such that_ \(\bar{x}(r)=s_{r}x(t_{r})\)_._
+3. _For every scale-time transformation with_ \(s_{1}=1\) _there exists a Gaussian Path defined by a scheduler_ \((\bar{\alpha}_{r},\bar{\sigma}_{r})\) _with trajectories_ \(\bar{x}(r)\) _such that_ \(s_{r}x(t_{r})=\bar{x}(r)\)_._
+
+(Proof in Appendix C.) Assuming an ideal velocity field (equation 23), _i.e._, the pre-trained model is optimal, this theorem implies that searching over the scale-time transformations is equivalent to searching over all possible Gaussian Paths. Note, that in practice we allow \(s_{1}\neq 1\), expanding beyond the standard space of Gaussian Paths. Another interesting consequence of Theorem 2.3 (simply plug in \(t=1\)) is that all ideal velocity fields in equation 23 define the _same_ coupling, _i.e._, joint distribution, of noise \(x_{0}\) and data \(x_{1}\).
+
+### RMSE upper bound loss
+
+Optimizing directly the RMSE loss (equation 6) is theoretically possible but would require keeping a full computational graph of Algorithm 2, _i.e._, \(n\times\)order compositions of \(u_{t}\) leading to a large memory footprint. Therefore, we instead derive an _upper-bound_ to the RMSE loss that enables _parallel computation_ over the steps of the solver, considerably reducing memory consumption. To construct the bound, let us fix an initial condition \(x_{0}\sim p(x_{0})\) and denote as before \(x(1)\) to be the exact solution of the sample path (equation 1). Furthermore, consider a candidate solver step \(\theta\), and denote its \(t\) and \(x\) coordinate updates by \(\text{step}^{\theta}=(\text{step}^{\theta}_{t},\text{step}^{\theta}_{x})\). Applying Algorithm 2 with \(t_{0}=0,x_{0}\) produces a series of approximations \(x^{\theta}_{i}\), each corresponds to a time step \(t_{i}\), \(i\in[n]\). Lastly, we denote by
+
+\[e^{\theta}_{i}=\left\lVert x(t_{i})-x^{\theta}_{i}\right\rVert,\quad d^{\theta }_{i}=\left\lVert x(t_{i})-\text{step}^{\theta}_{x(t_{i-1},x(t_{i-1});u_{t} )}\right\rVert \tag{24}\]
+
+the _global_ and _local_ truncation errors at time \(t_{i}\), respectively. Our goal is to bound the global error at the final time step \(t_{n}=1\), _i.e._, \(e^{\theta}_{n}\). Using the update rule definition (equation 2) and triangle inequality we can bound
+
+\[e^{\theta}_{i+1}\leq\left\lVert x(t_{i+1})-\text{step}^{\theta}_{x}(t_{i},x(t _{i});u_{t})\right\rVert+\left\lVert\text{step}^{\theta}_{x}(t_{i},x(t_{i});u_ {t})-\text{step}^{\theta}_{x}(t_{i},x^{\theta}_{i};u_{t})\right\rVert\leq d^{ \theta}_{i+1}+L^{\theta}_{i}e^{\theta}_{i},\]
+
+where \(L^{\theta}_{i}\) is defined to be the Lipschitz constant of the function \(\text{step}^{\theta}_{x}(t_{i},\cdot;u_{t})\). To simplify notation we set by definition \(L^{\theta}_{n}=1\) (this is possible since \(L^{\theta}_{n}\) does not actually participate in the bound).
+
+Using the above bound \(n\) times and noting that \(e_{0}^{\theta}=0\) we get
+
+\[e_{n}^{\theta}\leq\sum_{i=1}^{n}M_{i}^{\theta}d_{i}^{\theta},\text{ where }M_{i}^{\theta}=\prod_{j=i}^{n}L_{j}^{\theta}. \tag{25}\]
+
+Motivated by this bound we define our RMSE-Bound loss:
+
+\[\mathcal{L}_{\text{RMSE-B}}(\theta)=\mathbb{E}_{x_{0}\sim p(x_{0})}\sum_{i=1}^ {n}M_{i}^{\theta}d_{i}^{\theta}, \tag{26}\]
+
+where \(d_{i}^{\theta}\) is defined in equation 24 and \(M_{i}^{\theta}\) defined in equation 25. The constants \(L_{i}^{\theta}\) depend both on the parameters \(\theta\) and the Lipschitz constant \(L_{u}\) of the network \(u_{t}\). As \(L_{u}\) is difficult to estimate, we treat \(L_{u}\) as a hyper-parameter, denoted \(L_{\tau}\) (in all experiments we use \(L_{\tau}=1\)), and compute \(L_{i}^{\theta}\) in terms of \(\theta\) and \(L_{\tau}\) for our two Bespoke solvers, RK1 and RK2, in Appendix D. Assuming that \(L_{\tau}\geq L_{u}\), an immediate consequence of the bound in equation 25 is that the RMSE-Bound loss bounds the RMSE loss, _i.e._, the global truncation error defined in equation 6, \(\mathcal{L}_{\text{RMSE}}(\theta)\leq\mathcal{L}_{\text{RMSE-B}}(\theta)\).
+
+**Implementation of the RMSE-Bound loss.** We provide pseudocode for Bespoke training in Algorithm 3. During training, we need to have access to the GT path \(x(t)\) at times \(t_{i},\,i\in[n]\), which we compute with a generic solver. The Bespoke loss is constructed by plugging step \(\theta\) (equations 17 or 19) into \(d_{i}\) (equation 24). The gradient \(\nabla_{\theta}\mathcal{L}_{\text{RMSE-B}}(\theta)\) requires the derivatives \(\partial x(t_{i})/\partial t_{i}\). Computing the derivatives of \(x(t_{i})\) can be done using the ODE it obeys, _i.e._, \(\dot{x}(t_{i})=u_{t_{i}}(x_{i})\). Therefore, a simple way to write the loss ensuring correct gradients w.r.t. \(t_{i}\) is replace \(x(t_{i})\) with \(x_{i}^{\text{ran}}(t_{i})\) where
+
+\[x_{i}^{\text{ran}}(t)=x([t_{i}])+u_{[t_{i}]}(x([t_{i}]))\left(t-[t_{i}]\right), \tag{27}\]
+
+where \([\cdot]\) denotes the stop gradient operator; _i.e._, \(x_{i}^{\text{ran}}(t)\) is linear in \(t\) and its value and derivative w.r.t. \(t\) coincide with that of \(x(t_{i})\) at time \(t=t_{i}\). Full details are provided in Appendix F. In Appendix K.1 we provide an ablation experiment comparing different Bespoke losses and corresponding algorithms including the direct RMSE loss (eq. 6) and our RMSE-Bound loss (eq. 26).
+
+```
+0: pre-trained \(u_{t}\), number of steps \(n\) initialize \(\theta\in\mathbb{R}^{p}\) while not converged do \(x_{0}\sim p(x_{0})\)\(\triangleright\) sample noise \(x(t)=\) solve ODE \(1\)\(\triangleright\) GT path \(\mathcal{L}\subset 0\) \(\triangleright\) init loss parallel for\(i=0,...,n-1\)do \(x_{i+1}^{\text{ran}}\leftarrow\) stop\((x_{i}^{\text{ran}}(t_{i}),t_{i};u)\) \(x_{i+1}^{\text{ran}}=M_{i+1}^{\theta}\left(x_{i+1}^{\text{ran}}(t_{i+1})-x_{ i+1}^{\theta}\right)\) endfor \(\theta\gets\theta-\gamma\nabla_{\theta}\mathcal{L}\)\(\triangleright\) optimization step endwhile return\(\theta\)
+```
+
+**Algorithm 3** Bespoke training.
+
+## 3 Previous Work
+
+Diffusion models (Sohl-Dickstein et al., 2015; Ho et al., 2020) are a powerful paradigm for generative models that for sampling require solving a Stochastic Differential Equation (SDE), or its associated ODE, describing a (deterministic) flow process (Song et al., 2020). Diffusion models have been generalized to paradigms directly aiming to learn a deterministic flow (Lipman et al., 2022; Albergo and Vanden-Eijnden, 2022; Liu et al., 2022). Flow-based models are efficient to train but costly to sample. Previous works had tackled the sample complexity of flow models by building _dedicated solver schemes_ and _distillation_.
+
+**Dedicated Solvers.** This line of works introduced specialized ODE solvers exploiting the structure of the sampling ODE. Lu et al. (2022); Zhang and Chen (2022) utilize the semi-linear structure of the score/\(\epsilon\)-based sampling ODE to adopt a method of exponential integrators. (Zhang et al., 2023) further introduced refined error conditions to fulfill desired order conditions and achieve better sampling, while Lu et al. (2022) adapted the method to guided sampling. Karras et al. (2022) suggested transforming the ODE to sample a different Gaussian Path for more efficient sampling, while also suggesting non-uniform time steps. In principle, all of these methods effectively proposed--based on intuition and heuristics--to apply a particular scale-time transformation to the sampling trajectories of the pre-trained model for more efficient sampling, while Bespoke solvers search for an _optimal_ transformation within the entire space of scale-time transformations.
+
+Other works also aimed at learning the solver: Dockhorn et al. (2022) (GENIE) introduced a higher-order solver, and distilled the necessary JVP for their method; Watson et al. (2021) (DDSS) optimized a perceptual loss considering a family of generalized Gaussian diffusion models; Lam et al. (2021) improved the denoising process using bilateral filters, thereby indirectly affecting the efficiency of the ODE solver; Duan et al. (2023) suggested to learn a solver for diffusion models by replacing every other function evaluation by a linear subspace projection. Our Bespoke Solvers belong to this family of learnt solvers, however, they are consistent by construction (Theorem 2.2) and minimize a bound on the solution error (for the appropriate Lipschitz constant parameter).
+
+**Distillation.** Distillation techniques aim to simplify sampling from a trained model by fine-tuning or training a new model to produce samples with fewer function evaluations. Luhman and Luhman (2021) directly regressed the trained model's samples, while Salimans and Ho (2022); Meng et al. (2023) built a sequence of models each reducing the sampling complexity by a factor of 2. Song et al. (2023) distilled a consistency map that enables large time steps in the probability flow; Liu et al. (2022) retrained a flow-based method based on samples from a previously trained flow. Yang et al. (2023) used distillation to reduce model size while maintaining the quality of the generated images. The main drawbacks of distillation methods is their long training time (Salimans and Ho, 2022), and lack of consistency, _i.e._, they do not sample from the distribution of the pre-trained model.
+
+## 4 Experiments
+
+**Models and datasets.** Our method works with pre-trained models: we use the pre-trained CIFAR10 (Krizhevsky and Hinton, 2009) model of (Song et al., 2020) with published weights from EDM (Karras et al., 2022). Additionally, we trained diffusion/flow models on the datasets: CIFAR10, AFHQ-256 (Choi et al., 2020) and ImageNet-64/128 (Deng et al., 2009). Specifically, for ImageNet, as recommended by the authors (ima) we used the official _face-blurred_ data (64\(\times\)64 downsampled using the open source preprocessing scripts from Chrabaszcz et al. (2017)). For diffusion models, we used an \(\epsilon\)-Variance Preserving (\(\epsilon\)-VP) parameterization and schedule (Ho et al., 2020; Song et al., 2020). For flow models, we used Flow Matching (Lipman et al., 2022) with Conditional Optimal Transport (FM-OT), and Flow Matching/\(v\)-prediction with Cosine Scheduling (FM/\(v\)-CS) (Salimans and Ho, 2022; Albergo and Vanden-Eijnden, 2022). Note that Flow Matching methods directly provide the velocity vector field \(u_{t}(x)\), and we converted \(\epsilon\)-VP to a velocity field using the identity in Song et al. (2020). For conditional sampling we apply classifier free guidance (Ho and Salimans, 2022), so each evaluation uses two forward passes.
+
+**Bespoke hyper-parameters and optimization.** As our base ODE solvers, we tested RK1 (Euler) and RK2 (Midpoint). Furthermore, we have two hyper-parameters \(n\) - the number of steps, and \(L_{\tau}\) - the Lipschitz constant from lemmas \(D_{2}\), \(D_{3}\). We train our models with \(n\in\{4,5,8,10,12\}\) steps and fix \(L_{\tau}=1\). Ground Truth (GT) sample trajectories, \(x(t_{i})\), are computed with an adaptive RK45 solver (Shampine, 1986). We compute FID (Heusel et al., 2017) and validation RMSE (equation 6) is computed on a set of 10K fresh noise samples \(x_{0}\sim p(x_{0})\); Figure 12 depicts an example of RMSE vs. training iterations for different \(n\) values. Unless otherwise stated, below we report results on best FID iteration and show samples on best RMSE validation iteration. Figures 21, 22, 23 depict the learned Bespoke solvers' parameters \(\theta\) for the experiments presented below; note the differences across the learned schemes for different models and datasets.
+
+**Bespoke RK1 vs. RK2.** We compared RK1 and RK2 and their Bespoke versions on CIFAR10 and ImageNet-64 models (FM-OT and FM/\(v\)-CS). Figure 3 and Figures 10, 9 show best validation RMSE (and corresponding PSNR). Using the same budget of function evaluations RK2/RK2-Bespoke produce considerably lower RMSE validation compared to RK1/RK1-Bespoke, respectively. We therefore opted for RK2/RK2-Bespoke for the rest of the experiments below.
+
+**CIFAR10.** We tested our method on the pre-trained CIFAR10 \(\epsilon\)-VP model (Song et al., 2020) released by EDM (Karras et al., 2022). Figure 4 compares our RK2-Bespoke solver to the EDM method, which corresponds to a particular choice of scaling, \(s_{i}\), and time step discretization, \(t_{i}\). Euler and EDM curves computed as originally implemented in EDM, where the latter achieves
+
+\begin{table}
+\begin{tabular}{l c c} \hline \hline Method & NPE & FID \\ \hline \multirow{8}{*}{**Bespoke hyper-parameters and optimization**} & Zheng et al. (2023) & 1 & 3.78 \\  & Luhman and Luhman (2021) & 1 & 9.36 \\  & Salimans and Ho (2022) & 1 & 9.12 \\  & & 2 & 4.51 \\  & & 8 & 2.57 \\ \hline \multirow{8}{*}{**DRDMS(Song et al., 2023)**} & 10 & 13.36 \\  & 20 & 6.84 \\  & 20 & 3.99 \\  & DEIS (Zhang and Chen, 2022) & 10 & 4.17 \\  & 20 & 2.86 \\  & GENIE (Dockhorn et al., 2022) & 10 & 5.28 \\  & 20 & 3.94 \\  & DDSS (Watson et al., 2021) & 10 & 7.86 \\  & 20 & 4.72 \\  & \(\epsilon\)-VP & 10 & 3.31 \\  & \(\epsilon\)-VP & 20 & 2.75 \\  & FM/\(v\)-CS & 10 & 2.89 \\  & FM/\(v\)-CS & 20 & 2.64 \\  & FM/\(v\)-CS & 10 & **2.73** \\  & FM-OT & 20 & **2.59** \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: CIFAR10 sampling.
+
+FID=\(3.05\) at 35 NFE, comparable to the result reported by EDM. Using our RK2-Bespoke Solver, we achieved an FID of \(2.99\) with 20 NFE, providing a \(42\%\) reduction in NFE. Additionally, we tested our method on three models we trained ourselves on CIFAR10, namely _e_-VP, FM/_v_-CS, and FM-OT. Table 1 compares our best FID for each model with different baselines demonstrating superior generation quality for low NFE among all dedicated solvers; _e.g._, for NFE=10 we improve the FID of the runner-up by over 34% (from 4.17 to 2.73) using RK2-Bespoke FM-OT model. Table 4 lists best FID values for different NFE, along with the GT FID for the model and the fraction of time Bespoke training took compared to the original model's training time; with 20 NFE, our RK2-Bespoke solvers achieved FID within 8%, 1%, 1% (resp.) of the GT solvers' FID. Although close, our Bespoke solver does not match distillation's performance, however our approach is much faster to train, requiring \(\sim\)1% of the original GPU training time with our naive implementation that re-samples the model at each iteration. Figure 11 shows FID/RMSE/PSNR vs. NFE, where PSNR is computed w.r.t. the GT solver's samples.
+
+**Ablations.** We conducted two ablation experiments. First, Figure 16 shows the effect of training only time transform (keeping \(s_{r}\equiv 1\)) and scale transformation (keeping \(t_{r}=r\)). While the time transform is more significant than scale transform, incorporating scale improves RMSE for low NFE (which aligns with Theorem 2.2), and improve FID. Second, Figure 18 shows application of RK2-Bespoke solver trained on ImageNet-64 applied to ImageNet-128. The transferred solver, while sub-optimal compared to the Bespoke solver, still considerably improves the RK2 baseline in RMSE and PSNR, and improves FID for higher NFE (16,20). Reusing Bespoke solvers can potentially be a cheap option to improve solvers.
+
+## 5 Conclusions, Limitations and Future Work
+
+This paper develops an algorithm for finding low-NFE ODE solvers custom-tailored to general pre-trained flow models. Through extensive experiments we found that different models can benefit greatly from their own optimized solvers in terms of global truncation error (RMSE) and generation quality (FID). Currently, training a Bespoke solver requires roughly 1% of the original model's training time, which can probably be still be made more efficient, _e.g._, by using training data or pre-processing sampling paths. A limitation of our framework is that it requires separate training for each target NFE and/or choice of guidance weight. For general NFE solvers one may consider a combined loss and/or continuous representation of \(\varphi_{r},t_{r}\), while guidance weight or even more general conditions can be used to directly condition \(\varphi_{r},t_{r}\). More general/expressive models for \(\varphi_{r},t_{r}\) have the potential to further improve fast sampling of pre-trained models.
+
+Figure 6: Comparison of FM-OT and FM/\(v\)-CS ImageNet-64 samples with RK2 and bespoke-RK2 solvers. Comparison to DPM-2 samples are in Figure 30. More examples are in Figures 27, 28, and 29. The similarity of generated images across models can be explained by their identical noise-to-data coupling (Theorem 2.3).
+
+Figure 7: FM-OT ImageNet-128 (top) and AFHQ-256 (bottom) samples with RK2 and bespoke-RK2 solvers. More examples are in Figures 25, 26 and 24.
+
+## References
+
+* L. S. Albergo and E. Vanden-Eijnden (2022)Building normalizing flows with stochastic interpolants. External Links: 2207.12598 Cited by: SS1.
+* R. T. Q. Chen, T. Rubanova, J. Bettencourt, and D. K. Duvenaud (2018)Neural ordinary differential equations. Advances in neural information processing systems31. Cited by: SS1.
+* Y. Choi, Y. Uh, J. Yoo, and J. Ha (2020)Stargan v2: diverse image synthesis for multiple domains. External Links: 2009.01007 Cited by: SS1.
+* Y. Choi, Y. Uh, J. Yoo, and J. Ha (2020)Stargan v2: diverse image synthesis for multiple domains. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition, Cited by: SS1.
+* P. Chrabaszcz, I. Loshchilov, and F. Hutter (2017)A downsampled variant of imagenet as an alternative to the cifar datasets. arXiv preprint arXiv:1707.08819. Cited by: SS1.
+* J. Deng, W. Dong, R. Socher, L. Li, K. Li, and F. Li (2009)Imagenet: a large-scale hierarchical image database. In The IEEE Conference on Computer Vision and Pattern Recognition (CVPR), Cited by: SS1.
+* P. Dhariwal and A. Nichol (2021)Diffusion models beat gans on image synthesis. Advances in neural information processing systems34, pp. 8780-8794. Cited by: SS1.
+* T. Dockhorn, A. Vahdat, and K. Kreis (2022)Genie: higher-order denoising diffusion solvers. Advances in Neural Information Processing Systems35, pp. 30150-30166. Cited by: SS1.
+* Z. Duan, C. Wang, C. Chen, J. Huang, and W. Qian (2023)Optimal linear subspace search: learning to construct fast and high-quality schedulers for diffusion models. arXiv preprint arXiv:2305.14677. Cited by: SS1.
+* M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, and S. Hochreiter (2017)Gans trained by a two time-scale update rule converge to a local nash equilibrium. In Advances in Neural Information Processing Systems (NeurIPS), Cited by: SS1.
+* J. Ho and T. Salimans (2022)Classifier-free diffusion guidance. arXiv preprint arXiv:2207.12598. Cited by: SS1.
+* J. Ho, A. Jain, and P. Abbeel (2020)Denoising diffusion probabilistic models. Advances in neural information processing systems33, pp. 6840-6851. Cited by: SS1.
+* A. Iserles (2009)A first course in the numerical analysis of differential equations. External Links: Link Cited by: SS1.
+* T. Karras, M. Aittala, T. Aila, and S. Laine (2022)Elucidating the design space of diffusion-based generative models. Advances in Neural Information Processing Systems35, pp. 26565-26577. Cited by: SS1.
+* D. Kingma, T. Salimans, B. Poole, and J. Ho (2021)Variational diffusion models. Advances in neural information processing systems34, pp. 21696-21707. Cited by: SS1.
+* D. P. Kingma and J. Ba (2017)Adam: a method for stochastic optimization. External Links: 1612.01698 Cited by: SS1.
+* Z. Kong, W. Ping, J. Huang, K. Zhao, and B. Catanzaro (2020)DiffWave: a versatile diffusion model for audio synthesis. arXiv preprint arXiv:2009.09761. Cited by: SS1.
+* A. Krizhevsky and G. Hinton (2009)Learning multiple layers of features from tiny images. In University of Toronto, Canada, Cited by: SS1.
+
+* Lam et al. (2021) Max WY Lam, Jun Wang, Rongjie Huang, Dan Su, and Dong Yu. Bilateral denoising diffusion models. _arXiv preprint arXiv:2108.11514_, 2021.
+* Le et al. (2023) Matthew Le, Apoorv Vyas, Bowen Shi, Brian Karrer, Leda Sari, Rashel Moritz, Mary Williamson, Vimal Manohar, Yossi Adi, Jay Mahadeokar, et al. Voicebox: Text-guided multilingual universal speech generation at scale. _arXiv preprint arXiv:2306.15687_, 2023.
+* Lipman et al. (2022) Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le. Flow matching for generative modeling. _arXiv preprint arXiv:2210.02747_, 2022.
+* Liu et al. (2022) Xingchao Liu, Chengyue Gong, and Qiang Liu. Flow straight and fast: Learning to generate and transfer data with rectified flow. _arXiv preprint arXiv:2209.03003_, 2022.
+* Lu et al. (2022a) Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver: A fast ode solver for diffusion probabilistic model sampling in around 10 steps. _Advances in Neural Information Processing Systems_, 35:5775-5787, 2022a.
+* Lu et al. (2022b) Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver++: Fast solver for guided sampling of diffusion probabilistic models. _arXiv preprint arXiv:2211.01095_, 2022b.
+* Luhman & Luhman (2021) Eric Luhman and Troy Luhman. Knowledge distillation in iterative generative models for improved sampling speed. _arXiv preprint arXiv:2101.02388_, 2021.
+* Meng et al. (2023) Chenlin Meng, Robin Rombach, Ruiqi Gao, Diederik Kingma, Stefano Ermon, Jonathan Ho, and Tim Salimans. On distillation of guided diffusion models. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 14297-14306, 2023.
+* Rombach et al. (2021) Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bjorn Ommer. High-resolution image synthesis with latent diffusion models, 2021.
+* Salimans & Ho (2022) Tim Salimans and Jonathan Ho. Progressive distillation for fast sampling of diffusion models. _arXiv preprint arXiv:2202.00512_, 2022.
+* Shampine (1986) Lawrence F Shampine. Some practical runge-kutta formulas. _Mathematics of computation_, 46(173):135-150, 1986.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In _International conference on machine learning_, pp. 2256-2265. PMLR, 2015.
+* Song et al. (2020a) Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. _arXiv preprint arXiv:2010.02502_, 2020a.
+* Song et al. (2020b) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. _arXiv preprint arXiv:2011.13456_, 2020b.
+* Song et al. (2023) Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever. Consistency models. 2023.
+* Watson et al. (2021) Daniel Watson, William Chan, Jonathan Ho, and Mohammad Norouzi. Learning fast samplers for diffusion models by differentiating through sample quality. In _International Conference on Learning Representations_, 2021.
+* Yang et al. (2023) Xingyi Yang, Daquan Zhou, Jiashi Feng, and Xinchao Wang. Diffusion probabilistic model made slim. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 22552-22562, 2023.
+* Zhang & Chen (2022) Qinsheng Zhang and Yongxin Chen. Fast sampling of diffusion models with exponential integrator. _arXiv preprint arXiv:2204.13902_, 2022.
+* Zhang et al. (2023) Qinsheng Zhang, Jiaming Song, and Yongxin Chen. Improved order analysis and design of exponential integrator for diffusion models sampling. _arXiv preprint arXiv:2308.02157_, 2023.
+* Zheng et al. (2023) Hongkai Zheng, Weili Nie, Arash Vahdat, Kamyar Azizzadenesheli, and Anima Anandkumar. Fast sampling of diffusion models via operator learning. In _International Conference on Machine Learning_, pp. 42390-42402. PMLR, 2023.
+
+## Appendix A Transformed paths
+
+(Appendix to Section 2.1.)
+
+**Proposition A.1**.: _Let \(x(t)\) be a solution to equation 1. Denote \(\dot{\varphi}_{r}:=\frac{d}{dr}\varphi_{r}\) and \(\dot{t}_{r}:=\frac{d}{dr}t_{r}\). Then \(\ddot{x}(r)\) defined in equation 7 is a solution to the ODE (equation 1) with the VF_
+
+\[\ddot{u}_{r}(x)=\dot{\varphi}_{r}(\varphi_{r}^{-1}(x))+\dot{t}_{r}\partial_{x} \varphi_{r}(\varphi_{r}^{-1}(x))u_{t_{r}}(\varphi_{r}^{-1}(x)). \tag{9}\]
+
+Proof.: Differentiating \(\ddot{x}(r)\) in equation 7, _i.e._, \(\bar{x}(r)=\varphi_{r}(x(t_{r}))\) w.r.t. \(r\) and using the chain rule gives
+
+\[\dot{\bar{x}}(r) =\frac{d}{dr}(\varphi_{r}(x(t_{r})))\] \[=\dot{\varphi}_{r}(x(t_{r}))+\partial_{x}\varphi_{r}(x(t_{r})) \dot{x}(t_{r})\dot{t}_{r}\] \[=\dot{\varphi}_{r}(x(t_{r}))+\partial_{x}\varphi_{r}(x(t_{r}))u_ {t_{r}}(x(t_{r}))\dot{t}_{r}\] \[=\dot{\varphi}_{r}(\varphi_{r}^{-1}(\bar{x}(r)))+\partial_{x} \varphi_{r}(\varphi_{r}^{-1}(\bar{x}(r)))u_{t_{r}}(\varphi_{r}^{-1}(\bar{x}(r )))\dot{t}_{r}\]
+
+where in the third equality we used the fact that \(x(t)\) solves the ODE in equation 1 and therefore \(\dot{x}(t)=u_{t}(x(t))\); and in the last equality we applied \(\varphi_{r}^{-1}\) to both sides of equation 7, _i.e._, \(x(t_{r})=\varphi_{r}^{-1}(\bar{x}(r))\). The above equation shows that
+
+\[\dot{\bar{x}}(r)=u_{r}(\bar{x}(r)), \tag{28}\]
+
+where \(\bar{u}_{r}(x)\) is defined in equation 9, as required. 
+
+## Appendix B Consistency of solvers
+
+(Appendix to Section 2.1.)
+
+**Theorem 2.2**.: _(Consistency of parametric solvers) Given arbitrary \(t_{r},\varphi_{r}\) in the family of functions \(\mathcal{F}\) and a base ODE solver of order \(k\), the corresponding ODE solver step\({}^{\theta}\) is also of order \(k\), i.e.,_
+
+\[\|x(t_{\text{next}})-x_{\text{next}}\|=O((t_{\text{next}}-t)^{k+1}). \tag{13}\]
+
+Proof.: Here \((t,x)\) is our input sample \(x\in\mathbb{R}^{d}\) at time \(t\in[0,1]\). By definition \(r=r_{t}\), \(r_{\text{next}}=r+h\), and \(t_{\text{next}}=t_{r_{\text{next}}}\). Furthermore, by definition \(\bar{x}=\varphi_{r}(x)\) is a sample at time \(r\); \(\bar{x}(r_{\text{next}})\) is the solution to the ODE defined by \(\bar{u}_{r}\) starting from \((r,\bar{x})\); \(\bar{x}_{\text{next}}\) is an approximation to \(\bar{x}(r_{\text{next}})\) as generated from the base ODE solver step. Lastly, \(x_{\text{next}}=\varphi_{r_{\text{next}}}^{-1}(\bar{x}_{r_{\text{next}}})\) and \(x(t_{\text{next}})=\varphi_{r_{\text{next}}}^{-1}(\bar{x}(r_{\text{next}}))\). See Figure 8 for an illustration visualizing this setup.
+
+Now, since step is of order \(k\) we have that
+
+\[\bar{x}(r_{\text{next}})-\bar{x}_{\text{next}} =\bar{x}(r_{\text{next}})-\text{step}(\bar{x},r;\bar{u}_{r})\] \[=O((r_{\text{next}}-r)^{k+1}). \tag{29}\]
+
+Figure 8: Proof notations and setup.
+
+Now,
+
+\[x(t_{\text{next}})-x_{\text{next}} =x(t_{\text{next}})-\varphi_{r_{\text{next}}}^{-1}(\bar{x}_{\text{ next}})\] \[=x(t_{\text{next}})-\varphi_{r_{\text{next}}}^{-1}(\bar{x}(r_{ \text{next}})+O((r_{\text{next}}-r)^{k+1}))\] \[=x(t_{\text{next}})-\varphi_{r_{\text{next}}}^{-1}(\bar{x}(r_{ \text{next}}))+O((r_{\text{next}}-r)^{k+1})\] \[=O((r_{\text{next}}-r)^{k+1})\] \[=O((t_{\text{next}}-t)^{k+1}),\]
+
+where in the first equality we used the definition of \(x_{\text{next}}\); in the second equality we used equation 29; in the third equality we used the fact that \(\varphi_{r}^{-1}\) is Lipschitz with constant \(L\) (for all \(r\)); in the fourth equality we used the definition of the path transform, \(x(t_{\text{next}})=\varphi_{r_{\text{next}}}^{-1}(\bar{x}(r_{\text{next}}))\) as mentioned above; and in the last equality we used the fact that \(r_{t}\) is also Lipschitz with a constant \(L\) and therefore \(r_{\text{next}}-r=r_{t_{\text{next}}}-r_{t}=O(t_{\text{next}}-t)\). 
+
+## Appendix C Equivalence of Gaussian Paths and Scale-Time transformations
+
+(Appendix to Section 2.2.)
+
+**Theorem 2.3**.: _(Equivalence of Gaussian Paths and scale-time transformation) Consider a Gaussian Path defined by a scheduler \((\alpha_{t},\sigma_{t})\), and let \(x(t)\) denote the solution of equation 1 with \(u_{t}\) defined in equation 23 and initial condition \(x(0)=x_{0}\). Then,_
+
+1. _For every other Gaussian Path defined by a scheduler_ \((\bar{\alpha}_{r},\bar{\sigma}_{r})\) _with trajectories_ \(\bar{x}(r)\) _there exists a scale-time transformation with_ \(s_{1}=1\) _such that_ \(\bar{x}(r)=s_{r}x(t_{r})\)_._
+2. _For every scale-time transformation with_ \(s_{1}=1\) _there exists a Gaussian Path defined by a scheduler_ \((\bar{\alpha}_{r},\bar{\sigma}_{r})\) _with trajectories_ \(\bar{x}(r)\) _such that_ \(s_{r}x(t_{r})=\bar{x}(r)\)_._
+
+Proof of theorem 2.3.: Consider two arbitrary schedulers \((\alpha_{t},\sigma_{t})\) and \((\bar{\alpha}_{r},\bar{\sigma}_{r})\). We can find \(s_{r},t_{r}\) such that
+
+\[\bar{\alpha}_{r}=s_{r}\alpha_{t_{r}},\qquad\bar{\sigma}_{r}=s_{r}\sigma_{t_{r}}. \tag{30}\]
+
+Indeed, one can check the following are such \(s_{r},t_{r}\):
+
+\[t_{r}=\operatorname{snr}^{-1}(\overline{\operatorname{snr}}(r)),\qquad s_{r}= \frac{\bar{\sigma}_{r}}{\sigma_{t_{r}}}, \tag{31}\]
+
+where we remember \(\operatorname{snr}\) is strictly monotonic as defined in equation 22, hence invertible. On the other hand, given an arbitrary scheduler \((\alpha_{t},\sigma_{t})\) and an arbitrary scale-time transformation \((t_{r},s_{r})\) with \(s_{1}=1\), we can define a scheduler \((\bar{\alpha}_{r},\bar{\sigma}_{r})\) via equation 30.
+
+For case (i), we are given another scheduler \(\bar{\alpha}_{r},\bar{\sigma}_{r}\) and define a scale-time transformation \(s_{r},t_{r}\) with equation 31. For case (ii), we are given a scale-time transformation \(s_{r},t_{r}\) and define a scheduler \(\bar{\alpha}_{r},\bar{\sigma}_{r}\) by equation 30.
+
+Now, the scheduler \(\bar{\alpha}_{r},\bar{\sigma}_{r}\) defines sampling paths \(\bar{x}(r)\) given by the solution of the ODE in equation 1 with the marginal VF \(\bar{u}_{r}^{(1)}(x)\) defined in equation 23, _i.e._,
+
+\[\bar{u}_{r}^{(1)}(x)=\int\bar{u}_{r}(x|x_{1})\frac{\bar{p}_{r}(x|x_{1})q(x_{1} )}{\bar{p}_{r}(x)}dx_{1}, \tag{32}\]
+
+where \(\bar{u}_{r}(x|x_{1})=\frac{\dot{\delta}_{r}}{\dot{\delta}_{r}}x+\left[\dot{ \bar{\alpha}}_{r}-\dot{\delta}_{r}\frac{\bar{\alpha}_{r}}{\bar{\sigma}_{r}} \right]x_{1}\).
+
+The scale-time transformation \(s_{r},t_{r}\) gives rise to a second VF \(\bar{u}_{r}^{(2)}(x)\) as in equation 16,
+
+\[\bar{u}_{r}^{(2)}(x)=\frac{\dot{s}_{r}}{s_{r}}x+\dot{t}_{r}s_{r}u_{t_{r}}\left( \frac{x}{s_{r}}\right), \tag{33}\]
+
+where \(u_{t}\) is the VF defined by the scheduler \((\alpha_{t},\sigma_{t})\) and equation 23.
+
+By uniqueness of ODE solutions, the theorem will be proved if we show that
+
+\[\bar{u}_{r}^{(1)}(x)=\bar{u}_{r}^{(2)}(x),\quad\forall x\in\mathbb{R}^{d},r\in[0, 1]. \tag{34}\]
+
+For that end, we use the notation of determinants to express
+
+\[\bar{u}_{r}(x|x_{1})=\frac{1}{\hat{\sigma}_{r}}\begin{vmatrix}0&x&x_{1}\\ \bar{\sigma}_{r}&\hat{\alpha}_{r}&1\\ \hat{\sigma}_{r}&\hat{\alpha}_{r}&0\end{vmatrix}, \tag{35}\]
+
+where \(x,\ x_{1}\in\mathbb{R}^{d}\) and \(\bar{\alpha}_{r},\ \bar{\sigma}_{r},\ \hat{\alpha}_{r},\ \hat{\sigma}_{r}\in \mathbb{R}\) as in vector cross product. Differentiating \(\bar{\alpha}_{r},\bar{\sigma}_{r}\) w.r.t. \(r\) gives
+
+\[\dot{\bar{\alpha}}_{r}=\dot{s}_{r}\alpha_{t_{r}}+s_{r}\dot{\alpha}_{t_{r}}\dot {t}_{r},\qquad\dot{\bar{\sigma}}_{r}=\dot{s}_{r}\sigma_{t_{r}}+s_{r}\dot{ \sigma}_{t_{r}}\dot{t}_{r}. \tag{36}\]
+
+Using the bi-linearity of determinants shows that:
+
+\[\bar{u}_{r}(x|x_{1}) =\frac{1}{\hat{\sigma}_{r}}\begin{vmatrix}0&x&x_{1}\\ \bar{\sigma}_{r}&\bar{\alpha}_{r}&1\\ \hat{\sigma}_{r}&\hat{\alpha}_{r}&0\end{vmatrix}\] \[=\frac{1}{s_{r}\sigma_{t_{r}}}\begin{vmatrix}0&x&x_{1}\\ s_{r}\sigma_{t_{r}}&s_{r}\sigma_{t_{r}}&s_{r}\alpha_{t_{r}}&1\\ \hat{s}_{r}\sigma_{t_{r}}&s_{r}\sigma_{t_{r}}&\hat{\alpha}_{t_{r}}&\hat{s}_{r} \alpha_{t_{r}}+s_{r}\dot{\alpha}_{t_{r}}\dot{t}_{r}&0\end{vmatrix}\] \[=\frac{1}{s_{r}\sigma_{t_{r}}}\begin{vmatrix}0&x&x_{1}\\ s_{r}\sigma_{t_{r}}&s_{r}\alpha_{t_{r}}&1\\ \hat{s}_{r}\sigma_{t_{r}}&\hat{s}_{r}\alpha_{t_{r}}&0\end{vmatrix}+\frac{1}{s_ {r}\sigma_{t_{r}}}\begin{vmatrix}0&x&x_{1}\\ s_{r}\sigma_{t_{r}}&s_{r}\alpha_{t_{r}}&1\\ s_{r}\dot{\sigma}_{t_{r}}\dot{t}_{r}&s_{r}\dot{\alpha}_{t_{r}}&0\end{vmatrix}\] \[=\frac{\dot{s}_{r}}{s_{r}}x+s_{r}\dot{t}_{r}u_{t_{r}}\left(\frac {x}{s_{r}}\Big{|}x_{1}\right),\]
+
+where in the second equality we substitute \(\hat{\sigma}_{r},\ \hat{\alpha}_{r}\) as in equation 36, in the third and fourth equality we used the bi-linearity of determinants, and in the last equality we used the definition of \(u_{t}(x|x_{1})=\frac{\hat{\sigma}_{t}x}{\sigma_{t}}x+\left[\dot{\alpha}_{t}- \dot{\sigma}_{t}\frac{\alpha_{t}}{\sigma_{t}}\right]x_{1}\) expressed in determinants notation. Furthermore, since
+
+\[\bar{p}_{r}(x|x_{1})=\mathcal{N}(x|s_{r}\alpha_{t_{r}}x_{1},s_{r}^{2}\sigma_{t _{r}}^{2}I)\propto\mathcal{N}\left(\frac{x}{s_{r}}\Big{|}x_{1},\sigma_{t_{r}}^ {2}I\right)=p_{t_{r}}\left(\frac{x}{s_{r}}\Big{|}x_{1}\right) \tag{37}\]
+
+we have that
+
+\[\bar{p}_{r}(x_{1}|x)=p_{t_{r}}\left(x_{1}\Big{|}\frac{x}{s_{r}}\right). \tag{38}\]
+
+Therefore,
+
+\[\int\bar{u}_{r}(x|x_{1})\frac{\bar{p}_{r}(x|x_{1})q(x_{1})}{\bar{p }_{r}(x)}dx_{1} =\mathbb{E}_{\bar{p}_{r}(x_{1}|x)}\bar{u}_{r}(x|x_{1})\] \[=\mathbb{E}_{p_{t_{r}}(x_{1}|\frac{\dot{s}_{r}}{\sigma_{r}})}\left[ \frac{\dot{s}_{r}}{s_{r}}x+s_{r}\dot{t}_{r}u_{t_{r}}\left(\frac{x}{s_{r}} \Big{|}x_{1}\right)\right]\] \[=\frac{\dot{s}_{r}}{s_{r}}x+s_{r}\dot{t}_{r}\mathbb{E}_{p_{t_{r}} \left(x_{1}|\frac{x}{s_{r}}\right)}u_{t_{r}}\left(\frac{x}{s_{r}}\Big{|}x_{1}\right)\] \[=\frac{\dot{s}_{r}}{s_{r}}x+s_{r}\dot{t}_{r}u_{t_{r}}\left(\frac{ x}{s_{r}}\right),\]
+
+where in the first equality we used Bayes rule, in the second equality we substitute \(\bar{u}_{r}(x|x_{1})\) and \(\bar{p}_{r}(x_{1}|x)\) as above, and in the last equality we used the definition of \(u_{t}\) as in equation 23. We have proved equation 34 and that concludes the proof.
+
+Lipschitz constants of \(\text{step}^{\theta}\).
+
+(Appendix to Section 2.3.)
+
+We are interested in computing \(L_{i}^{\theta}\), a Lipschitz constant of the bespoke solver step function \(\text{step}^{\theta}_{x}(t_{i},\cdot;u_{t})\). Namely, \(L_{i}^{\theta}\) should satisfy
+
+\[\left\|\text{step}^{\theta}_{x}(t_{i},x;u_{t})-\text{step}^{\theta}_{x}(t_{i}, y;u_{t})\right\|\leq L_{i}^{\theta}\left\|x-y\right\|,\qquad\forall x,y\in\mathbb{ R}^{d}. \tag{39}\]
+
+We remember that \(\text{step}^{\theta}_{x}(t_{i},\cdot;u_{t})\) is defined using a base solver and the VF \(\bar{u}_{r_{i}}(\cdot)\); hence, we begin by computing a Lipschitz constant for \(\bar{u}_{r_{i}}\) denoted \(L_{\bar{u}}(r_{i})\) in an auxiliary lemma:
+
+**Lemma D.1**.: _Assume that the original velocity field \(u_{t}\) has a Lipschitz constant \(L_{u}>0\). Then for every \(r_{i}\in[0,1]\), \(L_{r}\geq L_{u}\), and \(x,y\in\mathbb{R}^{d}\)_
+
+\[\left\|\bar{u}_{r_{i}}(x)-\bar{u}_{r_{i}}(y)\right\|\leq L_{\bar{u}}(r_{i}) \left\|x-y\right\|, \tag{40}\]
+
+_where_
+
+\[L_{\bar{u}}(r_{i})=\frac{|\dot{s}_{i}|}{s_{i}}+\dot{t}_{i}L_{\tau} \tag{41}\]
+
+Proof of lemma d.1.: Since the original velocity field \(u\) has a Lipshitz constant \(L_{u}>0\), for every \(t\in[0,1]\) and \(x,y\in\mathbb{R}^{d}\)
+
+\[\left\|u_{t}(x)-u_{t}(y)\right\|\leq L_{u}\left\|x-y\right\|. \tag{42}\]
+
+Hence
+
+\[\left\|\bar{u}_{r_{i}}(x)-\bar{u}_{r_{i}}(y)\right\| =\left\|\frac{\dot{s}_{i}}{s_{i}}x+\dot{t}_{i}s_{i}u_{t_{i}}\left( \frac{x}{s_{i}}\right)-\left(\frac{\dot{s}_{i}}{s_{i}}y+\dot{t}_{i}s_{i}u_{t_{ i}}\left(\frac{y}{s_{i}}\right)\right)\right\| \tag{43}\] \[=\left\|\frac{\dot{s}_{i}}{s_{i}}(x-y)+\dot{t}_{i}s_{i}\left(u_{t _{i}}\left(\frac{x}{s_{i}}\right)-u_{t_{i}}\left(\frac{y}{s_{i}}\right)\right)\right\|\] (44) \[\leq\frac{|\dot{s}_{i}|}{s_{i}}\left\|x-y\right\|+\dot{t}_{i}s_{i }\left\|u_{t_{i}}\left(\frac{x}{s_{i}}\right)-u_{t_{i}}\left(\frac{y}{s_{i}} \right)\right\|\] (45) \[\leq\left(\frac{|\dot{s}_{i}|}{s_{i}}+\dot{t}_{i}L_{u}\right) \left\|x-y\right\|\] (46) \[\leq\left(\frac{|\dot{s}_{i}|}{s_{i}}+\dot{t}_{i}L_{\tau}\right) \left\|x-y\right\|. \tag{47}\]
+
+We first apply the auxiliary lemma D.1 to compute a Lipschitz constant of \(\text{step}^{\theta}_{x}(t_{i},\cdot;u_{t})\) with RK1 (Euler method) as the base solver in lemma D.2 and for RK2 (Midpoint method) as the base solver in lemma D.3.
+
+**Lemma D.2**.: _(RK1 Lipschitz constant) Assume that the original velocity field \(u_{t}\) has a Lipschitz constant \(L_{u}>0\). Then, for every \(L_{\tau}\geq L_{u}\),_
+
+\[L_{i}^{\theta}=\frac{s_{i}}{s_{i+1}}\left(1+hL_{\bar{u}}(r_{i})\right), \tag{48}\]
+
+_is a Lipschitz constant of RK1-Bespoke update rule, where_
+
+\[L_{\bar{u}}(r_{i})=\frac{|\dot{s}_{i}|}{s_{i}}+\dot{t}_{i}L_{\tau}. \tag{49}\]
+
+Proof of lemma d.2.: We begin with writing an explicit expression of \(\text{step}^{\theta}_{x}(t_{i},x,;u_{t})\) for Euler solver in terms of the transformed velocity field \(\bar{u}_{r}\). That is,
+
+\[\text{step}^{\theta}_{x}(t_{i},x,;u_{t})=\frac{1}{s_{i+1}}\left[s_{i}x+h\bar{ u}_{r_{i}}(s_{i}x)\right]. \tag{50}\]So that applying the triangle inequality and lemma D.1 gives
+
+\[\left\|\text{step}_{x}^{\theta}(t_{i},x;u_{t})-\text{step}_{x}^{ \theta}(t_{i},y;u_{t})\right\| =\frac{1}{s_{i+1}}\left\|s_{i}x+h\bar{u}_{r_{i}}(s_{i}x)-[s_{i}y+ h\bar{u}_{r_{i}}(s_{i}y)]\right\|\] \[\leq\frac{s_{i}}{s_{i+1}}\left\|x-y\right\|+\frac{h}{s_{i+1}} \left\|\bar{u}_{r_{i}}(s_{i}x)-\bar{u}_{r_{i}}(s_{i}y)\right\|\] \[\leq\frac{s_{i}}{s_{i+1}}\left\|x-y\right\|+\frac{h}{s_{i+1}} \left(\frac{\left|\hat{s}_{i}\right|}{s_{i}}+\dot{t}_{i}L_{\tau}\right)\left\| s_{i}x-s_{i}y\right\|\] \[=\frac{s_{i}}{s_{i+1}}\left(1+h\left(\frac{\left|\hat{s}_{i} \right|}{s_{i}}+\dot{t}_{i}L_{\tau}\right)\right)\left\|x-y\right\|.\]
+
+**Lemma D.3**.: _(RK2 Lipschitz constant) Assume that the original velocity field \(u_{t}\) has a Lipschitz constant \(L_{u}>0\). Then for every \(L_{\tau}\geq L_{u}\)_
+
+\[L_{i}^{\theta}=\frac{s_{i}}{s_{i+1}}\left[1+hL_{\bar{u}}(r_{i+\frac{1}{2}}) \left(1+\frac{h}{2}L_{\bar{u}}(r_{i})\right)\right] \tag{51}\]
+
+_is a Lipschitz constant of RK2-Bespoke update rule, where_
+
+\[L_{\bar{u}}(r_{i})=\frac{\left|\hat{s}_{i}\right|}{s_{i}}+\dot{t}_{i}L_{\tau}. \tag{52}\]
+
+Proof of lemma D.3.: We begin by writing explicit expression of \(\text{step}_{x}^{\theta}(t_{i},x;u_{t})\) for RK2 (Midpoint) method in terms of the transformed velocity field \(\bar{u}_{r}\). We set
+
+\[z=s_{i}x+\frac{h}{2}\bar{u}_{r_{i}}(s_{i}x),\quad w=s_{i}y+\frac{h}{2}\bar{u} _{r_{i}}(s_{i}y). \tag{53}\]
+
+then
+
+\[\text{step}_{x}^{\theta}(t_{i},x,;u_{t})=\frac{1}{s_{i+1}}\left[s_{i}x+h\bar{u }_{r_{i+\frac{1}{2}}}(z)\right], \tag{54}\]
+
+and
+
+\[\text{step}_{x}^{\theta}(t_{i},y;u_{t})=\frac{1}{s_{i+1}}\left[s_{i}y+h\bar{u }_{r_{i+\frac{1}{2}}}(w)\right]. \tag{55}\]
+
+So that applying the triangle inequality and lemma D.1 gives
+
+\[\left\|\text{step}_{x}^{\theta}(t_{i},x;u_{t})-\text{step}_{x}^{ \theta}(t_{i},y;u_{t})\right\| \leq\frac{s_{i}}{s_{i+1}}\left\|x-y\right\|+\frac{h}{s_{i+1}} \left\|\bar{u}_{r_{i+\frac{1}{2}}}(z)-\bar{u}_{r_{i+\frac{1}{2}}}(w)\right\|\] \[\leq\frac{s_{i}}{s_{i+1}}\left\|x-y\right\|+\frac{h}{s_{i+1}}L_{ \bar{u}}(r_{i+\frac{1}{2}})\left\|z-w\right\|. \tag{56}\]
+
+We apply the triangle inequality and the lemmaD.1 again to \(\left\|z-w\right\|\). That is,
+
+\[\left\|z-w\right\| =\left\|s_{i}x+\frac{h}{2}\bar{u}_{r_{i}}(s_{i}x)-\left(s_{i}y+ \frac{h}{2}\bar{u}_{r_{i}}\left(s_{i}y\right)\right)\right\|\] \[\leq s_{i}\left\|x-y\right\|+\frac{h}{2}\left\|\bar{u}_{r_{i}}(s _{i}x)-\bar{u}_{r_{i}}\left(s_{i}y\right)\right\|\] \[\leq s_{i}\left\|x-y\right\|+\frac{h}{2}L_{\bar{u}}(r_{i})s_{i} \left\|x-y\right\|\] \[=s_{i}\left(1+\frac{h}{2}L_{\bar{u}}(r_{i})\right)\left\|x-y \right\|.\]
+
+Substitute back in equation 56 gives
+
+\[\frac{s_{i}}{s_{i+1}}\left\|x-y\right\|+\frac{h}{s_{i+1}}L_{\bar{u}}(r_{i+ \frac{1}{2}})\left\|z-w\right\|\leq\frac{s_{i}}{s_{i+1}}\left[1+hL_{\bar{u}}(r _{i+\frac{1}{2}})\left(1+\frac{h}{2}L_{\bar{u}}(r_{i})\right)\right]\left\|x-y \right\|.\]Derivation of parametric solver step\({}^{\theta}\)
+
+(Appendix to Section 2.2.)
+
+This section presents a derivation of \(n\)-step parametric solver
+
+\[\text{step}^{\theta}(t,x\,;u_{t})=\big{(}\text{step}^{\theta}_{t}(t,x\,;u_{t}), \text{step}^{\theta}_{x}(t,x\,;u_{t})\big{)} \tag{57}\]
+
+for scale-time transformation (equation 15) with two options for a base solver: (i) RK1 method (Euler) as the base solver; and \((ii)\) RK2 method (Midpoint). We do so by following equation 10-12. We begin with RK1 and derive equation 17. Given \((t_{i},x_{i})\), equation 10 for the scale time transformation is,
+
+\[\bar{x}_{i}=s_{i}x_{i}. \tag{58}\]
+
+Then according to equation 11,
+
+\[\bar{x}_{i+1} =\text{step}_{x}(r_{i},\bar{x}_{i},\bar{u}_{r_{i}}) \tag{59}\] \[=\bar{x}_{i}+h\bar{u}_{r_{i}}(\bar{x}_{i})\] (60) \[=\bar{x}_{i}+h\left(\frac{\dot{s}_{i}}{s_{i}}\bar{x}_{i}+\dot{t}_ {i}s_{i}u_{t_{i}}\left(\frac{\bar{x}_{i}}{s_{i}}\right)\right)\] (61) \[=s_{i}x_{i}+h\left(\dot{s}_{i}x_{i}+\dot{t}_{i}s_{i}u_{t_{i}}(x_{ i})\right), \tag{62}\]
+
+where in the second equality we apply an RK1 step (equation 4), in the third equality we substitute \(\bar{u}_{r_{i}}\) using equation 16, and in the fourth equality we substitute \(\bar{x}_{i}\) as in equation 58. According to RK1 step (equation 4) we also have \(r_{i+1}=r_{i}+h\). Finally, equation 12 gives,
+
+\[\text{step}^{\theta}_{t}(t_{i},x_{i}\,;u_{t}) =t_{i+1} \tag{63}\] \[\text{step}^{\theta}_{x}(t_{i},x_{i}\,;u_{t}) =\frac{s_{i}+h\dot{s}_{i}}{s_{i+1}}x_{i}+\frac{h}{s_{i+1}}\dot{t}_ {i}s_{i}u_{t_{i}}(x_{i}), \tag{64}\]
+
+as in equation 17.
+
+Regarding the second case, equation 11 for the RK2 method (equation 5) is,
+
+\[\bar{x}_{i+1} =\text{step}_{x}(r_{i},\bar{x}_{i},\bar{u}_{r_{i}}) \tag{65}\] \[=\bar{x}_{i}+h\bar{u}_{r_{i+\frac{1}{2}}}(\bar{x}_{i+\frac{1}{2}}), \tag{66}\]
+
+where
+
+\[\bar{x}_{i+\frac{1}{2}}=\bar{x}_{i}+\frac{h}{2}\bar{u}_{r_{i}}(\bar{x}_{i}) \tag{67}\]
+
+is the RK1 step from \((r_{i},\bar{x}_{i})\) with step size \(h/2\). Now substituting \(\bar{x}_{i}\) as defined equation 58 and \(\bar{u}_{r}\) as defined in equation 16 we get
+
+\[\bar{x}_{i+1}=s_{i}x_{i}+h\left(\frac{\dot{s}_{i+\frac{1}{2}}}{s_{i+\frac{1}{ 2}}}\bar{x}_{i+\frac{1}{2}}+\dot{t}_{i+\frac{1}{2}}s_{i+\frac{1}{2}}u_{t_{i+ \frac{1}{2}}}\left(\frac{\bar{x}_{i+\frac{1}{2}}}{s_{i+\frac{1}{2}}}\right) \right). \tag{68}\]
+
+where
+
+\[\bar{x}_{i+\frac{1}{2}}=\left(s_{i}+\frac{h}{2}\dot{s}_{i}\right)x_{i}+\frac{ h}{2}s_{i}\dot{t}_{i}u_{t_{i}}(x_{i}). \tag{69}\]
+
+Lastly, according to equation 12 we have
+
+\[\text{step}^{\theta}_{x}(t_{i},x\,;u_{t})=\frac{s_{i}}{s_{i+1}}x_{i}+\frac{h} {s_{i+1}}\left(\frac{\dot{s}_{i+\frac{1}{2}}}{s_{i+\frac{1}{2}}}\bar{x}_{i+ \frac{1}{2}}+\dot{t}_{i+\frac{1}{2}}s_{i+\frac{1}{2}}u_{t_{i+\frac{1}{2}}} \left(\frac{\bar{x}_{i+\frac{1}{2}}}{s_{i+\frac{1}{2}}}\right)\right), \tag{70}\]
+
+as in equation 19 where \(z_{i}=\bar{x}_{i+\frac{1}{2}}\).
+
+## Appendix F Implementation Details
+
+(Appendix to Section 2.3.)
+
+This section presents further implementation details, complementing the main text. Our parametric family of solvers step\({}^{\theta}\) is defined via a base solver step and a transformation \((t_{r},\ \varphi_{r})\) as defined in equation 12. We consider the RK2 (Midpoint, equation 5) method as the base solver with \(n\) steps and \((t_{r},\ \varphi_{r})\) the scale-time transformation (equation 15). That is, \(\varphi_{r}(x)=s_{r}x\), where \(s:[0,1]\rightarrow\mathbb{R}_{>0}\), as in equation 14, which is our primary use case.
+
+**Parameterization of \(t_{i}\).** Remember that \(t_{r}\) is a strictly monotonic, differentiable, increasing function \(t:[0,1]\rightarrow[0,1]\). Hence, \(t_{i}\) must satisfy the constraints as in equation 21, _i.e._,
+
+\[0=t_{0}<t_{\frac{1}{2}}<\cdots<t_{n}=1 \tag{71}\] \[\dot{t}_{0},\dot{t}_{\frac{1}{2}},\ldots,\dot{t}_{n-1},\dot{t}_{n -\frac{1}{2}}>0. \tag{72}\]
+
+To satisfy these constrains, we model \(t_{i}\) and \(\dot{t}_{i}\) via
+
+\[t_{i}=\frac{\sum_{j=0}^{i}|\theta_{i}^{t}|}{\sum_{k=0}^{k}|\theta_{k}^{t}|}, \quad\dot{t}_{i}=|\theta_{i}^{t}|, \tag{73}\]
+
+where \(\theta_{i}^{t}\) and \(\theta_{i}^{t}\), \(i=0,\frac{1}{2},...,n\) are free learnable parameters.
+
+**Parameterization of \(s_{i}\).** Since \(s_{r}\) is a strictly positive, differentiable function satisfying a boundary condition at \(r=0\), the sequence \(s_{i}\) should satisfy the constraints as in equation 21, _i.e._,
+
+\[s_{\frac{1}{2}},s_{1},\ldots,s_{n}>0\ \,\ \ s_{0}=1, \tag{74}\]
+
+and \(\dot{s}_{i}\) are unconstrained. Similar to the above, we model \(s_{i}\) and \(\dot{s}_{i}\) by
+
+\[s_{i}=\begin{cases}0&i=0\\ \exp{\theta_{i}^{s}}&\text{otherwise}\end{cases},\quad\dot{s}_{i}=\theta_{i}^{s}, \tag{75}\]
+
+where \(\theta_{i}^{s}\) and \(\theta_{i}^{s}\), \(i=0,\frac{1}{2},...,n\) are free learnable parameters.
+
+**Bespoke training.** The pseudo-code for training a Bespoke solver is provided in Algorithm 3. Here we add some more details on different steps of the training algorithm. We initialize the parameters \(\theta\) such that the scale-transformation is the Identity transformation. That is, for every \(i=0,\frac{1}{2},...,n\),
+
+\[t_{i}=\frac{i}{n},\quad\dot{t}_{i}=1, \tag{76}\] \[s_{i}=1,\quad\dot{s}_{i}=0. \tag{77}\]
+
+Explicitly, in terms of the learnable parameters, for every \(i=0,\frac{1}{2},...,n\),
+
+\[\theta_{i}^{t}=1,\quad\theta_{i}^{t}=1 \tag{78}\] \[\theta_{i}^{s}=0,\quad\theta_{i}^{s}=0. \tag{79}\]
+
+To compute the GT path \(x(t)\), we solve the ODE in equation 1 with the pre-trained model \(u_{t}\) and DOPRI5 method, then use linear interpolation to extract \(x(t_{i})\), \(i=0,1,...,n\)(Chen, 2018). Then, apply \(x_{i}^{\text{aux}}(t)\) (equation 27) to correctly handle the gradients w.r.t. to \(\theta_{i}^{t}\). See Table 3 for number of trajectories used during training. To compute the loss \(\mathcal{L}_{\text{RMSE-B}}\) (equation 26) we compute \(x_{i+1}=\text{step}_{x}^{\theta}(x_{i}^{\text{aux}}(t_{i}),t_{i};u_{t})\) with equations 19,20, and compute \(M_{i}\) via lemma D.3 with \(L_{\tau}=1\). Finally, we use Adam optimizer Kingma & Ba (2017) with a learning rate of \(2e^{-3}\).
+
+**Efficient sampling.** When sampling using a Bespoke solver (Algorithm 2) each step involves applying \(\varphi_{r_{i}}^{-1}\) and \(\varphi_{r_{i}}\) consecutively. In case we use scale transformation, equation 14 (as is done in all examples in this paper), this does not introduce any difficulty, however if a more compute intensive \(\varphi\) is used the following sampling pseudo-code (Algorithm 4) provides an equivalent sampling while avoiding this unnecessary step.
+
+## Appendix G Bespoke RK1 versus RK2
+
+## Appendix H Cifar10
+
+## Appendix I ImageNet-64/128
+
+## Appendix J AFHQ-256
+
+Figure 14: Bespoke RK2, RK1, RK2, and RK4 solvers on AFHQ-256; PSNR vs. NFE (left), and RMSE vs. NFE (right).
+
+Ablations
+
+### Loss ablation
+
+We consider here three losses for optimizing the Bespoke solvers: RMSE-Bound (the parallel loss we advocate in the paper), RMSE (optimizing directly equation 6), and a simplified version of the RMSE-Bound: sum of Local Truncation Errors (LTE-parallel). That is, LTE is defined as in equation 26 but taking \(M_{t}^{\theta}=1\) for all \(i\). Algorithm 5 provides the pseudo-codes for all three losses. We have run all three algorithms on the ImageNet 64 dataset and compared their FID, RMSE, and PSNR, where RMSE and PSNR are computed w.r.t. GT samples (see Section 4 for details). For the non-parallel RMSE loss, we needed to use Activate Checkpointing to reduce memory consumption in order to be able to run this loss. Figure 15 shows the results. As can be seen in the graphs, RMSE loss, as expected, reaches lowest RMSE values per NFE, the second best is the RMSE-Bound loss and worst in terms of RMSE is the LTE. As for FID, RMSE performs worst, while for FM-OT model RMSE-Bound and LTE perform equivalently for NFE\(>\)10, and LTE has advantage as far as FID goes otherwise. Since our goal is to reduce RMSE and provide memory-scalable training algorithm we opted to use the memory efficient RMSE-Bound in the paper.
+
+```
+: pre-trained \(u_{t}\), number of steps \(n\)  initialize \(\theta\in\mathbb{R}^{p}\) while not converged do \(x_{0}\sim p(x_{0})\) \(x(t)\leftarrow\) solve ODE 1 \(\triangleright\) sample noise ifRMSE loss then \(x_{n}^{\theta}\leftarrow\) Bespoke sampling \(\triangleright\) Alg. 2 \(\mathcal{L}\leftarrow\left\lVert x(1)-x_{n}^{\theta}\right\rVert\) elseif\(\text{RMSE-parallel loss}\)then \(\mathcal{L}\gets 0\) \(\triangleright\) init loss parallel for\(i=0,...,n-1\)do \(x_{i+1}^{\theta}\leftarrow\text{step}_{x}^{\theta}\left(x_{i}^{\text{max}}(t_{i }),t_{i};u_{t}\right)\) \(\mathcal{L}\leftarrow=M_{t+1}^{\theta}\left\lVert x_{i+1}^{\theta}(t_{i+1})-x_ {i+1}^{\theta}\right\rVert\) endfor elseif\(\text{LTE-parallel loss}\)then \(\mathcal{L}\gets 0\) \(\triangleright\) init loss parallel for\(i=0,...,n-1\)do \(x_{i+1}^{\theta}\leftarrow\text{step}_{x}^{\theta}\left(x_{i}^{\text{max}}(t_{i }),t_{i};u_{t}\right)\) \(\mathcal{L}\leftarrow=\left\lVert x_{i+1}^{\text{max}}(t_{i+1})-x_{i+1}^{\theta}\right\rVert\) endfor endif \(\theta\leftarrow\theta-\gamma\nabla_{\theta}\mathcal{L}\) \(\triangleright\) optimization step endwhile return\(\theta\)
+```
+
+**Algorithm 5** Bespoke training (parallel).
+
+### Scale-time ablations
+
+This section presents an ablation experiment on the effect of each component in the scale-time transformation. We train Bespoke-RK2 solvers with three choices of transformation: (i) time-only: train \(t_{r},\hat{t}_{r}\) and freeze \(s_{r}\equiv 1,\hat{s}_{r}\equiv 0\), (ii) scale-only: freeze \(t_{r}\equiv r,\hat{t}_{r}\equiv 1\) and train \(s_{r},\hat{s}_{r}\), and (iii) scale-time: train both \(t_{r},\hat{t}_{r}\) and \(s_{r},\hat{s}_{r}\). All experiments are performed on ImageNet 64 FM-OT model. Figure 16 shows the FID, RMSE, and PSNR of Bespoke-RK2 time-only/scale-only/scale-time solvers and the base RK2 solver. First, all three Bespoke-RK2 solvers improve upon the base RK2 solver. Second, the time component seems more significant, but the scale component improves FID for all NFEs and RMSE for NFE \(<20\). Third, in RMSE, the significance of the time component increases as NFE increases. In addition, Figure 17 shows the trained time-only (top) and scale-only (bottom) transformations. Interestingly, we see that even seemingly small changes (e.g., scale-only with NFE \(\in\{16,20\}\)) can affect dramatically the FID.
+
+### Transferring Bespoke solvers
+
+This section presents an ablation experiment demonstrating trained Bespoke solvers' generalization to different models. We train a Bespoke-RK2 solver on an ImageNet-64 FM-OT model and evaluate it on an ImageNet-128 FM-OT model. We compare its FID, RMSE, and PSNR vs. NFE against
+
+Figure 16: Bespoke ablation I: RK2, Bespoke RK2 with full scale-time optimization, time-only optimization (keeping \(s_{r}\equiv 1\) fixed), and scale-only optimization (keeping \(t_{r}=r\) fixed) on FM-OT ImageNet-64: FID vs. NFE (left), RMSE vs. NFE (center), and PSNR vs. NFE (right). Note that most improvement provided by time optimization where scale improves FID for all NFEs, and RMSE for \(<20\) NFEs.
+
+Figure 15: Different Bespoke losses for ImageNet 64. We compare the RMSE-Bound (the parallel loss advocated in the paper), direct RMSE loss, and Local Truncation Error (LTE) which is a slightly simplified version of RMSE-Bound loss. All three variations are provided in Algorithm 5. In terms of RMSE the direct RMSE loss is as expected best however has large memory footprint, while RMSE-Bound is the runner-up and parallelizable. FID is not perfectly correlated with RMSE and shows a somewhat opposite trend (partially excluding the FM-OT model where RMSE-Bound and LTE are almost FID equivalent). We opted for RMSE-Bound loss in the paper since it is memory-scalable and provides best RMSE among the parallel loss options considered.
+
+the base RK2 solver evaluated on ImageNet-128 FM-OT and a Bespoke-RK2 solver trained and evaluated on ImageNet-128 FM-OT. The results is shown in Figure 18.
+
+### Distillation-type parametrization
+
+This section presents a distillation-type experiment in our framework. Our parametric family of solvers is defined by a composition of a scale-time transformation and the RK2 solver, resulting in step\({}^{\theta}\) as in equations 19 and 20, where the weights of the pre-trained model \(u_{t}\) are frozen. A natural comparison to a distillation-like approach is to let the weights of \(u_{t}=u_{t}^{\theta}\) change during optimization instead of using the scale-time transformation, that is
+
+\[\mathcal{L}_{\text{dis}}(\theta)=\mathbb{E}_{x_{0}\sim p(x_{0})}\sum_{i=0}^{n- 1}\left\|x_{i+1}(t_{i+1})-\text{step}_{x}(x_{i},t_{i};u_{t}^{\theta}))\right\|, \tag{80}\]
+
+where \(t_{i}=ih\) is fixed. We perform this experiment on ImageNet 64 FM\(v\)-CS. For a fair comparison, we use the same compute budget as used to train our Bespoke-RK2 solvers on these models: a total of 48K generated trajectories, 6k iterations, and we report at best FID. Figure 19 shows the RK2 base solver, Bespoke-RK2 solver, and Distillation-RK2 on ImageNet 64 FM\(v\)-CS: FID vs. NFE (left), RMSE vs. NFE (center), and PSNR vs. NFE (right). Note that while distillation is able to improve from the baseline solver (RK2) it does not match the performance of the Bespoke solver. Two potential explanations why distillation is not as performant as Bespoke in this experiment are:
+
+Figure 17: Trained \(\theta\) of scale-time ablation: Bespoke-RK2 time-only optimization (top), Bespoke-RK2 scale-only optimization (bottom), on ImageNet-64 FM-OT for NFE 8/10/16/20.
+
+Figure 18: Bespoke ablation II: RK2 evaluated on FM-OT ImageNet-128 model, Bespoke RK2 trained and evaluated on FM-OT ImageNet-128 model, and Bespoke RK2 trained on FM-OT ImageNet-64 and evaluated on FM-OT ImageNet-128 model (transferred): FID vs. NFE (left), RMSE vs. NFE (center), and PSNR vs. NFE (right). Note that the transferred Bespoke solver is still inferior to the Bespoke solver but improves considerably RMSE and PSNR compared to the RK2 baseline. In FID the transferred solver improves over the baseline only for NFE=16,20.
+
+First, the amount of trajectories/compute budget we use to optimize Bespoke is not sufficient for effective distillation; and second, successful distillation methods require access to training data. Training only on generated data distillation is less effective.
+
+### Training stopping criteria
+
+In this ablation experiment, we qualitatively compare samples when changing the stopping criteria of the bespoke solver training. In Figure 20, we compare samples with bespoke-RK2 solvers where the training stopping criteria is best FID versus best RMSE on four models, ImageNet 64 \(\epsilon\)-VP/FM\(\upsilon\)-CS/FM-OT and ImageNet 128 FM-OT, and NFE \(\in\{8,10,20\}\). In all of the cases the differences are practically indistinguishable.
+
+Figure 19: Distillation-type experiment: RK2 solver, Bespoke-R2 solver, and Distillation using same number of trajectories and compute as Bespoke, on ImageNet 64 FM/\(\upsilon\)-CS: FID vs. NFE (left), RMSE vs. NFE (center), and PSNR vs. NFE (right).
+
+## Appendix L Trained Bespoke solvers
+
+In this section, we present the trained Bespoke solvers by visualizing their respective parameters \(\theta\). Figures 21, 22, and 23 show the learned scale-time transformation of Bespoke-RK2 solvers trained on ImageNet-128, ImageNet-64, and CIFAR10 (resp.) for NFE \(\{8,10,16,20\}\). First, we note the significant differences between the learned scale-time transformation of \(\epsilon\)-VP versus FM-OT on ImageNet 64 in Figure 22 top and bottom rows (resp.). Second, we note that the scale-time transformations trained on the same model type but on different datasets seem to have similarities to some degree but are still different from one another, see Figure 21 and Figures 22, 23 bottom rows, for FM-OT trained on ImageNet-128, ImageNet-64, and CIFAR10 (resp.). These two observations showcase the advantage of a custom-made solver for each model. We also tested the latter point empirically in the ablation experiment in Section K.3, where we tested a Bespoke-RK2 solver trained on an ImageNet 64 FM-OT model to an ImageNet 128 FM-OT model and noticed a drop in performance compared to a Bespoke solver trained directly on the ImageNet 128 FM-OT model. In addition, we note the resemblance in the form of scale-time transformations trained on the same model type and same dataset across different NFE (i.e., a row in Figures 21, 22, and 23). This phenomenon suggests there may be a well-defined scale-time transformation in the limit of NFE \(\rightarrow\infty\). Furthermore, for \(\dot{t}_{i}\) and \(\dot{s}_{i}\), even and odd parity points on the grid seem to converge to different curves, possibly due to their different role in the RK2 solvers.
+
+Figure 20: Different stopping criteria experiment. We compare samples with bespoke-RK2 solvers with training stopping criteria at best FID and best RMSE; ImageNet64 (3 top rows) and ImageNet-128 (2 bottom rows).
+
+## Appendix M Pre-trained Models
+
+All our FM-OT and FM/\(v\)-CS models were trained with Conditional Flow Matching (CFM) loss derived in Lipman et al. (2022),
+
+\[\mathcal{L}_{\text{CFM}}(\theta)=\mathbb{E}_{t,p_{0}(x_{0}),q(x_{1})}\left\|v_{t }(x_{t};\theta)-\left(\dot{\sigma}_{t}x_{0}+\dot{\alpha}_{t}x_{1}\right)\right\| ^{2}, \tag{81}\]
+
+where \(t\sim\mathcal{U}([0,1])\), \(p_{0}(x_{0})=\mathcal{N}\left(x_{0}|0,I\right)\), \(q(x_{1})\) is the data distribution, \(v_{t}(x_{t};\theta)\) is the network, \(\left(\alpha_{t},\sigma_{t}\right)\) is the scheduler as defined in equation 22, and \(x_{t}=\sigma_{t}x_{0}+\alpha_{t}x_{1}\). For FM-OT the scheduler is
+
+\[\alpha_{t}=t,\quad\sigma_{t}=1-t, \tag{82}\]
+
+and for FM/\(v\)-CS the scheduler is
+
+\[\alpha_{t}=\sin\frac{\pi}{2}t,\quad\sigma_{t}=\cos\frac{\pi}{2}t. \tag{83}\]
+
+All our \(\epsilon\)-VP models were trained with noise prediction loss as derived in Ho et al. (2020) and Song et al. (2020),
+
+\[\mathcal{L}_{\text{noise}}(\theta)=\mathbb{E}_{t,p_{0}(x_{0}),q(x_{1})}\left\| \epsilon_{t}(x_{t};\theta)-x_{0}\right\|^{2}, \tag{84}\]
+
+where the VP scheduler is
+
+\[\alpha_{t}=\xi_{1-t},\quad\sigma_{t}=\sqrt{1-\xi_{1-t}^{2}},\quad\xi_{s}=e^{- \frac{1}{2}s^{2}(B-b)-\frac{1}{2}sb}, \tag{85}\]
+
+and \(B=20,\ b=0.1\). All models use U-Net architecture as in Dhariwal and Nichol (2021), and the hyper-parameters are listed in Table 5.
+
+Figure 21: Trained \(\theta\) of Bespoke-RK2 solvers on ImageNet-128 FM-OT for NFE 8/10/16/20.
+
+Figure 22: Trained \(\theta\) of Bespoke-RK2 solvers on ImageNet-64 for NFE 8/10/16/20; \(\epsilon\)-VP (top), FM/\(v\)-CS (middle), and FM-OT (bottom).
+
+## Appendix N More results
+
+In this section we present more sampling results using RK2-Bespoke solvers, the RK2 baseline and Ground Truth samples (with DOPRI5).
+
+Figure 23: Trained \(\theta\) of Bespoke-RK2 solvers on CIFAR10 for NFE 8/10/16/20; \(\epsilon\)-pred (top), FM/\(\nu\)-CS (middle), and FM-OT (bottom).
+
+\begin{table}
+\begin{tabular}{l c c c c c} \hline \hline  & CIFAR10 & CIFAR10 & ImageNet-64 & ImageNet-128 & AFHQ 256 \\  & \(\epsilon\)-VP & FM-OT;FM/\(\nu\)-CS & \(\epsilon\)-VP;FM-OT;FM/\(\nu\)-CS & FM-OT & FM-OT \\ \hline Channels & 128 & 128 & 196 & 256 & 256 \\ Depth & 4 & 4 & 3 & 2 & 2 \\ Channels multiple & 2,2,2 & 2,2,2 & 1,2,3,4 & 1,1,2,3,4 & 1,1,2,2,4,4 \\ Heads & 1 & 1 & - & - & - \\ Heads Channels & - & - & 64 & 64 & 64 \\ Attention resolution & 16 & 16 & 32,16,8 & 32,16,8 & 64,32,16 \\ Dropout & 0.1 & 0.3 & 1.0 & 0.0 & 0.0 \\ Effective Batch size & 512 & 512 & 2048 & 2048 & 256 \\ GPUs & 8 & 8 & 64 & 64 & 64 \\ Epochs & 2000 & 3000 & 1600 & 1437 & 862 \\ Iterations & 200k & 300k & 1M & 900k & 50k \\ Learning Rate & 5e-4 & 1e-4 & 1e-4 & 1e-4 & 1e-4 \\ Learning Rate Scheduler & constant & constant & constant & Poly Decay & Polyn Decay \\ Warmup Steps & - & - & - & 5k & 5k \\ P-Unconditional & - & - & 0.2 & 0.2 & 0.2 \\ Guidance weight & - & - & 0.20 (vp.cs), 0.15 (ot) & 0.5 & 0.1 \\ Total parameters count & 55M & 55M & 296M & 421M & 537M \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Pre-trained models’ hyper-parameters.
+
+Figure 24: Comparison of FM-OT AFHQ-256 GT samples with RK2 and Bespoke-RK2 solvers.
+
+Figure 25: Comparison of FM-OT ImageNet-128 GT samples with RK2 and Bespoke-RK2 solvers.
+
+Figure 26: Comparison of FM-OT ImageNet-128 GT samples with RK2 and Bespoke-RK2 solvers.
+
+Figure 27: Comparison of FM-OT ImageNet-64 GT samples with RK2 and Bespoke-RK2 solvers.
+
+Figure 28: Comparison of FM/\(v\)-CS ImageNet-64 GT samples with RK2 and Bespoke-RK2 solvers.
+
+Figure 29: Comparison of \(\epsilon\)-pred ImageNet-64 GT samples with RK2 and Bespoke-RK2 solvers.
+
+Figure 30: Comparison of \(\epsilon\)-VP and FM/\(v\)-CS ImageNet-64 samples with DPM-2 and bespoke-RK2 solvers.

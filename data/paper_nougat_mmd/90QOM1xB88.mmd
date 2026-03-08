@@ -1,0 +1,589 @@
+## Improved Order Analysis and Design of Exponential Integrator for Diffusion Models Sampling
+
+### Anonymous authors
+
+Paper under double-blind review
+
+Efficient differential equation solvers have significantly reduced the sampling time of diffusion models (DMs) while retaining high sampling quality. Among these solvers, exponential integrators (EI) have gained prominence by demonstrating state-of-the-art performance. Surprisingly, we find existing high-order EI-based sampling algorithms rely on degenerate EI solvers, resulting in inferior error bounds and reduced accuracy in contrast to the theoretically anticipated results under optimal settings. This situation makes the sampling quality extremely vulnerable to seemingly innocuous design choices such as timestep schedules. For example, an inefficient timestep scheduler might necessitate twice the number of steps to achieve a quality comparable to that obtained through carefully optimized timesteps. To address this issue, we reevaluate the design of high-order differential solvers for DMs. Built upon well-established numerical framework from Hochbruck and Ostermann (2005a) and extensive experiments, we reveal that the degeneration of existing high-order EI solvers can be attributed to the absence of essential order conditions. By reformulating the differential equations in DMs and capitalizing on the theory of exponential integrators Weiner (1992), we introduce EI solvers that fulfill all order conditions for diffusion sampling, which we designate as Refined Exponential Solver (RES). Utilizing these improved solvers, RES exhibits more favorable error bounds theoretically and achieves superior sampling efficiency and stability in practical applications. For instance, a simple switch from the single-step DPM-Solver++ to our order-satisfied RES when Number of Function Evaluations (NFE) \(=9\), results in a reduction of numerical defects by \(25.2\%\) and FID improvement of \(25.4\%\) (16.77 vs 12.51) on a pre-trained ImageNet model.
+
+## 1 Introduction
+
+Diffusion models (DMs) (Ho et al., 2020; Song et al., 2021b) have recently garnered significant interest as powerful and expressive generative models. They have demonstrated unprecedented success in text-to-image synthesis (Rombach et al., 2022; Saharia et al., 2022; Balaji et al., 2022) and extended their impact to other data modalities, such as 3D objects (Poole et al., 2022; Lin et al., 2022; Shue et al., 2022; Bautista et al., 2022), audio (Kong et al., 2020), time series (Tashiro et al., 2021; Bilos et al., 2022), and molecules (Wu et al., 2022; Qiao et al., 2022; Xu et al., 2022). However, DMs have slow generation due to their iterative noise removal, requiring potentially thousands of network function evaluations (NFEs) to transform Gaussian noise into clean data, compared to Generative adversarial networks (GANs) single evaluation for a batch of images.
+
+Recently, a surge of research interests has been directed toward accelerating the sampling process in diffusion models. One strategy involves the distillation of deterministic generation. Despite requiring additional computational resources, this approach can reduce the number of NFEs to fewer than five (Salimans and Ho, 2022; Song et al., 2023; Meng et al., 2022; Liu et al., 2023). Nevertheless, distillation methods often depend on training-free sampling methods during the learning process and are only applicable to the specific model being distilled, thereby limiting their flexibility compared to training-free sampling methods (Luhman and Luhman, 2021). Another line of investigation is aimed at designing generic sampling techniques that can be readily applied to any pre-trained DMs. Specifically, these techniques leverage the connection between diffusion models and stochastic differential equations (SDEs), as well as the feasibility of deterministically drawing samples by solving the equivalent Ordinary Differential Equations (ODEs) for marginal probabilities, known as probability flow ODEs (Song et al., 2021b;a). Research in this domain focuses on the designof efficient numerical solvers to expedite the process (Liu et al., 2022; Zhang & Chen, 2022; Lu et al., 2022; Zhang et al., 2022; Karras et al., 2022; Lu et al., 2022b; Zhao et al., 2023). Despite the significant empirical acceleration, numerous methods that claim the same order of numerical error convergence rate demonstrate significant disparities in practical application. Furthermore, these approaches often incorporate a range of techniques and designs that may obscure the actual factors contributing to the acceleration, such as various thresholding (Dharivari & Nichol, 2021; Saharia et al., 2022), and sampling time optimization (DeepFloyd, 2023; Karras et al., 2022). (See App A for more related works and discussions.)
+
+In this study, we initiate by revisiting different diffusion probability flow ODE parameterizations, underlining the vital role of approximation accuracy for integrals in the ODE solution in various sampling algorithms. This directly impacts both the quality and speed of sampling (Sec 3.1). Through a change-of-variable process, we further unify the ODEs for the noise prediction model and data prediction into a singular, canonical semilinear ODE. Building on the framework, and drawing from the wisdom of well-established numerical analysis literature (Hochbruck & Ostermann, 2005a; 2010), we conduct a detailed order analysis of diffusion ODE with semilinear structure. This analysis uncovers critical limitations in widely used sampling algorithms, notably their non-compliance with the order conditions of exponential integrators (EI). This leads to inferior error bounds, compromised accuracy, and a lack of robustness compared to the theoretically projected outcomes under optimal settings (Sec 3.2).
+
+In response, we introduce the Refined Exponential Solver (RES), which is built upon an order-satisfied scheme originating from Weiner (1992). RES offers more favorable error recursion both theoretically and empirically, thus ensuring superior sampling efficiency and robustness (Sec 3.3). Moreover, our single-step scheme can be seamlessly integrated to enhance multistep deterministic (Sec 3.4) and stochastic sampling algorithms (Sec 3.5), surpassing the performance of contemporary alternatives. Lastly, we undertake comprehensive experiments with various diffusion models to demonstrate the generalizability, superior efficiency, and enhanced stability of our approach, in comparison with existing works (Sec 4). In summary, our contributions are as follows:
+
+* We revisit and reevaluate diffusion probability flow ODE parameterizations and reveal the source of approximation error.
+* To minimize error, we propose a unified canonical semilinear ODE, identify the overlooked order condition in existing studies, and rectify this oversight for diffusion ODE by leveraging theoretically sound exponential integrator analysis (Hochbruck & Ostermann, 2005a).
+* We introduce RES, a new diffusion sampling algorithm that provides improved error recursion, both theoretically and empirically. Extensive experiments are conducted to show its superior efficiency, enhanced stability, and its orthogonality to other sampling improvements. For example, it shows up to 40% acceleration by switching single-step DPM-Solver++ to single-step RES under a suboptimal time scheduling.
+
+## 2 Background
+
+Given a data distribution of interest, denoted as \(p_{data}(\mathbf{x})\) where \(\mathbf{x}\in\mathcal{X}\), a diffusion model consists of a forward noising process that diffuses data point \(\mathbf{x}\) into random noise and a backward denoising process that synthesize data via removing noise iteratively starting from random noise. We start our discussion with simple variance-exploding diffusion models (Song & Ermon, 2020), which can be generalized to other diffusion models under the unifying framework introduced by Karras et al. (2022). Concretely, the forward noising process defines a family of distributions \(p(\mathbf{x};\sigma(t))\) dependent on time \(t\), which is obtained by adding _i.i.d._ Gaussian noise of standard deviation \(\sigma(t)\) to noise-free data samples. We choose \(\sigma(t)\) to be monotonically increasing with respect to time \(t\), such as \(\sigma(t)=t\).
+
+To draw samples from diffusion models, a backward synthesis process is required to solve the following stochastic differential equation (SDE) (Zhang & Chen, 2021; Huang et al., 2021; Karras et al., 2022), starting from \(\mathbf{x}(T)\sim\mathcal{N}(\mathbf{0},\sigma(T)^{2}\mathbf{I})\) for a large enough \(T\):
+
+\[\mathrm{d}\mathbf{x}= -\underbrace{\dot{\sigma}(t)\sigma(t)\nabla_{\mathbf{x}}\log p(\mathbf{x} ;\sigma(t))\mathrm{d}t}_{\text{Probabilistic ODE}}-\underbrace{\beta_{t} \sigma(t)^{2}\nabla_{\mathbf{x}}\log p(\mathbf{x};\sigma(t))\mathrm{d}t+\sqrt{2\beta_{ t}}\sigma(t)\mathrm{d}\omega_{t}}_{\text{Langevin process}}, \tag{1}\]
+
+where \(\nabla_{\mathbf{x}}\log p(\mathbf{x};\sigma(t))\) is the score function (_i.e._, gradient of log-probability), \(\omega_{t}\) is the standard Wiener process, and \(\beta_{t}\) is a hyperparameter that controls the stochasticity of the process. Eq (1)reduces to deterministic probabilistic flow ODE (Song et al., 2021b) when \(\beta=0\). Some popular methods, such as variance-preserving diffusion models, introduce an additional scale schedule \(s(t)\) and consider \(\mathbf{x}=s(t)\hat{\mathbf{x}}\) to be a scaled version of the original, non-scaled data \(\hat{\mathbf{x}}\). Though the introduction of scale schedule \(s(t)\) will result in a different backward process, we can undo the scaling and reduce their sampling SDEs to Eq (1). Note that we focus on non-scaling diffusion models in this paper for simplicity and leave the extension to other diffusion models in App B. The score function \(\nabla_{\mathbf{x}}\log p(\mathbf{x};\sigma(t))\) of noised distribution at a particular noise level \(\sigma\) can be learned via a denoising score matching objective (Vincent, 2011):
+
+\[L_{\sigma}(\theta)=\mathbb{E}_{\mathbf{x}\sim p_{data},\epsilon\sim\mathcal{N}(0, \mathbf{I})}[\|D_{\theta}(\mathbf{x}+\sigma\epsilon,\sigma)-\mathbf{x}\|_{2}^{2}], \tag{2}\]
+
+where \(D_{\theta}:\mathcal{X}\times\mathcal{R}\rightarrow\mathcal{X}\) is a time-conditioned neural network that tries to denoise the noisy sample. In the ideal case, having the perfect denoiser \(D_{\theta}\) is equivalent to having the score function thanks to Tweedie's formula (Efron, 2011):
+
+\[D_{\theta}(\mathbf{x},\sigma)=\mathbf{x}+\sigma^{2}\nabla_{\mathbf{x}}\log p(\mathbf{x}; \sigma). \tag{3}\]
+
+For convenience, we also introduce the noise prediction model, which tries to predict \(\epsilon\) in Eq (2):
+
+\[\epsilon_{\theta}(\mathbf{x},\sigma):=\frac{\mathbf{x}-D_{\theta}(\mathbf{x},\sigma)}{ \sigma}. \tag{4}\]
+
+## 3 Refined exponential solver RES
+
+Even with the same trained diffusion model, different solvers of Eq (1) will lead to samplers of drastically different efficiency and quality. In this section, we present a unified formulation to the various probability flow ODE being considered (Sec 3.1), analyze the numerical approximation errors for general single-step methods (Sec 3.2), and find the optimal set of coefficients that satisfies the desired order conditions and minimizes numerical error (Sec 3.3). We then extend the improvement to the stochastic setting (Sec 3.4) and multistep sampling methods (Sec 3.5).
+
+### Better parameterizations for probability flow ODE
+
+The probability flow ODE in diffusion models in Eq (1) is first order, and thus we can draw some analogies between \(\mathbf{x}\) and "location", \(t\) and "time", and \(-\hat{\sigma}(t)\sigma(t)\nabla_{\mathbf{x}}\log p(\mathbf{x},\sigma(t))\) as "velocity". In general, an ODE is easier to solve if the "velocity" term has smaller first-order derivatives (Press et al., 2007; Lipman et al., 2022). Here, we list several different parametrizations for these quantities. While the exact solutions to these ODEs are the same, the numerical solutions can differ dramatically.
+
+EdmIn EDM (Karras et al., 2022), the location term is on the data space \(\mathbf{x}\), the probability flow ODE in Eq (1) with \(\beta_{t}=0\) simplifies to the following equation:
+
+\[\mathrm{d}\mathbf{x}=\frac{\mathbf{x}-\mathbf{D}_{\theta}(\mathbf{x},\sigma(t))}{\sigma(t)} \hat{\sigma}(t)\mathrm{d}t. \tag{5}\]
+
+To solve Eq (5), Karras et al. (2022) interpret the term \(\frac{\mathbf{x}-\mathbf{D}_{\theta}(\mathbf{x},\sigma(t))}{\sigma_{t}}\hat{\sigma}(t)\) as a black box function and choose \(\sigma(t)=t\), and then apply a standard second-order Heun ODE solver.
+
+DeisSimilarly, one variant of DEIS (Zhang and Chen, 2022) uses the noise prediction model \(\epsilon_{\theta}\) to parametrize the ODE:
+
+\[\mathrm{d}\mathbf{x}=\epsilon_{\theta}(\mathbf{x},\sigma)\mathrm{d}\sigma. \tag{6}\]
+
+It is not hard to see that this is equivalent to the EDM one if we set \(\sigma\) to \(t\).
+
+\begin{table}
+\begin{tabular}{c c c c c} \hline \hline Parametrization & Location & Velocity & Time & Semi-linear \\ \hline EDM / DEIS & \(\mathbf{x}\) & \((\mathbf{x}-\mathbf{D}_{\theta}(\mathbf{x},t))/t\) & \(t:=\sigma\) & No \\ logSNR & \(\mathbf{x}\) & \(-\mathbf{x}+\mathbf{D}_{\theta}(\mathbf{x},e^{-\lambda_{D}})\) & \(\lambda_{\mathbf{D}}:=-\log\sigma\) & Yes \\ Negative logSNR & \(\mathbf{y}:=\mathbf{x}/e^{\lambda_{\epsilon}}\) & \(-\mathbf{y}+\epsilon_{\theta}(e^{\lambda_{\epsilon}}\mathbf{y},e^{\lambda_{\epsilon}})\) & \(\lambda_{\epsilon}:=\log\sigma\) & Yes \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Different parametrizations of the probabilistic ODE.
+
+logSNRWe explore an alternative probability flow ODE parameterization based on the denoising model \(\mathbf{D}_{\theta}\). We consider \(\lambda_{\mathbf{D}}(t):=-\log\sigma(t)\), which can be treated as the log signal-to-noise ratio (logSNR, (Kingma et al., 2021)) between coefficients of the signal \(\mathbf{x}(0)\) and noise \(\epsilon\). With \(\mathrm{d}\lambda_{\mathbf{D}}(t)=\frac{-\sigma(t)}{\sigma(t)}\mathrm{d}t\), Eq (5) can be reformulated as follows:
+
+\[\frac{\mathrm{d}\mathbf{x}}{\mathrm{d}\lambda_{\mathbf{D}}}=-\mathbf{x}+g_{\mathbf{D}}(\mathbf{x}, \lambda_{\mathbf{D}}),\quad g_{\mathbf{D}}(\mathbf{x},\lambda_{\mathbf{D}}):=D_{\theta}(\mathbf{x },e^{-\lambda_{\mathbf{D}}}). \tag{7}\]
+
+Negative logSNRAlternatively, we can restructure Eq (6) by employing a change-of-variables approach with \(\mathbf{y}(t):=\frac{\mathbf{x}(t)}{\sigma(t)},\lambda_{\epsilon}(t):=\log\sigma(t)\) for the noise prediction model \(\epsilon_{\theta}\):
+
+\[\frac{\mathrm{d}\mathbf{y}}{\mathrm{d}\lambda_{\epsilon}}=-\mathbf{y}+g_{\epsilon}(\bm {y},\lambda_{\epsilon}),\quad g_{\epsilon}(\mathbf{y},\lambda_{\epsilon}):=\epsilon _{\theta}(e^{\lambda_{\epsilon}}\mathbf{y},e_{\epsilon}^{\lambda}), \tag{8}\]
+
+where \(\lambda_{\epsilon}\) is the negative logSNR. We observe that Eq (7) and (8) possess highly similar ODE structures. In fact, they are both _semilinear parabolic problems_ in the numerical analysis literature (Hochbruck and Ostermann, 2005b), _i.e._, the velocity term is a linear function of location plus a non-linear function of location (\(g_{\mathbf{D}}\) or \(g_{\epsilon}\)). This suggests that ODEs with either epsilon prediction or data prediction models can be addressed within a _unified_ framework. We summarize these parametrizations in Tab 1.
+
+A notable advantage of the logSNR and negative logSNR parametrizations is that their velocity terms along exact solution trajectory, such as \(-\mathbf{x}(\lambda_{\mathbf{D}})+g_{\mathbf{D}}(\mathbf{x}(\lambda_{\mathbf{D}}),\lambda_{\mathbf{D}})\), are smoother than the velocity term in the ODE for EDM/DEIS. We illustrate this in Fig 0(a), which shows that the norm of the derivative of the EDM velocity term grows rapidly as \(\sigma\to 0\). To mitigate the challenges associated with solving ODEs that exhibit sharper "acceleration", the timestep scheduling employed in prevalent samplers (like DDIM and EDM) typically allocates more steps at lower noise levels.
+
+For the rest of the section, we focus on logSNR (Eq (7)); theoretical conclusions and practical algorithms can be easily transferred to negative logSNR (Eq (8)). For notational simplicity, we substitute \(\lambda\) for \(\lambda_{\mathbf{D}}\) and \(g\) for \(g_{\mathbf{D}}\), so our ODE in Eq (7) becomes:
+
+\[\frac{\mathrm{d}\mathbf{x}}{\mathrm{d}\lambda}=-\mathbf{x}+g(\mathbf{x},\lambda), \tag{9}\]
+
+Suppose that our ODE solver advances for a step size of \(h\) from \(\mathbf{x}(\lambda)\), then the exact solution \(\mathbf{x}(\lambda+h)\) to this ODE, as given by the _variation-of-constants_ formula, is represented as follows:
+
+\[\mathbf{x}(\lambda+h)=e^{-h}\mathbf{x}(\lambda)+\int_{0}^{h}e^{(\tau-h)}g(\mathbf{x}( \lambda+\tau),\lambda+\tau)\mathrm{d}\tau. \tag{10}\]
+
+Figure 1: Fig 0(a). Along the trajectory of an exact solution to the probability flow ODE, semi-linear ODE with logarithm transformation parametrization on noise level \(\sigma\) has smaller “acceleration”, _i.e.,_ the time-derivative of “velocity”. The curves are averaged over \(512\) solutions on the pre-trained ImageNet model (Karras et al., 2022). This implies that semi-linear ODEs may incur lower discretization errors by approximating underlying networks with a constant or linear profile during the solving of ODEs. Fig 0(b). The auxiliary trajectory \(\hat{\mathbf{x}}\) starts from exact solution \(\mathbf{x}\) and is built upon numerical integration proposed in Eq (11). The diagram depicts that numerical defects \(\Delta_{n+1}\) between \(\mathbf{x}(\lambda_{n+1})\) and numerical solution \(\mathbf{x}_{n+1}\) is a result of accumulated intermediate defects \(\{\delta_{n},\delta_{n,i}\}\) in each step, which is the discrepancy between the auxiliary trajectory and the exact solution trajectory.
+
+However, the computation of this exact solution confronts two significant challenges: the intractability of the integral and the inaccessible integrand, which involves the evaluation of the denoiser on the exact solution \(\mathbf{x}(\lambda+\tau)\). To approximate the intractable integration in Eq (10), we leverage numerical analysis and methods from Hochbruck & Ostermann (2005a) to derive order conditions and update scheme for single-step methods.
+
+### Single-step numerical schemes and defect analysis
+
+To approximate the exact solution in Eq (10), the numerical scheme of explicit single-step methods, characterized by \(s\)-stages, can be described as follows:
+
+\[\mathbf{x}_{n+1} =e^{-h_{n}}\mathbf{x}_{n}+h_{n}\sum_{i=1}^{s}b_{i}(-h_{n})\mathbf{d}_{n,i}, \tag{11a}\] \[\mathbf{x}_{n,i} =e^{-c_{i}h_{n}}\mathbf{x}_{n}+h_{n}\sum_{j=1}^{i-1}a_{ij}(-h_{n})\bm {d}_{n,j},\quad\mathbf{d}_{n,i}:=g(\mathbf{x}_{n,i},\lambda_{n}+c_{i}h_{n}), \tag{11b}\]
+
+where \(h_{n}:=\lambda_{n+1}-\lambda_{n}\) denotes the step size from state \(\mathbf{x}_{n}\) to \(\mathbf{x}_{n+1}\), \(\mathbf{x}_{n,i}\) denotes the numerical solution at the \(i\)-th stage with timestep \(\lambda_{n}+c_{i}h_{n}\), and \(\mathbf{d}_{n,i}\) is the function evaluation at the \(i\)-th stage. Notably, \(\mathbf{x}_{n}\) denotes the numerical solution at time \(\lambda_{n}\), which deviates from the exact solution \(\mathbf{x}(\lambda_{n})\); similarly, the numerical solution \(\mathbf{x}_{n,i}\) at stage \(i\) deviates from the exact \(\mathbf{x}(\lambda_{n}+c_{i}h_{n})\). The coefficients \(a_{ij},b_{i},c_{j}\) in Eq (11) can be compactly represented using Butcher tableaus Tab 2 (Press et al., 2007).
+
+To bound the numerical defect \(\mathbf{x}_{n}-\mathbf{x}(\lambda_{n})\), we first decompose it into the summation of, \(\mathbf{x}_{n}-\hat{\mathbf{x}}_{n}\) and \(\hat{\mathbf{x}}_{n}-\mathbf{x}(\lambda_{n})\). Here, the auxiliary trajectory \(\hat{\mathbf{x}}_{n}\) is obtained by substituting \(\mathbf{d}_{n,i}\) in Eq (11) with \(f(\lambda):=g(\mathbf{x}(\lambda),\lambda)\). Specifically, we define _intermediate numerical defects_\(\delta_{n},\delta_{n,i}\) as
+
+\[\delta_{n,i}:=\mathbf{x}(\lambda_{n}+c_{i}h_{n})-\hat{\mathbf{x}}_{n,i}, \quad\hat{\mathbf{x}}_{n,i}=e^{-c_{i}h_{n}}\mathbf{x}(\lambda_{n})-h_{n}\sum_{j=1}^{i- 1}a_{ij}(-h_{n})f(\lambda_{n}+c_{j}h_{n}), \tag{12a}\] \[\delta_{n+1}:=\mathbf{x}(\lambda_{n+1})-\hat{\mathbf{x}}_{n+1},\quad\hat {\mathbf{x}}_{n+1}=e^{-h_{n}}\mathbf{x}(\lambda_{n})-h_{n}\sum_{i=1}^{s}b_{i}(-h_{n})f( \lambda_{n}+c_{i}h_{n}). \tag{12b}\]
+
+Intuitively, defects \(\delta_{n,i},\delta_{n+1}\) are caused by approximating the intractable integration in Eq (10) by finite summation in Eq (11). Let \(\Delta_{n}:=\mathbf{x}_{n}-\mathbf{x}(\lambda_{n})\), \(\Delta_{n,i}:=\mathbf{x}_{n,i}-\mathbf{x}(\lambda_{n}+c_{i}h_{n})\), we can derive error recursion with the help of \(\delta_{n,i},\delta_{n+1}\), such that
+
+\[\Delta_{n+1}=e^{-h_{n}}\Delta_{n}+h\sum_{j=1}^{i-1}b_{i}(-h_{n})( g(\mathbf{x}_{n,i},\lambda_{n}+c_{i}h_{n})-f(\lambda_{n}+c_{i}h_{n}))-\delta_{n+1}, \tag{13a}\] \[\Delta_{n,i}=e^{-c_{i}h_{n}}\Delta_{n}+h\sum_{j=1}^{i-1}a_{ij}(-h _{n})(g(\mathbf{x}_{nj},\lambda_{n}+c_{j}h_{n})-f(\lambda_{n}+c_{j}h_{n}))-\delta_ {n,i}. \tag{13b}\]
+
+Eq (13) reveals that numerical defects \(\Delta_{n+1},\Delta_{n,i}\) are influenced by the emergent intermediate defects \(\delta_{n+1},\delta_{n,i}\) and defects \(\Delta_{n}\), which are themselves modulated by previous intermediate defects. Moreover, the discrepancy \(g(\mathbf{x}_{n,i},\lambda_{n}+c_{i}h_{n})-f(\lambda_{n}+c_{i}h_{n})\) is contingent upon \(\Delta_{n,i}\). As error recursion illustrated in Fig 1b, the origin of final numerical defects lies in the defects \(\delta_{n+1},\delta_{n,i}\) in each step. Consequently, to curtail the ultimate defect, it becomes paramount to constrain \(\delta_{n+1},\delta_{n,i}\). To establish bounds for \(\Delta_{n}\) using the above error recursion, the following lemma provides an expansion of intermediate defects, uncovering the association between \(\delta_{n+1},\delta_{n,i}\) and the derivative of \(f(\lambda)\).
+
+\begin{table}
+\begin{tabular}{c|c c c c c|c c 
+
+**Lemma 1** ((Hochbruck and Ostermann, 2005b)).: _Let \(\phi_{j}(-h_{n})=\frac{1}{h_{n}^{j}}\int_{0}^{h_{n}}e^{r-h_{n}}\frac{r^{j-1}}{(j-1 )!}d\tau\), the order-\(q\) Taylor expansion of the intermediate defects \(\delta_{n,i},\delta_{n+1}\) can be formulated as follows:_
+
+\[\delta_{n,i}=\sum_{j=1}^{q}h_{n}^{j}\psi_{j,i}(-h_{n})f^{(j-1)}( \lambda_{n})+\mathcal{O}(h_{n}^{q})\quad\delta_{n+1}=\sum_{j=1}^{q}h_{n}^{j} \psi_{j}(-h_{n})f^{(j-1)}(\lambda_{n})+\mathcal{O}(h_{n}^{q}), \tag{14}\]
+
+_where function \(\psi_{j,i},\psi_{j}\) for the coefficients of the \((j-1)\)-th order derivative of \(f(\lambda_{n})\) are defined as_
+
+\[\psi_{j,i}(-h_{n})=\phi_{j}(-c_{i}h_{n})c_{i}^{j}-\sum_{k=1}^{i-1} a_{ik}(-h_{n})\frac{c_{k}^{j-1}}{(j-1)!},\quad\psi_{j}(-h_{n})=\phi_{j}(-h_{n})- \sum_{k=1}^{s}b_{k}(-h_{n})\frac{c_{k}^{j-1}}{(j-1)!}.\]
+
+Lemma 1 furnishes an expansion expression for \(\delta_{n,i},\delta_{n+1}\), with each term contingent upon the derivative of \(f\) and coefficients \(\{\psi_{j},\psi_{j,i}\}\). This implies that to minimize numerical defects (\(\Delta_{n+1}\)), an ODE parametrization that ensures the smoothest possible nonlinear function along the exact solution trajectory should be selected, thus substantiating our choice of the logarithmic transformation on the noise level. To this end, we can constrain numerical defects \(\delta_{n+1},\delta_{n,i}\) by minimizing the magnitude of \(\{\psi_{j},\psi_{j,i}\}\), forming the foundation of the order conditions for the single-step scheme.
+
+### Order conditions
+
+With Eq (13) and Lemma 1, we can deduce the conditions necessary to achieve a numerical scheme of order \(q\). We start with the case of a single-stage solver of order one.
+
+**Theorem 1** (Error bound for solvers that satisfy the 1st-order condition).: _When \(\psi_{1}(-h_{i})=0\) is satisfied for \(1\leq i\leq n\), the error bound of first-order solver based on Eq (11)_
+
+\[\|\mathbf{x}_{n}-\mathbf{x}(\lambda_{n})\|\leq Ch\sup_{\lambda_{\text{max}}\leq\lambda \leq\lambda_{\text{max}}}\|f^{\prime}(\lambda)\| \tag{15}\]
+
+_holds for \(h=\max_{1\leq i\leq n}h_{i}\). The constant \(C\) is independent of \(n,h\)._
+
+With Thm 1, \(b_{1}(-h)=\phi_{1}(-h)\) and the numerical scheme reads
+
+\[\mathbf{x}_{n+1}=e^{-h_{n}}\mathbf{x}_{n}+h_{n}\phi_{1}(-h)g(\mathbf{x}_{n}, \lambda_{n}), \tag{16}\]
+
+which is known as exponential Euler (Hochbruck and Ostermann, 2010) or DDIM for diffusion model (Song et al., 2021a). Although our order analysis aligns with existing work (Lu et al., 2022; Zhang and Chen, 2022), the distinction emerges in high-order methods.
+
+**Theorem 2** (Error bound for solvers that satisfy the 1st- and 2nd-order conditions (Hochbruck and Ostermann, 2005a, Thm 4.7)).: _When \(\psi_{1}(-h_{i})=\psi_{2}(-h_{i})=\psi_{1,2}(-h_{i})=0\) is satisfied for \(1\leq i\leq n\), the error bound of second order solver based on Eq (11)_
+
+\[\|\mathbf{x}_{n}-\mathbf{x}(\lambda_{n})\|\leq Ch^{2}(\sup_{\lambda_{\text{max}}\leq \lambda\leq\lambda_{\text{max}}}\|f^{\prime}(\lambda)\|+\sup_{\lambda_{\text{ min}}\leq\lambda\leq\lambda_{\text{max}}}\|f^{\prime\prime}(\lambda)\|) \tag{17}\]
+
+_holds for \(h=\max_{1\leq i\leq n}h_{i}\). The constant \(C\) is independent of \(n,h\)._
+
+To satisfy order conditions in Thm 2, the optimal Butcher tableau can be parameterized by \(c_{2}\) as shown in Tab 3. It turns out the single-step scheme proposed in DPM-Solver++ (Lu et al., 2022b) can also be reformulated with a different Butcher tableau as shown in Tab 3 (See App B). Those two Butcher tableau was actually first proposed by Weiner (1992) for adaptive RK methods. Nevertheless, compared with Thm 2, DPM-Solver++ breaks the order condition \(\psi_{2}(-h)=0\) and introduces additional errors in solving ODEs (See App B) compared with Thm 2 theoretically. Practically, Hochbruck and Ostermann (2005a) demonstrated that numerical schemes satisfying order conditions yield enhanced performance in their low-dimensional synthetic problems. As evidenced in Sec 4, we verify our numerical scheme, which adheres to these order conditions, exhibits reduced numerical defects and consequently produces samples of higher quality from diffusion models.
+
+**Proposition 1** (Informal).: _Employing the Butcher tableau outlined in Tab 3, the single-step method Eq (11), characterized by three stages, functions as a third-order solver._```
+1:procedureSingleUpdateStep(\(\mathbf{x}_{i},\sigma_{i},\sigma_{i+1}\))
+2:\(\lambda_{i+1},\lambda_{i}\leftarrow-\log(\sigma_{i+1}),-\log(\sigma_{i})\)
+3:\(h\leftarrow\lambda_{i+1}-\lambda_{i}\)\(\triangleright\) Step length
+4:\(a_{21},b_{1},b_{2}\leftarrow\texttt{Tab 3 with }c_{2}\)\(\triangleright\) Runge Kutta coeffcients
+5:\((\mathbf{x}_{i,2},\lambda_{i,2})\leftarrow(e^{-c_{2}b_{2}}\mathbf{x}_{i}+a_{2i}hD_{ \theta}(\mathbf{x}_{i},\lambda_{i}),\,\lambda_{i}+c_{2}h)\)\(\triangleright\) Additional evaluation point
+6:\(\mathbf{x}_{i+1}\gets e^{-h}\mathbf{x}_{i}+h(b_{1}D_{\theta}(\mathbf{x}_{i},\lambda_{i} )+b_{2}D_{\theta}(\mathbf{x}_{i,2},\lambda_{i,2}))\)
+7:return\(\mathbf{x}_{i+1}\)
+```
+
+**Algorithm 1** RES Second order Single Update Step with \(c_{2}\)
+
+### Single-step update for deterministic and stochastic sampler
+
+With the single-step update scheme developed in Sec 3.3, we are prepared to develop a deterministic sampling algorithm by iteratively applying Eq (11) with the corresponding Butcher tableau. Inspired by the stochastic samplers proposed in Karras et al. (2022), which alternately execute a denoising backward step and a diffusion forward step, we can replace the original Heun-based single-step update with our improved single-step method. Concretely, one update step of our stochastic sampler consists of two substeps. The first substep simulates a forward noising scheme with a relatively small step size, while the subsequent substep executes a single-step ODE update with a larger step. We unify both samplers in Alg 2 where the hyperparameter \(\eta\) determines the degree of stochasticity.
+
+### Multi-step scheme
+
+Instead of constructing a single-step multi-stage numerical scheme to approximate the intractable integration in Eq (10), we can employ a multi-step scheme that capitalizes on the function evaluations from previous steps. Analogous to the analysis in Sec 3.2 and conclusions in Thm 2, we can extend these results to a multi-step scheme, the details of which are provided in App E. Intuitively, multi-step approaches implement an update similar to Eq (11a). Instead of selecting intermediate states and incurring additional function evaluations, a multi-step method reuses function evaluation output from previous steps. In this work, our primary focus is on the multi-step predictor case. However, our framework and analysis can also be applied to derive multi-step corrector, which has been empirically proven to further improve sampling quality (Zhao et al., 2023; Li et al., 2023).
+
+## 4 Experiments
+
+We further extend our experiments to address the following queries: (1) Do the deterministic numerical schemes of RES outperform existing methods in terms of reduced numerical defects and enhanced robustness? (2) Does a reduction in numerical defects translate to improved sampling quality? (3) Can our single-step numerical scheme enhance the performance of existing samplers?
+
+Numerical defects for deterministic samplerFirst, we investigate the evolution of numerical defects \(\|\mathbf{x}_{N}-\mathbf{x}(0)\|\) in \(L1\) norm as the number of function evaluations (NFE) increases in pre-trained ImageNet diffusion models with default hyperparameters. Since the exact solution \(\mathbf{x}(0)\) is unavailable, we approximate it using a 500-step RK4 solution, which exhibits negligible changes with additional steps. For a fair comparison, we evaluate the **second-order RES** against single-stepDPM-Solver++(S)(Lu et al., 2022b) and Heun (Karras et al., 2022), both claimed to be second-order solvers. We also include first order DDIM (Song et al., 2021a) as a baseline. Our findings indicate that single-step RES exhibits significantly smaller numerical defects, consistent with our theoretical analysis. RES based on the noise prediction model (negative logSNR) surpasses the data prediction model (logSNR) in performance for guidance-free diffusion models; we provide a detailed presentation of the former here (More details in App F). Additionally, we compare single-step solvers
+
+Figure 3: Comparison among various deterministic samplers on pretrained ImageNet diffusion model (Karras et al., 2022). (S) indicates single-step methods while (M) for multistep methods. (Left) Numerical defects and FID of various sampling algorithms _vs_ the number of function evaluation (NFE) with recommended time scheduling (Karras et al., 2022). (Right) Numerical defects and FID _vs_ NFEs with suboptimal time schedule. RES (S) shows better robustness against suboptimal-scheduling. Remarkably, with only 59 NFE, the single-step RES attains a numerical accuracy on par with the 99 NFE DPM-Solver++ (S).
+
+Figure 2: Importance of Order-Satisfied RK Tableau. RES showcases faster convergence with the same recommended time scheduling on (DeepFloyd, 2023) and better robustness against suboptimal scheduling compared with existing works. _Prompt: ultra close-up color photo portrait of rainbow owl with deer horns in the woods_.
+
+with multistep solvers, specifically including second-order multistep RES and DPM-Solver++ (M). We observe RES-AB consistently outperforms DPM-Solver++ (M) and both lead to smaller defects compared with single-step methods.
+
+Numerical defects and FIDWe further investigate the relationship between numerical defects and image sampling quality, using the Frechet Inception Distance (FID) (Heusel et al., 2017). As shown in Fig 3, smaller numerical defects generally lead to better FID scores as the number of function evaluations (NFE) increases for all algorithms. However, we also observe that the correlation may not be strictly positive and similar defects may lead to different FIDs. We observed a Pearson correlation coefficient of \(0.956\) between these two metrics, which suggests that better FID scores are _strongly correlated_ with smaller numerical defects. Notably, when \(\text{NFE}=9\), compared with single-step DPM-Solver++, the single step RES with noise prediction model (negative logSNR) reduce \(52.75\%\) numerical defects, and \(48.3\%\) improvement in FID (16.77 vs 8.66). For RES with data prediction model (logSNR), RES achieves \(25.2\%\) numerical defects and \(25.4\%\) FID improvement (16.77 vs 12.51).
+
+Time-scheduling robustnessWe also evaluate the performance of these solvers concerning varying timestep schedules. We observe that existing methods lack systematic strategies for optimal timestep selection, often relying on heuristic choices or extensive hyperparameter tuning. An ideal algorithm should demonstrate insensitivity to various scheduling approaches. Instead of using the recommended setting in EDM (Karras et al., 2022), we test these algorithms under a suboptimal choice with uniform step in \(\sigma\). While all algorithms exhibit decreased performance under this setting, the single-step RES method outperforms the rest. Notably, single-step methods surpass multi-step methods in this scenario, which signifies the robustness of single-step RES and underscores the benefits of our principled single-step numerical scheme. Besides, to achieve a numerical accuracy comparable to that of the 99 NFE DPM-Solver++ (S), our single-step method requires only 59 NFE.
+
+Stochastic sampling with improved single-step algorithmEncouraged by the improvement of single-step sampling, we conduct experiments to show that this enhancement can boost stochastic samplers and achieve a favorable trade-off between sampling quality and speed. First, we investigate how FID is affected by NFE for a given \(\eta\). Next, we sweep different values of \(\eta\) under the same NFE. As illustrated in Fig 3(a), we can accelerate the stochastic sampler compared with Heun-based EDM sampler (Karras et al., 2022).
+
+Cascaded text-to-image modelFinally, we test algorithms on cascaded text-to-image models with DeepFloyd IF (DeepFloyd, 2023). We initially evaluate various sampling algorithms for \(64\times 64\) tasks
+
+\begin{table}
+\begin{tabular}{l|c c c c c c c c c c c} \hline \hline NFE & 6 & 8 & 10 & 15 & 20 & 25 & 30 & 35 & 50 & 75 & 100 \\ \hline DPM-Solver++ (M) & 14.87 & 8.02 & 5.46 & 3.52 & 2.98 & 2.73 & 2.60 & 2.52 & 2.42 & 2.40 & 2.38 \\ Our (M) & **14.32** & **7.44** & **5.11** & **3.23** & **2.54** & **2.41** & **2.38** & **2.35** & **2.34** & **2.33** & **2.33** \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: FID for DPM-Solver++ and RES multistep across various NFEs on ImageNet Karras et al. (2022).
+
+Figure 4: Fig 3(a) RES can also boost stochastic sampling by simply switching single-step update scheme from Heun (Karras et al., 2022) to ours under various NFEs and stochasticity. Fig 3(b) Our approach achieves superior performance in large-scale text-to-image diffusion models, excelling in both purely text-conditioned scenarios and super-resolution tasks conditioned on low-resolution images.
+
+in Fig 3(b). Furthermore, we compare the FID-CLIP score trade-off curves for various classifier-free guidance schemes under the same computational budget. Next, we incorporate a super-resolution diffusion model conditioned on generated images from the low-resolution model. In both scenarios, we find that our model consistently outperforms DPM-Solver++ in terms of quality.
+
+## 5 Conclusion
+
+In this work, we present the Refined Exponential Solver (RES), derived from a meticulous analysis of numerical defects in diffusion model probability flow ODEs and fulfilling all order conditions. RES enjoys superior error bounds theoretically and enhanced sampling efficiency in practice. Originally designed to boost single-step updates, we have also extended the improvements to multistep schemes and stochastic samplers, effectively enhancing their performance. We include more discussions and limitations in App D.
+
+## References
+
+* Balaji et al. (2022) Yogesh Balaji, Seungjun Nah, Xun Huang, Arash Vahdat, Jiaming Song, Karsten Kreis, Miika Aittala, Timo Aila, Samuli Laine, Bryan Catanzaro, et al. ediffi: Text-to-image diffusion models with an ensemble of expert denoisers. _arXiv preprint arXiv:2211.01324_, 2022.
+* Bao et al. (2022) Fan Bao, Chongxuan Li, Jun Zhu, and Bo Zhang. Analytic-DPM: An Analytic Estimate of the Optimal Reverse Variance in Diffusion Probabilistic Models. 2022. URL [http://arxiv.org/abs/2201.06503](http://arxiv.org/abs/2201.06503).
+* Bautista et al. (2022) Miguel Angel Bautista, Pengsheng Guo, Samira Abnar, Walter Talbott, Alexander Toshev, Zhuoyuan Chen, Laurent Dinh, Shuangfei Zhai, Hanlin Goh, Daniel Ulbricht, et al. Gaudl: A neural architect for immersive 3d scene generation. _arXiv preprint arXiv:2207.13751_, 2022.
+* Bilos et al. (2022) Marin Bilos, Kashif Rasul, Anderson Schneider, Yuriy Nevmyvaka, and Stephan Gunnemann. Modeling temporal data as continuous functions with process diffusion. _arXiv preprint arXiv:2211.02590_, 2022.
+* Chen et al. (2021) Tianrong Chen, Guan-Horng Liu, and Evangelos A Theodorou. Likelihood training of schrodinger bridge using Forward-Backward SDEs theory. _arXiv preprint arXiv:2110.11291_, October 2021a.
+* Chen et al. (2021b) Yongxin Chen, Tryphon T Georgiou, and Michele Pavon. Stochastic control liaisons: Richard sinkhorn meets gaspard monge on a schrodinger bridge. _SIAM Review_, 63(2):249-313, 2021b.
+* De Bortoli et al. (2021) Valentin De Bortoli, James Thornton, Jeremy Heng, and Arnaud Doucet. Diffusion schrodinger bridge with applications to Score-Based generative modeling. _arXiv preprint arXiv:2106.01357_, June 2021.
+* Defloyd (2023) DeepFloyd. If. [https://github.com/deep-floyd/IF](https://github.com/deep-floyd/IF), 2023.
+* Dhariwal and Nichol (2021) Prafulla Dhariwal and Alex Nichol. Diffusion models beat GANs on image synthesis. _arXiv preprint arXiv:2105.05233_, May 2021.
+* Dockhorn et al. (2021) Tim Dockhorn, Arash Vahdat, and Karsten Kreis. Score-Based generative modeling with Critically-Damped langevin diffusion. _arXiv preprint arXiv:2112.07068_, December 2021.
+* Efron (2011) Bradley Efron. Tweedie's formula and selection bias. _Journal of the American Statistical Association_, 106(496):1602-1614, 2011.
+* Heusel et al. (2017) Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, and Sepp Hochreiter. GANs trained by a two Time-Scale update rule converge to a local nash equilibrium. _arXiv preprint arXiv:1706.08500_, June 2017.
+* Ho and Salimans (2022) Jonathan Ho and Tim Salimans. Classifier-free diffusion guidance. _arXiv preprint arXiv:2207.12598_, 2022.
+* Ho et al. (2020) Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. _arXiv preprint arXiv:2006.11239_, June 2020.
+* Hochbruck and Ostermann (2005a) Marlis Hochbruck and Alexander Ostermann. Explicit exponential runge-kutta methods for semilinear parabolic problems. _SIAM Journal on Numerical Analysis_, 43(3):1069-1090, 2005a.
+* Hochbruck and Ostermann (2005b) Marlis Hochbruck and Alexander Ostermann. Exponential runge-kutta methods for parabolic problems. _Applied Numerical Mathematics_, 53(2-4):323-339, 2005b.
+* Hochbruck and Ostermann (2010) Marlis Hochbruck and Alexander Ostermann. Exponential integrators. _Acta Numerica_, 19:209-286, 2010.
+* Hoogeboom and Salimans (2022) Emiel Hoogeboom and Tim Salimans. Blurring diffusion models. _arXiv preprint arXiv:2209.05557_, 2022.
+* Huang et al. (2021) Chin-Wei Huang, Jae Hyun Lim, and Aaron C Courville. A variational perspective on diffusion-based generative models and score matching. _Advances in Neural Information Processing Systems_, 34:22863-22876, 2021.
+
+* Ilharco et al. (2021) Gabriel Ilharco, Mitchell Wortsman, Ross Wightman, Cade Gordon, Nicholas Carlini, Rohan Taori, Achal Dave, Vaishaal Shankar, Hongseok Namkoong, John Miller, Hannaneh Hajishirzi, Ali Farhadi, and Ludwig Schmidt. Openclip, July 2021. URL [https://doi.org/10.5281/zenodo.5143773](https://doi.org/10.5281/zenodo.5143773). If you use this software, please cite it as below.
+* Karras et al. (2022) Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-based generative models. _arXiv preprint arXiv:2206.00364_, 2022.
+* Kingma et al. (2021) Diederik Kingma, Tim Salimans, Ben Poole, and Jonathan Ho. Variational diffusion models. _Advances in neural information processing systems_, 34:21696-21707, 2021.
+* Kong & Ping (2021) Zhifeng Kong and Wei Ping. On fast sampling of diffusion probabilistic models. _arXiv preprint arXiv:2106.00132_, 2021.
+* Kong et al. (2020) Zhifeng Kong, Wei Ping, Jiaji Huang, Kexin Zhao, and Bryan Catanzaro. Diffwave: A versatile diffusion model for audio synthesis. _arXiv preprint arXiv:2009.09761_, 2020.
+* Li et al. (2023) Shengmeng Li, Luping Liu, Zenghao Chai, Runnan Li, and Xu Tan. Era-solver: Error-robust adams solver for fast sampling of diffusion probabilistic models. _arXiv preprint arXiv:2301.12935_, 2023.
+* Lin et al. (2022) Chen-Hsuan Lin, Jun Gao, Luming Tang, Towaki Takikawa, Xiaohui Zeng, Xun Huang, Karsten Kreis, Sanja Fidler, Ming-Yu Liu, and Tsung-Yi Lin. Magic3d: High-resolution text-to-3d content creation. _arXiv preprint arXiv:2211.10440_, 2022.
+* Lin et al. (2014) Tsung-Yi Lin, Michael Maire, Serge Belongie, James Hays, Pietro Perona, Deva Ramanan, Piotr Dollar, and C Lawrence Zitnick. Microsoft coco: Common objects in context. In _Computer Vision-ECCV 2014: 13th European Conference, Zurich, Switzerland, September 6-12, 2014, Proceedings, Part V 13_, pp. 740-755. Springer, 2014.
+* Lipman et al. (2022) Yaron Lipman, Ricky TQ Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le. Flow matching for generative modeling. _arXiv preprint arXiv:2210.02747_, 2022.
+* Liu et al. (2022) Luping Liu, Yi Ren, Zhijie Lin, and Zhou Zhao. Pseudo numerical methods for diffusion models on manifolds. _arXiv preprint arXiv:2202.09778_, 2022.
+* Liu et al. (2023) Xingchao Liu, Xiwen Zhang, Jianzhu Ma, Jian Peng, and Qiang Liu. Instaflow: One step is enough for high-quality diffusion-based text-to-image generation. _arXiv preprint arXiv:2309.06380_, 2023.
+* Lu et al. (2022) Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver: A fast ode solver for diffusion probabilistic model sampling in around 10 steps. _arXiv preprint arXiv:2206.00927_, 2022a.
+* Lu et al. (2022b) Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver++: Fast solver for guided sampling of diffusion probabilistic models. _arXiv preprint arXiv:2211.01095_, 2022b.
+* Luhman & Luhman (2021) Eric Luhman and Troy Luhman. Knowledge distillation in iterative generative models for improved sampling speed. _arXiv preprint arXiv:2101.02388_, 2021.
+* Meng et al. (2022) Chenlin Meng, Ruiqi Gao, Diederik P Kingma, Stefano Ermon, Jonathan Ho, and Tim Salimans. On distillation of guided diffusion models. _arXiv preprint arXiv:2210.03142_, 2022.
+* Poole et al. (2022) Ben Poole, Ajay Jain, Jonathan T Barron, and Ben Mildenhall. Dreamfusion: Text-to-3d using 2d diffusion. _arXiv preprint arXiv:2209.14988_, 2022.
+* Press et al. (2007) William H Press, Saul A Teukolsky, William T Vetterling, and Brian P Flannery. _Numerical recipes 3rd edition: The art of scientific computing_. Cambridge university press, 2007.
+* Qiao et al. (2022) Zhuoran Qiao, Weili Nie, Arash Vahdat, Thomas F Miller III, and Anima Anandkumar. Dynamic-backbone protein-ligand structure prediction with multiscale generative diffusion models. _arXiv preprint arXiv:2209.15171_, 2022.
+* Rissanen et al. (2022) Severi Rissanen, Markus Heinonen, and Arno Solin. Generative modelling with inverse heat dissipation. _arXiv preprint arXiv:2206.13397_, 2022.
+
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bjorn Ommer. High-resolution image synthesis with latent diffusion models. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 10684-10695, 2022.
+* Russakovsky et al. (2015) Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng Huang, Andrej Karpathy, Aditya Khosla, Michael Bernstein, Alexander C Berg, and Li Fei-Fei. ImageNet large scale visual recognition challenge. _International journal of computer vision_, 115(3):211-252, December 2015. ISSN 0920-5691, 1573-1405. doi: 10.1007/s11263-015-0816-y.
+* Saharia et al. (2022) Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily Denton, Seyed Kamyar Seyed Ghasemipour, Burcu Karagol Ayan, S Sara Mahdavi, Rapha Gontijo Lopes, et al. Photorealistic text-to-image diffusion models with deep language understanding. _arXiv preprint arXiv:2205.11487_, 2022.
+* Salimans & Ho (2022) Tim Salimans and Jonathan Ho. Progressive distillation for fast sampling of diffusion models. _arXiv preprint arXiv:2202.00512_, February 2022.
+* Seitzer (2020) Maximilian Seitzer. pytorch-fid: FID Score for PyTorch. [https://github.com/mseitzer/pytorch-fid](https://github.com/mseitzer/pytorch-fid), August 2020. Version 0.3.0.
+* Shue et al. (2022) J Ryan Shue, Eric Ryan Chan, Ryan Po, Zachary Ankner, Jiajun Wu, and Gordon Wetzstein. 3d neural field generation using triplane diffusion. _arXiv preprint arXiv:2211.16677_, 2022.
+* Song et al. (2021a) Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. In _International Conference on Learning Representations_, 2021a.
+* Song & Ermon (2020) Yang Song and Stefano Ermon. Improved techniques for training Score-Based generative models. _arXiv preprint arXiv:2006.09011_, June 2020.
+* Song et al. (2021b) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. In _International Conference on Learning Representations_, 2021b.
+* Song et al. (2023) Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever. Consistency models. _arXiv preprint arXiv:2303.01469_, 2023.
+* Tashiro et al. (2021) Yusuke Tashiro, Jiaming Song, Yang Song, and Stefano Ermon. Csdi: Conditional score-based diffusion models for probabilistic time series imputation. _Advances in Neural Information Processing Systems_, 34:24804-24816, 2021.
+* Vahdat et al. (2021) Arash Vahdat, Karsten Kreis, and Jan Kautz. Score-based generative modeling in latent space. _arXiv preprint arXiv:2106.05931_, June 2021.
+* Vargas et al. (2021) Francisco Vargas, Pierre Thodoroff, Austen Lamacraft, and Neil Lawrence. Solving Schrodinger bridges via maximum likelihood. _Entropy_, 23(9):1134, 2021.
+* Vincent (2011) Pascal Vincent. A connection between score matching and denoising autoencoders. _Neural computation_, 23(7):1661-1674, July 2011.
+* Wang et al. (2021) Gefei Wang, Yuling Jiao, Qian Xu, Yang Wang, and Can Yang. Deep generative learning via schrodinger bridge. In _International Conference on Machine Learning_, pp. 10794-10804. PMLR, 2021.
+* Wang et al. (2022) Zhendong Wang, Huangjie Zheng, Pengcheng He, Weizhu Chen, and Mingyuan Zhou. Diffusion-gan: Training gans with diffusion. _arXiv preprint arXiv:2206.02262_, 2022.
+* Watson et al. (2021) Daniel Watson, Jonathan Ho, Mohammad Norouzi, and William Chan. Learning to efficiently sample from diffusion probabilistic models. _arXiv preprint arXiv:2106.03802_, June 2021.
+* Weiner (1992) Rudiger Weiner. _Linear-implizite Runge-Kutta-Methoden und ihre Anwendung_, volume 127. Springer-Verlag, 1992.
+* Wu et al. (2022) Kevin E Wu, Kevin K Yang, Rianne van den Berg, James Y Zou, Alex X Lu, and Ava P Amini. Protein structure generation via folding diffusion. _arXiv preprint arXiv:2209.15611_, 2022.
+
+* Xiao et al. (2022) Zhisheng Xiao, Karsten Kreis, and Arash Vahdat. Tackling the generative learning trilemma with denoising diffusion GANs. In _International Conference on Learning Representations (ICLR)_, 2022.
+* Xu et al. (2022) Minkai Xu, Lantao Yu, Yang Song, Chence Shi, Stefano Ermon, and Jian Tang. Geodiff: A geometric diffusion model for molecular conformation generation. _arXiv preprint arXiv:2203.02923_, 2022.
+* Zhang & Chen (2021) Qinsheng Zhang and Yongxin Chen. Diffusion normalizing flow. _arXiv preprint arXiv:2110.07579_, October 2021.
+* Zhang & Chen (2022) Qinsheng Zhang and Yongxin Chen. Fast sampling of diffusion models with exponential integrator. _arXiv preprint arXiv:2204.13902_, April 2022.
+* Zhang et al. (2022) Qinsheng Zhang, Molei Tao, and Yongxin Chen. gddim: Generalized denoising diffusion implicit models. _arXiv preprint arXiv:2206.05564_, June 2022.
+* Zhao et al. (2023) Wenliang Zhao, Lujia Bai, Yongming Rao, Jie Zhou, and Jiwen Lu. Unipc: A unified predictor-corrector framework for fast sampling of diffusion models. _arXiv preprint arXiv:2302.04867_, 2023.
+
+Related works and discussion
+
+To unlock and democratize the extraordinary generative potential of diffusion models, considerable research efforts have been dedicated to enhancing their efficiency and speeding up sampling. In addition to the works discussed in Sec 1, other methods have been explored to enhance the speed of diffusion models.
+
+The authors of (Bao et al., 2022) optimize the backward Markovian process to approximate the non-Markovian forward process, yielding an analytic expression of optimal variance in the denoising process. Another strategy involves making the forward diffusion nonlinear and trainable (Zhang and Chen, 2021; Vargas et al., 2021; De Bortoli et al., 2021; Wang et al., 2021; Chen et al., 2021a), in the spirit of the Schrodinger bridge (Chen et al., 2021b). However, this approach incurs a considerable training overhead. Researchers have also explored modifying the backward stochastic process by incorporating more function evaluations and optimizing time scheduling (Kong and Ping, 2021; Watson et al., 2021). Nevertheless, such acceleration strategies struggle to generate high-quality samples with a limited number of discretization steps. An alternate approach for improving diffusion models involves designing non-isotropic diffusion models, such as Blurring diffusion models (Hoogeboom and Salimans, 2022; Rissanen et al., 2022) and the critically-damped Langevin diffusion models (Dockhorn et al., 2021). There are other fast sampling methods by construction diffusion models in latent space (Rombach et al., 2022; Vahdat et al., 2021). In addition, several works show GANs can be leveraged to accelerate diffusion models (Xiao et al., 2022; Wang et al., 2022).
+
+More related are the diffusion model sampling algorithms inspired by semilinear ODEs solvers (Zhang and Chen, 2022; Lu et al., 2022a). Zhang and Chen (2022) introduced Diffusion Exponential Integrator Sampler (DEIS), whose fastest variant is based on an approximate exact solution, achieved by replacing the nonlinear function with polynomial exploration. However, DEIS was originally designed for fitting polynomials in the original \(t\) space and is affected by noising scheduling \(\sigma(t)\). On the other hand, Lu et al. (2022a) proposed DPM-Solver, which leverages a similar analysis of the exponential integrator to solve a semilinear ODE with time-varying coefficients. They further advanced DPM-Solver++ for the data prediction model and a sampling algorithm based on a multistep scheme, claiming improved sampling speed (Lu et al., 2022b). However, as we highlight in Sec 3.3, their numerical scheme does not meet all the necessary order conditions. The omission of these conditions could potentially worsen performance, especially with non-isotropic ODEs (Hochbruck and Ostermann, 2010).
+
+## Appendix B Proof
+
+In this section, we provide detailed derivations and proofs for the key theoretical results presented in the paper. Given that we have two semi-linear ODEs Eq (7) and (8) sharing similar structures, we primarily concentrate on the data prediction model, with the understanding that the results can be easily extended to the ODE based on the noise prediction model. Recall that we denote the denoiser network as \(g\), and its evaluation along the exact solution \(\mathbf{x}(\lambda)\) as \(f(\lambda):=g(\mathbf{x}(\lambda),\lambda)\). Our analytical framework is heavily influenced by the foundational works of Hochbruck and Ostermann (2005a; 2010). We present self-contained and thorough derivations for the semi-linear ODE Eq (7), meticulously tailored for drawing samples from diffusion models.
+
+### Proof of Lemma 1
+
+We first expand \(f\) into a Taylor series with the remainder in integral form,
+
+\[f(\lambda_{n}+\tau)=\sum_{j=1}^{q}\frac{\tau^{j-1}}{(j-1)!}f^{(j-1)}(\lambda_{ n})+\int_{0}^{\tau}\frac{(\tau-\nu)^{q-1}}{(q-1)!}f^{(q)}(\lambda_{n}+\nu) \mathrm{d}\nu \tag{18}\]
+
+With Eq (18), we can rewrite exact ODE solution Eq (10) as
+
+\[\mathbf{x}(\lambda_{n}+c_{i}h) =e^{-c_{i}h}\mathbf{x}(\lambda_{n})+\sum_{j=1}^{q_{i}}(c_{i}h)^{j} \phi_{j}(-c_{i}h)f^{(j-1)}(\lambda_{n}) \tag{19}\] \[+\int_{0}^{c_{i}h}e^{-(c_{i}h-\tau)}\int_{0}^{\tau}\frac{(\tau- \nu)^{q_{i}-1}}{(q_{i}-1)!}f^{(q_{i})}(\lambda_{n}+\nu)\mathrm{d}\nu\mathrm{d}\tau,\]where function \(\phi_{j}\) is defined as
+
+\[\phi_{j}(-h)=\frac{1}{h^{j}}\int_{0}^{h}e^{\tau-h}\frac{\tau^{j-1}}{(j-1)!}\mathrm{ d}\tau,\quad j\geq 1. \tag{20}\]
+
+With integration by part, we arrive at the recursion formulation for \(\phi\) function (Hochbruck & Ostermann, 2005a) as
+
+\[\phi_{k+1}(z)=\begin{cases}\frac{\phi_{k}(z)-1/k!}{z}&k\geq 0,z\neq 0\\ e^{z}&k=0\\ \frac{1}{k!},&z=0,k\leq 0\end{cases}. \tag{21}\]
+
+One the other hand, by integrating Eq (18) into the numerical scheme Eq (11), we can derive another expression for the exact solution. We begin with the exact solution at the intermediate time \(\lambda_{n}+c_{i}h\). Plugging in Eq (18) into Eq (12a), we obtain
+
+\[\mathbf{x}(\lambda_{n}+c_{i}h) =e^{-c_{i}h}\mathbf{x}(\lambda_{n})+h\sum_{k=1}^{i-1}a_{ik}(-h)\sum_{ j=1}^{q_{i}}(\frac{c_{k}h)^{j-1}}{(j-1)!}f^{(j-1)}(\lambda_{n}) \tag{22}\] \[+h\sum_{k=1}^{i-1}a_{ik}(-h)\int_{0}^{c_{k}h}\frac{(c_{k}h-\nu)^{ q_{i}-1}}{(q_{i}-1)!}f^{(q_{i})}(\lambda_{n}+\nu)\mathrm{d}\nu\mathrm{d}\tau+ \delta_{n,i}.\]
+
+By comparing Eq (19) and Eq (22), we obtain the error term \(\Delta_{ni}\) as
+
+\[\delta_{n,i} =\sum_{j=1}^{q_{i}}h^{j}\psi_{j,i}(-h)f^{(j-1)}(\lambda_{n})+ \delta_{n,i}^{(q_{i})} \tag{23}\] \[\psi_{j,i}(-h) =\phi_{j}(-c_{i}h)c_{i}^{j}-\sum_{k=1}^{i-1}a_{ik}(-h)\frac{c_{k} ^{j-1}}{(j-1)!}, \tag{24}\]
+
+where \(\delta_{n,i}^{(q_{i})}\) denotes higher order terms that resulted from the truncation of the Taylor series.
+
+Similarly, we can get the expression for \(\delta_{n+1}\) if we plug Eq (18) into Eq (12b) and comparing the result against Eq (19)
+
+\[\delta_{n+1} =\sum_{j=1}^{q}h^{j}\psi_{j}(-h)f^{(j-1)}(\lambda_{n})+\delta_{n+ 1}^{(q)} \tag{25}\] \[\psi_{j}(-h) =\phi_{j}(-h)-\sum_{k=1}^{s}b_{k}(-h)\frac{c_{k}^{j-1}}{(j-1)!} \tag{26}\]
+
+where \(\delta_{n+1}^{(q)}\) denotes higher order terms that resulted from the truncation of the Taylor series.
+
+## Appendix C Proof of error bound
+
+We first state several mild assumptions that are required for our theoretical bounds.
+
+**Assumption 1**.: _For nonlinear function \(g:\mathbf{R}^{d}\times\mathbf{R}\to\mathbf{R}^{d}\) considered in this work, e.g. \(\epsilon_{\theta}\), \(\mathbf{D}_{\theta}\), we assume there exists a real number \(L(R)\) such that_
+
+\[\|\mathbf{g}(\mathbf{x}_{1},\lambda)-g(\mathbf{x}_{2},\lambda)\|\leq L\left\|\mathbf{x}_{1}- \mathbf{x}_{2}\right\|. \tag{27}\]
+
+_for all \(\lambda_{\min}\leq\lambda\leq\lambda_{max}\) and \(\max(\|\mathbf{x}_{1}-\mathbf{x}(\lambda)\|,\|\mathbf{x}_{2}-\mathbf{x}(\lambda)\|)\leq R\) where \(\mathbf{x}(\lambda)\) is one ODE solution with nonlinear function \(g\)._
+
+The region where \(\mathbf{x}_{1},\mathbf{x}_{2}\) exists and is close to the exact solution is referred to as the strip along the exact ODE solution. For high-order methods, we introduce another assumption regarding the nonlinear function \(g\):
+
+**Assumption 2**.: _For ODE with nonlinear function \(g:\mathbf{R}^{d}\times\mathbf{R}\to\mathbf{R}^{d}\) considered in this work, e.g. \(\epsilon_{\theta}\), \(\mathbf{D}_{\theta}\), \(g\) is differentiable in a strip along the ODE exact solution \(\mathbf{x}(\lambda)\). All occurring derivatives are uniformly bounded._By default, we assume that Thm 1 and 2 and Prop 1 satisfy above assumptions. First, we consider a scenario with a uniform step size, denoted as \(h\). Subsequently, the obtained results are extended to accommodate non-uniform step sizes. This generalization involves loosening the error bounds' reliance on the step size from the uniform case, directing it instead towards the maximum step size evident in the non-uniform scenario. Indeed, the error boundaries delineated in Thm 1 and 2 manifest dependence on this longest step size.
+
+First, we bound the truncated high-order term \(\delta_{n,i}^{(q_{i})}\). Based on Eq (19) and (22), \(\delta_{n,i}^{(q_{i})}\) can be bounded by
+
+\[\|\delta_{n,i}^{(q_{i})}\|\leq \|\int_{0}^{c_{i}h}e^{-(c_{i}h-\tau)}\int_{0}^{\tau}\frac{(\tau- \nu)^{q_{i}-1}}{(q_{i}-1)!}f^{(q_{i})}(\lambda_{n}+\nu)\mathrm{d}\nu\mathrm{d} \tau\|\] \[+\|h\sum_{k=1}^{i-1}a_{ik}(-h)\int_{0}^{c_{k}h}\frac{(c_{k}h-\nu) ^{q_{i}-1}}{(q_{i}-1)!}f^{(q_{i})}(\lambda_{n}+\nu)\mathrm{d}\nu\|\] \[\leq\sup_{\lambda\in[\lambda_{n},\lambda_{n}+c_{i}h]}\|f^{(q_{i}) }\|\left(\|\int_{0}^{c_{i}h}e^{-(c_{i}h-\tau)}\int_{0}^{\tau}\frac{(\tau-\nu) ^{q_{i}-1}}{(q_{i}-1)!}\mathrm{d}\nu\mathrm{d}\tau\|\right.\] \[\left.+\|h\sum_{k=1}^{i-1}a_{ik}(-h)\int_{0}^{c_{k}h}\frac{(c_{k} h-\nu)^{q_{i}-1}}{(q_{i}-1)!}\mathrm{d}\nu\|\right)\] \[\leq\sup_{\lambda\in[\lambda_{n},\lambda_{n}+c_{i}h]}\|f^{(q_{i}) }\|C(c_{i}h)^{q_{i}+1}, \tag{28}\]
+
+where \(C\) is a sufficiently large constant. This is due to
+
+\[\|\int_{0}^{c_{i}h}e^{-(c_{i}h-\tau)}\int_{0}^{\tau}\frac{(\tau- \nu)^{q_{i}-1}}{(q_{i}-1)!}\mathrm{d}\nu\mathrm{d}\tau\|\leq\|\int_{0}^{c_{i}h }\mathrm{d}\tau\|\|\int_{0}^{c_{i}h}\frac{(c_{i}h-\nu)^{q_{i}-1}}{(q_{i}-1)!} \|=\frac{(c_{i}h)^{q_{i}+1}}{(q_{i})!}\] \[\|h\sum_{k=1}^{i-1}a_{ik}(-h)\int_{0}^{c_{k}h}\frac{(c_{k}h-\nu) ^{q_{i}-1}}{(q_{i}-1)!}\mathrm{d}\nu\|\leq\frac{\|\sum_{k=1}^{i-1}a_{ik}(-h)\| }{c_{i}}\frac{(c_{i}h)^{q_{i}+1}}{(q_{i})!}.\]
+
+We note above conclusion only holds when \(\psi_{j,i}(-h)=0\) is satisfied. Otherwise, defects of \(h^{j}f^{(j-1)}(\lambda_{n})\) will show up \(\|\delta_{n,i}^{(q)}\|\) once \(\psi_{j,i}(-h)\neq 0\).
+
+Similarly, we can bound the accumulation of \(\delta_{i}^{(q_{i})}\) with
+
+\[\|\sum_{j=0}^{n-1}e^{-jh}\delta_{n-j}^{(q_{i})}\|\leq Ch^{q_{i}} \sup_{\lambda\in[\lambda_{i},\lambda_{n}]}\|f^{(q_{i})}\| \tag{29}\]
+
+once \(\phi_{j}=0\) is satisfied. Indeed, the defect \(\delta_{n}^{(q)}\) can be formulated
+
+\[\|\delta_{n}^{(q_{i})}\| =\|\int_{0}^{h}e^{-(h-\tau)}\int_{0}^{\tau}\frac{(\tau-\nu)^{(q_{i }-1)}}{(q_{i}-1)!}f^{(q_{i})}(\lambda_{n-1}+\nu)\mathrm{d}\nu\mathrm{d}\tau\| \tag{30}\] \[\leq\|\int_{0}^{h}e^{-(h-\tau)}\mathrm{d}\tau\|\|\int_{0}^{h} \frac{(h-\nu)^{(q_{i}-1)}}{(q_{i}-1)!}\mathrm{d}\nu\|\sup_{\lambda\in[\lambda_ {n-1},\lambda_{n}]}\|f^{(q_{i})}\|\] (31) \[=(1-e^{-h})\frac{h^{q_{i}}}{q_{i}!}\sup_{\lambda\in[\lambda_{n-1},\lambda_{n}]}\|f^{(q_{i})}\| \tag{32}\]Therefore, we can bound
+
+\[\|\sum_{j=0}^{n-1}e^{-jh}\delta_{n-j}^{(q_{i})}\| \leq\sum_{j=0}^{n-1}\|e^{-jh}\delta_{n-j}^{(q_{i})}\|\] \[\leq\|\sum_{j=0}^{n-1}e^{-jh}\|(1-e^{-h})\frac{h^{q_{i}}}{q_{i}!} \sup_{\lambda\in[\lambda_{1},\lambda_{n}]}\|f^{(q_{i})}\|\] \[\leq\frac{1}{1-e^{-h}}(1-e^{-h})\frac{h^{q_{i}}}{q_{i}!}\sup_{ \lambda\in[\lambda_{1},\lambda_{n}]}\|f^{(q_{i})}\|\] \[=\frac{h^{q_{i}}}{q_{i}!}\sup_{\lambda\in[\lambda_{1},\lambda_{n} ]}\|f^{(q_{i})}\|\leq Ch^{q_{i}}\sup_{\lambda\in[\lambda_{1},\lambda_{n}]}\|f^ {(q_{i})}\|,\]
+
+with a sufficiently large \(C\).
+
+Second, we introduce Discrete Gronwall Inequality in Lemma 2, which we will use later.
+
+**Lemma 2** (Discrete Gronwall Inequality).: _Let \(\langle\alpha_{n}\rangle\) and \(\langle\beta_{n}\rangle\) be nonnegative sequences and \(c\) a nonnegative constant. If_
+
+\[\alpha_{n}\leq c+\sum_{0\leq k<n}\beta_{k}\alpha_{k},\]
+
+_then_
+
+\[\alpha_{n}\leq c\prod_{0\leq j<n}(1+\beta_{j})\leq c\exp\left(\sum_{0\leq j<n} \beta_{j}\right)\quad\text{for}\quad n\geq 0. \tag{33}\]
+
+### Order \(1\) error bound for Thm 1
+
+With Lemma 1, we can formulate the error recursion for the \(s=1\) case
+
+\[\Delta_{n+1}=e^{-h}\Delta_{n}+h\phi_{1}(-h)(g(\mathbf{x}_{n},t_{n})-f(t_{n}))- \delta_{n+1} \tag{34}\]
+
+with defects \(\delta_{n+1}=\delta_{n+1}^{(1)}\), the recursion gives
+
+\[\Delta_{n}=h\sum_{j=0}^{n-1}e^{(-n-j-1)h}\phi_{1}(-h)(g(\mathbf{x}_{j},t_{j})-f(t_ {j}))-\sum_{j=0}^{n-1}e^{-jh}\delta_{n-j}. \tag{35}\]
+
+Thanks to Assumption 1 and Eq (29), we can bound above \(\Delta_{n}\) by
+
+\[\|\Delta_{n}\|\leq\sum_{j=1}^{n-1}h\phi_{1}(-h)e^{-(n-j-1)h}L\|\Delta_{j}\|+Ch \sup_{\lambda\in[\lambda_{n},\lambda_{n}+c_{i}h]}\|f^{(1)}\| \tag{36}\]
+
+With Discrete Gronwall Inequality Lemma 2 and \(\Delta_{0}=0\), we can show that
+
+\[\|\Delta_{n}\|=\|\mathbf{x}_{n}-\mathbf{x}(\lambda_{n})\| \leq Ch\sup_{\lambda_{\text{min}}\leq\lambda\leq\lambda_{\text{max }}}\|f^{\prime}(\lambda)\|\exp\left(\prod_{j=1}^{n-1}hL\phi_{1}(-h)e^{-(n-j- 1)h}\right) \tag{37}\] \[\leq Ch\sup_{\lambda_{\text{min}}\leq\lambda\leq\lambda_{\text{max }}}\|f^{\prime}(\lambda)\|\exp(L^{n})\] (38) \[\leq C^{\prime}h\sup_{\lambda_{\text{min}}\leq\lambda\leq\lambda_ {\text{max}}}\|f^{\prime}(\lambda)\| \tag{39}\]
+
+with a large enough \(C^{\prime}\). This finishes the proof for Thm 1 if we upper bound Eq (39) by the largest step size in the non-uniform stepsize. Thanks to order condition \(\psi_{1}=0\) and \(c_{1}=0\), the Butcher tableau follows
+
+\[\begin{array}{c|c}0&\\ \hline&\phi_{1}(-h).\end{array} \tag{40}\]
+
+### High order error bounds
+
+We first start with the second order method. Since it is a second-stage algorithm, we have only one intermediate point \(\mathbf{x}_{n,1}\). Based on Eq (13) and (28) and Assumption 1, we can bound
+
+\[\|\Delta_{n,2}\| \leq C_{1}\,\|\Delta_{n}\|+\|\delta_{n,2}^{(1)}\| \tag{41}\] \[\leq C_{1}\,\|\Delta_{n}\|+C_{2}h^{2}\sup_{\lambda\in[\lambda_{n}, \lambda_{n}+c_{2}h]}\|f^{(1)}\|, \tag{42}\]
+
+where \(C_{1},C_{2}\) are two constants. And we know \(\Delta_{n,1}=\Delta_{n}\) for our explicit method due to \(c_{1}=0\).
+
+Similar to Eq (36), we can bound
+
+\[\|\Delta_{n}\| \leq h\sum_{j=0}^{n-1}e^{(-n-j-1)h}\phi_{1}(-h)C_{3}\max\left(\| \Delta_{j}\|\,,\|\Delta_{j,1}\|\right)+\sum_{j=0}^{n-1}e^{-jh}\delta_{n-j}\|\] \[\leq h\sum_{j=0}^{n-1}e^{(-n-j-1)h}\phi_{1}(-h)C_{4}\,\|\Delta_{j}\| +h\sum_{j=0}^{n-1}e^{(-n-j-1)h}\phi_{1}(-h)C_{2}h^{2}\sup_{\lambda\in[\lambda_ {min},\lambda_{max}]}\|f^{(1)}\|\] \[+C_{5}h^{2}\sup_{\lambda\in[\lambda_{min},\lambda_{max}]}\|f^{(2) }\|,\]
+
+where \(C_{4}=\max{(1,C_{1})}\), and the last inequality is due to Eq (29). We note that \(h\sum_{j=0}^{n-1}e^{(-n-j-1)h}\phi_{1}(-h)\leq 1\). We can further simplify the upper bound of \(\Delta_{n}\) by
+
+\[\|\Delta_{n}\| \leq h\sum_{j=0}^{n-1}e^{(-n-j-1)h}\phi_{1}(-h)C_{4}\,\|\Delta_{j}\|\] \[+\max{(C_{2},C_{5})h^{2}(\sup_{\lambda\in[\lambda_{min},\lambda_{ max}]}\|f^{(2)}\|+\sup_{\lambda\in[\lambda_{min},\lambda_{max}]}\|f^{(1)}\|)}.\]
+
+Due to Lemma 2, we can upper bound it by
+
+\[\|\Delta_{n}\| \leq \max{(C_{2},C_{5})h^{2}(\sup_{\lambda\in[\lambda_{min},\lambda_{ max}]}\|f^{(2)}\|+\sup_{\lambda\in[\lambda_{min},\lambda_{max}]}\|f^{(1)}\|)} \tag{43}\] \[\exp{(\sum_{j=1}^{n-1}C_{4}h\phi_{1}(-h)e^{-(n-j-1)h})}\] \[\leq C^{\prime}h^{2}(\sup_{\lambda\in[\lambda_{min},\lambda_{ max}]}\|f^{(2)}\|+\sup_{\lambda\in[\lambda_{min},\lambda_{max}]}\|f^{(1)}\|) \tag{44}\]
+
+for a large enough \(C^{\prime}\). This finishes the proof of Thm 2 if we upper bound Eq (39) by the largest step size in the non-uniform stepsize case.
+
+Thanks to condition \(\psi_{1}(-h)=\psi_{2}(-h)=\psi_{1,2}(-h)=0\), the Butcher tableaus has to satisfy
+
+\[b_{1}+b_{2} =\phi_{1}(-h)\] \[b_{2}c_{2} =\phi_{2}(-h)\] \[a_{21} =c_{2}\phi_{1}(-c_{2}h).\]
+
+Therefore, the only solution for Butcher tableau is
+
+\[\begin{array}{c|c}0&\\ c_{2}&c_{2}\phi_{1}(-c_{2}h)\\ \hline 0&\phi_{1}(-h)-\frac{1}{c_{2}}\phi_{2}(-h)&\frac{1}{c_{2}}\phi_{2}(-h )\\ \end{array}. \tag{45}\]
+
+For third-order methods, numerical methods with three-stage methods have to satisfy (Hochbruck & Ostermann, 2005a, Sec 5.2)
+
+\[\psi_{1}(-h) =0\] \[\psi_{2}(-h) =0\] \[\psi_{1,2}(-h) =0\] \[\psi_{1,3}(-h) =0\] \[\psi_{3}(-h) =0\] \[b_{2}\psi_{2,2}(-h)+b_{3}\psi_{2,3}(-h) =0\]One two-parameter solution family for Butcher tableau satisfies other conditions and achieves third-order error bounds follows
+
+\[\begin{array}{c|c}0&\\ c_{2}&c_{2}\phi_{1,2}\\ c_{3}&c_{3}\phi_{1,3}-a_{32}&\frac{c_{3}^{2}}{c_{3}}\phi_{2,3}\\ \hline&\phi_{1}-b_{2}-b_{3}&0&\frac{1}{c_{3}}\phi_{2,3}\end{array}, \tag{46}\]
+
+where \(\gamma\) can be obtained by solving \(2(\gamma c_{2}+c_{3})=3(\gamma c_{2}^{2}+c_{3}^{3})\) once \(c_{2},c_{3}\) are given.
+
+## Appendix D Discussions and Limitations
+
+Our work is also constrained by the following limitations. Our analysis reveals that the performance of different samplers is contingent on the trajectory of network evaluations along the exact solution, where a time-smooth trajectory facilitates the reduction of numerical error. However, existing works are still uncertain about which time transformation or time scheduling leads to the most favorable trajectory. The logarithmic transformation we've used was selected based on our empirical observations. In practical terms, training-free methods still require more than 10 network evaluations, making them significantly slower than GANs or distillation-based methods. We leave it for future work to explore how distillation training can benefit from these improved training-free methods.
+
+## Appendix E Algorithms
+
+For deterministic single-step and stochastic samplers, we have listed the unified algorithm in Alg 2. We have also listed the algorithm for single-step second order update in Alg 1. Furthermore, we list general high order algorithm in Alg 3.
+
+```
+1:procedureSingleUpdateStep(\(\mathbf{x}_{n},\sigma_{n},\sigma_{n+1}\))
+2:\(\lambda_{n+1},\lambda_{n}\leftarrow-\log(\sigma_{n+1}),-\log(\sigma_{n})\)
+3:\(h\leftarrow\lambda_{n+1}-\lambda_{n}\)\(\triangleright\) Step length
+4:\(\{a_{ij}\},\{b_{j}\}\leftarrow\) Butcher tableau with \(\{c_{i}\}\)\(\triangleright\) Single-step update coeffcients
+5:\((\mathbf{x}_{n,1},\lambda_{n,1})\leftarrow(\mathbf{x}_{n},\lambda_{n})\)\(\triangleright\)\(c_{1}=0\) for explicit methods
+6:for\(i\) in \(2,\cdots,s\)do
+7:\((\mathbf{x}_{n,i},\lambda_{n,i})\leftarrow(e^{-c_{i}b}\mathbf{x}_{n}+h\sum_{j=1}^{i}a _{i,j}\mathbf{D}_{\theta}(\mathbf{x}_{n,j},\lambda_{n}+c_{j}h),\,\lambda_{n}+c_{i}h)\)
+8:\(\mathbf{x}_{n+1}\leftarrow e^{-h}\mathbf{x}_{n}+h(\sum_{i=1}^{s}b_{i}\mathbf{D}_{\theta}( \mathbf{x}_{n,i},\lambda_{n}+c_{i}h))\)
+9:return\(\mathbf{x}_{n+1}\)
+```
+
+**Algorithm 3** RES General \(s\)-stage Single-step Update with \(\{c_{s}\}\)
+
+### Multistep algorithm
+
+The insights and analysis gained from a multi-stage single-step numerical scheme can be leveraged to develop multistep numerical methods. The crux of a multistep update step lies in its utilization of not only the function evaluation at the current state but also previous function evaluations.
+
+To underscore the parallels between single-step and multistep methods, consider a single update step from timestamp \(\lambda_{n}\) to \(\lambda_{n+1}:=\lambda_{n}+h\) with function evaluations \(\{g(\mathbf{x}_{n,i},\lambda_{n}+c_{i}h)\}_{i=1}^{r}\), where \(c_{1}=0,c_{i}<0\) for \(1<i\leq r\) and \(\mathbf{x}_{n,i}\) are numerical results on timestamp \(\lambda_{n}+c_{i}h\). The general multistep scheme can be expressed as follows:
+
+\[\mathbf{x}_{n+1}=e^{-h}\mathbf{x}_{n}+h[\sum_{i=1}^{r}b_{i}g(\mathbf{x}_{n,i},\lambda_{n}+ c_{i}h)] \tag{47}\]
+
+The present multistep method configuration bears many resemblances to the single-step method outlined in Sec 3.2. The distinction resides in the selection of \(\{c_{i}\}_{i=2}^{r}\), which are chosen such that \(\lambda_{n}+c_{i}h=\lambda_{n+1-i}\). Consequently, with \(\mathbf{x}_{n,i}\) coinciding with \(\mathbf{x}_{n+1-i}\), we can bypass the function evaluation cost, as \(g(\mathbf{x}_{n,i},\lambda_{n}+c_{i}h)\) is readily available due to the existing value of \(g(\mathbf{x}_{n+1-i},\lambda_{n+1-i})\).
+
+From this viewpoint, the construction of auxiliary \(\hat{\mathbf{x}}\) and intermediate numerical defects \(\delta_{n}\) in Sec 3.2 remain applicable for multistep cases. Most notably, the error recursion in Eq (13a) and the expansion of \(\delta_{n+1}\) in Lemma 1 persist in the multistep scenario. To minimize numerical defects, we also aim to reduce \(\delta_{n}\). Therefore, the choice of \(b_{i}\) from the Butcher tableaus developed for the single-step scheme can be employed for multistep methods with particular \(c_{i}\) values. The second-order multistep algorithm is detailed in Alg 4.
+
+```
+1:procedureMultiStepUpdate(\(\mathbf{x}_{n},\sigma_{n},\sigma_{n+1},\mathbf{D}_{\theta}(\mathbf{x}_{n-1},\lambda_{n-1})\))
+2:\(\lambda_{n+1},\lambda_{n},\lambda_{n-1}\leftarrow-\log(\sigma_{n+1}),-\log( \sigma_{n}),-\log(\sigma_{n-1})\)
+3:\(h\leftarrow\lambda_{n+1}-\lambda_{n}\)\(\triangleright\) Step length
+4:\(c_{2}\leftarrow\frac{\lambda_{n-1}-\lambda_{n}}{h}\)
+5:\(b_{1},b_{2}\leftarrow\phi_{1}(-h)-\phi_{2}(-h)/c_{2},\phi_{2}(-h)/c_{2}\)\(\triangleright\) Coeffcients
+6:\(\mathbf{x}_{n+1}\gets e^{-h}\mathbf{x}_{n}+h(b_{1}D_{\theta}(\mathbf{x}_{n},\lambda_{n })+b_{2}D_{\theta}(\mathbf{x}_{n-1},\lambda_{n-1}))\)
+7:return\(\mathbf{x}_{n+1}\)
+```
+
+**Algorithm 4** RES Second order Multistep Update Scheme
+
+## Appendix F Experiment details
+
+In this section, we provide necessary experiment details and extra experiments.
+
+### Reproduction of Fig 1
+
+Fig 1aWe use the pre-trained ImageNet \(64\times 64\) class-conditioned diffusion model (Karras et al., 2022) to conduct the experiment. Due to the lack of ground truth solution trajectories, we use high-accuracy ODE solvers to approximate the solutions. Concretely, we employ RK4 with 500 steps (2000 NFE) to generate trajectories, with negligible alterations with more steps. To generate those trajectories, we randomly select initial random noise and labels. Curves in Fig 1a are averaged over \(512\) trajectories.
+
+Extra experimentsBesides the "acceleration" outlined in Fig 1a, we examine the evolution of \(f(\lambda):=g(\mathbf{x}(\lambda),\lambda)\) along the solution trajectory for various nonlinear functions \(g\). We note that smoother \(f\) typically results in smaller numerical defects, as indicated in Lemma 1 and Thm 1 and 2. As depicted in Fig 5, the benefit of applying a logarithmic transformation to the noise level \(\sigma\) is evident.
+
+### Reproduction of Fig 3
+
+We utilize the pre-trained ImageNet \(64\times 64\) class-conditioned diffusion model (Karras et al., 2022) for our experiment. For the numerical defect experiments, we approximate the ground truth solution \(\mathbf{x}(0)\) using 500 steps RK4 (2000 NFE). We generate \(50,000\) images with randomized labels to calculate numerical defects and FIDs. The EDM, as suggested by Karras et al. (2022), follows a time schedule as given in Eq (48),
+
+\[t_{i}=(\sigma_{\text{max}}^{\frac{1}{2}}+\frac{i}{N-1}(\sigma_{\text{min}}^{ \frac{1}{2}}-\sigma_{\text{max}}^{\frac{1}{2}}))^{\rho}, \tag{48}\]
+
+where \(\rho\) is a hyperparameter that controls the timestamp spacing. Our findings reveal that the \(\epsilon_{\theta}\)-based RES outperforms the \(\mathbf{D}_{\theta}\)-based RES. By default, we adhere to the recommended \(\rho=7\) for our
+
+Figure 5: (Left) The evolution of nonlinear function evaluation for Eq (6) characterized by \(f_{e}(\sigma):=\epsilon_{\theta}(\mathbf{x}(\sigma),\sigma)\). (Right) The evolution of nonlinear function evaluation for Eq (8), defined by \(f_{e}(\lambda):=\epsilon_{\theta}(\mathbf{x}(\lambda),\lambda)\) and \(f_{D}(\lambda):=D_{\theta}(\mathbf{x}(\lambda),\lambda)\). Implementing a logarithmic transformation on the noise level \(\sigma\) results in smoother trajectories of nonlinear function evaluations along ODE solutions.
+
+experiments. To test the robustness through the suboptimal time rescheduling experiment, we use \(\rho=1\), where the timestamps are uniformly distributed in \(\sigma\). For all experiments, we test the sampling algorithm with NFE set to \(6,8,10,15,20,25,30,35,50,75,100\). Similar to EDM, an additional denoising step is included in the final stage. We note that for second-order single-step methods, the total NFE may not align perfectly with the NFE. In such instances, we always take one less step, for example, second-order methods only use 5 NFEs when we expect them to utilize 6 NFEs. We use the official code from Karras et al. (2022) to calculate FID score. We include quantitative results in Tab 5 to 7.
+
+\begin{table}
+\begin{tabular}{c|c c c c c c} \hline \hline NFE & DDIM (S) & Heun (S) & DPM-Solver++ (S) & Our (S) & DPM-Solver++ (M) & Our (M) \\ \hline
+6 & 2339 & 4.116\(\times 10^{4*}\) & 2850\({}^{*}\) & 1957\({}^{*}\) & 5034 & 4615 \\
+8 & 1948 & 1.249\(\times 10^{1*}\) & 2004\({}^{*}\) & 1177\({}^{*}\) & 5281 & 5430 \\
+10 & 1664 & 5901\({}^{*}\) & 1578\({}^{*}\) & 827.9\({}^{*}\) & 5296 & 5800 \\
+15 & 1241 & 1362 & 907.2 & 435.6 & 4975 & 5469 \\
+20 & 996.9 & 780.2\({}^{*}\) & 681\({}^{*}\) & 314.8\({}^{*}\) & 4445 & 4779 \\
+25 & 834.9 & 428 & 483.1 & 222.6 & 3923 & 4116 \\
+30 & 718.5 & 312.7\({}^{*}\) & 392.9\({}^{*}\) & 184.8\({}^{*}\) & 3513 & 3675 \\
+35 & 632.6 & 218.3 & 300.5 & 139.6 & 3191 & 3409 \\
+50 & 467.5 & 126.1\({}^{*}\) & 185.6\({}^{*}\) & 90.87\({}^{*}\) & 2597 & 2607 \\
+75 & 329.4 & 79.22 & 101.2 & 55.01 & 2019 & 1876 \\
+100 & 256.8 & 63.15\({}^{*}\) & 70.82\({}^{*}\) & 43.44\({}^{*}\) & 1658 & 1537 \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: Numerical defects \(|\mathbf{x}(0)-\mathbf{x}_{N}|\) with different NFEs and suboptimal time scheduling for Fig 3 (Right). \(*\) indicates the number is produced by one less NFE.
+
+\begin{table}
+\begin{tabular}{c|c c c c c c} \hline \hline NFE & DDIM (S) & Heun (S) & DPM-Solver++ (S) & Our (S) & DPM-Solver++ (M) & Our (M) \\ \hline
+6 & 2515 & 1.446\(\times 10^{4*}\) & 2681\({}^{*}\) & 1774\({}^{*}\) & 1507 & 2602 \\
+8 & 2063 & 3943\({}^{*}\) & 2060\({}^{*}\) & 1072\({}^{*}\) & 1062 & 1895 \\
+10 & 1747 & 2501\({}^{*}\) & 1544\({}^{*}\) & 729.1\({}^{*}\) & 740.2 & 1195 \\
+15 & 1280 & 992.7 & 845.7 & 382.6 & 369.9 & 463.3 \\
+20 & 1020 & 623.9\({}^{*}\) & 617.8\({}^{*}\) & 283.6\({}^{*}\) & 227.6 & 258.7 \\
+25 & 852.7 & 360.4 & 420.7 & 187.6 & 153.2 & 167.8 \\
+30 & 731.4 & 270.4\({}^{*}\) & 339.4\({}^{*}\) & 151.1\({}^{*}\) & 114 & 117.1 \\
+35 & 640.1 & 190.2 & 256.5 & 113.8 & 87.17 & 85.13 \\
+50 & 468.4 & 106.3\({}^{*}\) & 146\({}^{*}\) & 64.43\({}^{*}\) & 46.06 & 40.59 \\
+75 & 328.1 & 43.23 & 68.56 & 31.35 & 22.82 & 18.28 \\
+100 & 254.6 & 24.56\({}^{*}\) & 41.63\({}^{*}\) & 19.08\({}^{*}\) & 14.58 & 10.65 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Numerical defects \(|\mathbf{x}(0)-\mathbf{x}_{N}|\) with different NFEs and recommended time scheduling for Fig 3 (Left). \(*\) indicates the number is produced by one less NFE.
+
+### More experiments on Classifier-guided DMs
+
+We further investigate RES diffusion models trained using different schemes, including DDPM-like diffusion models with classifier-based guidance (Dhariwal and Nichol, 2021). It is important to note that we employ dynamic thresholding (Sahara et al., 2022) for all experiments to help alleviate pixel over-saturation issues. To ensure a fair comparison, all algorithms differ solely in their numerical update schemes. As depicted in Fig 6, our previous observations remain valid for guided diffusion models trained with different techniques, and RES converges faster than baselines.
+
+Concretely, we utilize pre-trained diffusion models equipped with a noise data classifier from Dhariwal and Nichol (2021). These diffusion models are trained on discrete time analogous to DDPM. By employing an additional noise data classifier \(p(\mathbf{c}|\mathbf{x})\), we can derive a new diffusion model by incorporating the gradient of the classifier into the diffusion model, resulting in the following denoiser:
+
+\[\hat{\mathbf{D}}(\mathbf{x},\sigma|\mathbf{c}) =\mathbf{x}+\sigma^{2}\nabla_{\mathbf{x}}\log p(\mathbf{x}|\mathbf{c};\sigma) \tag{49}\] \[=\mathbf{x}+\sigma^{2}\nabla_{\mathbf{x}}\log p(\mathbf{x};\sigma)+\sigma^{2 }\nabla_{\mathbf{x}}\log p(\mathbf{c}|\mathbf{x};\sigma), \tag{50}\]
+
+where \(p(\mathbf{c}|\mathbf{x};\sigma)\) denotes a classifier for the label \(\mathbf{c}\) on noise data. In practice, researchers have observed that increasing the weight on the classifier can enhance performance, as expressed by:
+
+\[\hat{\mathbf{D}}(\mathbf{x},\sigma|\mathbf{c})\approx\hat{\mathbf{D}}_{\theta}(\mathbf{x},\sigma| \mathbf{c})+\omega\sigma^{2}\nabla_{\mathbf{x}}\log p(\mathbf{y}|\mathbf{x};\sigma), \tag{51}\]
+
+where \(\omega\) can be adjusted to values greater than \(1\). In our experiment, we utilize the pre-trained classifier detailed in Dhariwal and Nichol (2021). We approximate the ground truth \(\mathbf{x}(0)\) using 500 steps of the RK4 method. In addition, we apply dynamic thresholding (Sahara et al., 2022) to all methods evaluated in this experiment to ensure a fair comparison. We conduct the sampling tests with NFE values of \(6,7,8,9,10,12,15,18,20,30,50\). It should be noted that for guided diffusion models, our approach based on \(\mathbf{D}_{\theta}\) proves superior. We use the official code from Dhariwal and Nichol (2021) to calculate FID score.
+
+### Reproduction of Fig 4a
+
+This experiment is designed to demonstrate how an enhanced single-step sampler can augment stochastic samplers' performance. We utilize the pre-trained ImageNet \(64\times 64\) class-conditioned diffusion model (Karras et al., 2022) for this purpose. The time schedule adheres to the recommended setting with \(\rho=7\). With a fixed level of stochasticity, parameterized by \(\eta\), we contrast the second order Heun method with our method at NFE values of \(6,8,10,15,20,25,30,35,50,75,100,150,200,350,500\). We also examine the influence of \(\eta\) on the FID with a fixed NFE of 75, iterating \(\eta=0,0.01,0.025,0.05,0.15,0.20,0.30,0.35,0.40,0.45,0.50\). We observe that adding random noise can enhance perceptual quality in terms of FID when compared to deterministic sampling, although an excess of stochasticity can impair sampling quality. We use the official code from Karras et al. (2022) to calculate FID score.
+
+Figure 6: Comparison on DDPM-like classifier-guided diffusion models (Dhariwal and Nichol, 2021) with different guidance.
+
+### Reproduction of Fig 4b
+
+This experiment is designed to corroborate the effectiveness of our enhanced order analysis and RES in large-scale text-to-image diffusion models (DeepFloyd, 2023), primarily against the benchmark set by DPM-Solver++ (Lu et al., 2022b). The initial experiments examine FID-CLIP scores under varying classifier-free guidance weights (Ho and Salimans, 2022). With classifier-free guidance, we can build a new diffusion model based on a conditional diffusion model and an unconditional model. Specifically, for either the data prediction model or the noise prediction model, denoted by their network as \(g\), the newly proposed diffusion model adheres to the following protocol:
+
+\[\hat{g}(\mathbf{x},\sigma,\mathbf{c}):=g(\mathbf{x},\sigma,\emptyset)+\omega(g(\mathbf{x}, \sigma,\mathbf{c})-g(\mathbf{x},\sigma,\emptyset)), \tag{52}\]
+
+where\(\omega\) serves as the guidance weight, \(\emptyset\) represents the unconditional signal, and \(\mathbf{c}\) stands for the conditional signal1. We vary the guidance between \(1,1.5,3,5,10\). We employ ViT-g-14 (Ilharco et al., 2021) for the calculation of the CLIP score and proton-fid for FID. This experiment is carried out on the MS-COCO validation dataset. Owing to computational resource constraints, the experiment is performed at a resolution of \(64\times 64\) with a fixed 25 NFE. It should be noted that for this experiment, we merely substitute the degenerated Butcher tableau of DPM-Solver++ with our Butcher tableau, keeping all other configurations consistent. The experiment is based on IF-I-XL.
+
+Footnote 1: We slightly modify the classifier-free equation to align it with the implementation (DeepFloyd, 2023) available at [https://github.com/deep-floyd/IF/blob/2ad4ff7cde3cee91f237270a3cc81cae4578015/deepfloyd_if/modules/base.py#L114](https://github.com/deep-floyd/IF/blob/2ad4ff7cde3cee91f237270a3cc81cae4578015/deepfloyd_if/modules/base.py#L114)
+
+In a further experiment, we compare RES and DPM-Solver++ using the upsampling diffusion model IF-II-L, which upsamples a low-resolution image of \(64\times 64\) pixels to a high-resolution image of \(256\times 256\) pixels. For this test, we feed generated \(64\times 64\) images, using the single-step RES with \(49\) NFE, along with corresponding captions into the upsampling model. We then vary the NFE to assess the quality of the generated images. Intriguingly, our findings reveal that the single-step RES outperforms multi-step methods in terms of the quality of samples produced.
+
+In our experiments involving DeepFloyd IF models, we adopt the time schedule outlined in Eq (48) with \(\rho=7\). Owing to constraints on our computational resources, we are unable to sweep through hyperparameters to locate a more optimized time schedule. However, we posit that with the same NFE, the quality of the sampling could be further enhanced by fine-tuning the time schedule.
+
+### Licenses
+
+#### Dataset
+
+* ImageNet (Russakovsky et al., 2015)
+* MS-COCO (Lin et al., 2014)
+	* 4.0 License.
+
+#### Pre-trained models and code
+
+* EDM ImageNet (Karras et al., 2022)
+* NonCommercial-ShareAlike 4.0 International License
+* DeepFloyd IF (DeepFloyd, 2023)
+* OpenAI Guided ImageNet (Dhariwal and Nichol, 2021)
+* Pytorch FID (Seitzer, 2020)
+* OpenCLIP (Ilharco et al., 2021)
+* G Image samples
+
+In this section, we include samples from our experiments for quantitative comparison.
+
+Figure 8: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step Heun 15 NFE. (FID=5.54)
+
+Figure 7: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step Heun 9 NFE. (FID=35.31)
+
+Figure 10: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step DPM-Solver++ 15 NFE. (FID=6.40)
+
+Figure 9: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step DPM-Solver++ 9 NFE. (FID=16.77)
+
+Figure 11: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step RES data prediction model 9 NFE. (FID=8.66)
+
+Figure 12: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step RES data prediction model 15 NFE. (FID=3.92)
+
+Figure 14: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step RES noise prediction model 15 NFE. (FID=3.88)
+
+Figure 13: Uncurated samples of \(64\times 64\) ImageNet model (Karras et al., 2022) with single-step RES noise prediction model 9 NFE. (FID=5.08)
+
+Figure 15: Single-step DPM-Solver++ _vs_ Single-step RES on cascaded DM

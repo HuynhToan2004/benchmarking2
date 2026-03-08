@@ -1,0 +1,230 @@
+# LiDAR-PTQ: Post-Training Quantization for Point Cloud 3D Object Detection
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Due to highly constrained computing power and memory, deploying 3D lidar-based detectors on edge devices equipped in autonomous vehicles and robots poses a crucial challenge. Being a convenient and straightforward model compression approach, Post-Training Quantization (PTQ) has been widely adopted in 2D vision tasks. However, applying it directly to 3D lidar-based tasks inevitably leads to performance degradation. As a remedy, we propose an effective PTQ method called LiDAR-PTQ, which is particularly curated for 3D lidar detection (both SPConv-based and SPConv-free). Our LiDAR-PTQ features three main components, **(1)** a sparsity-based calibration method to determine the initialization of quantization parameters, **(2)** a Task-guided Global Positive Loss (TGPL) to reduce the disparity between the final predictions before and after quantization, **(3)** an adaptive rounding-to-nearest operation to minimize the layerwise reconstruction error. Extensive experiments demonstrate that our LiDAR-PTQ can achieve state-of-the-art quantization performance when applied to CenterPoint (both Pillar-based and Voxel-based). To our knowledge, for the very first time in lidar-based 3D detection tasks, the PTQ INT8 model's accuracy is almost the same as the FP32 model while enjoying \(3\times\) inference speedup. Moreover, our LiDAR-PTQ is cost-effective being \(30\times\) faster than the quantization-aware training method.
+
+## 1 Introduction
+
+LiDAR-based 3D detection has a wide range of applications in self-driving and robotics. It is important to detect the objects in the surrounding environment fastly and accurately, which places a high demand for both performance and latency. Currently, mainstream grid-based 3D detectors convert the irregular point cloud into arranged grids (voxels/pillars), and achieve top-ranking performance (Jiageng Mao, 2023) while facing a crucial challenge when deploying 3D lidar-based models on resource-limited edge devices. Therefore, it is important to improve the efficiency of grid-based 3D perception methods (e.g., reduce memory and computation cost).
+
+Quantization is an efficient model compression approach for high-efficiency computation by reducing the number of bits for activation and weight representation. Compared to quantization-aware training (QAT) methods, which require access to all labeled training data and substantial computation resources, Post-training quantization (PTQ) is more suitable for fast and effective industrial applications. This is because PTQ only needs a small number of unlabeled samples as calibration set. Besides, PTQ does not necessitate retraining the network with all available labeled data, resulting in a shorter quantization process. Although several advanced PTQ methods (Nagel et al., 2020; Li et al., 2021; Wei et al., 2022; Yao et al., 2022) have been proposed for RGB-based detection tasks, applying it directly to 3D lidar-based tasks inevitably leads to performance degradation due to the differences between images and point clouds.
+
+As shown in Fig 1, the inherent sparsity and irregular distribution of LiDAR point clouds present new challenges for the quantization of 3D Lidar-based detectors. **(1)** The sparsity of point cloud. Different from dense RGB images, non-zero pixels only occupy a very limited part of the whole scenario (about 10% in Waymo dataset (Sun et al., 2020)). For example, the huge number of zero pixel lead to significant differences in activation distribution compared to dense RGB-based tasks. **(2)** Larger arithmetic range. Compared with the 8-bit (0-255) RGB images, the point coordinates after voxelization are located in a 1504 \(\times\) 1504 \(\times\) 40 (voxel size = 0.1m) 3D space in Waymodataset, which makes it more susceptible to the effects of quantization (such as clipping error). **(3)** Imbalance between foreground instances and large redundant background area. For example, based on CenterPoint-Voxel (Yin et al., 2021), a vehicle with \(4m\times 2m\) occupies only \(40\times 20\) pixels in the input \(1504\times 1504\) BEV feature map. Such small foreground instances and large perception ranges in 3D detection require the quantized model to have less information loss to maintain detection performance. Therefore, these challenges hinder the direct application of quantization methods developed for 2D vision tasks to 3D point cloud tasks.
+
+To tackle the above challenge, we propose an effective PTQ method called LiDAR-PTQ, which is specifically curated for 3D LiDAR-based object detection tasks. Firstly, we introduce a sparsity-based calibration method to determine the initialization of quantization parameters on parameter space. Secondly, we propose Task-guided Global Positive Loss (TGPL) to find the quantization parameter on model space that is suitable for final output performance. Thirdly, we utilize an adaptive rounding value to mitigate the performance gap between the quantized and the full precision model. The proposed LiDAR-PTQ framework is a general and effective quantization method for both SPConv-based and SPConv-free 3D detection models. Extensive experiments on various datasets evaluate that our LiDAR-PTQ can achieve state-of-the-art quantization performance (Fig 2) when applied to CenterPoint (both Pillar-based and Voxel-based). To our knowledge, for the very first time in LiDAR-based 3D detection tasks, the PTQ INT8 model's accuracy is almost the same as the FP32 model while enjoying \(3\times\) inference speedup. Moreover, our LiDAR-PTQ is cost-effective being \(30\times\) faster than QAT method. We will release our code to the community.
+
+Here, we summarize our main contributions as follows:
+
+* Unveiling the root cause of performance collapse in the quantization of the 3D LiDAR-based detection model. Furthermore, we propose the sparsity-based calibration method to initialize the quantization parameter.
+* TGPL: A Task-guided Global Positive Loss (TGPL) function to minimize the output disparity on model space which helps improve the quantized performance.
+* LiDAR-PTQ: a general and effective quantization method for both SPConv-based and SPConv-free 3D detection models. Extensive experiments demonstrate LiDAR-PTQ can achieve state-of-the-art quantization performance on CenterPoint (both Pillar-based and Voxel-based).
+* To our knowledge, for the very first time in LiDAR-based 3D detection tasks, the PTQ INT8 model's accuracy is almost the same as the FP32 model while enjoying \(3\times\) inference speedup. Moreover, LiDAR-PTQ is cost-effective being \(30\times\) faster than QAT method.
+
+Figure 1: The sparsity of point cloud on 3D LiDAR-based object detection. Orange area means empty area, blue point means the point cloud (non-empty area) in a scenario, green box means the 3D Bboxes, and red point means foreground points.
+
+Figure 2: Performance comparison
+
+## 2 Preliminaries
+
+**LiDAR-based 3D object detection.** Given a point set with \(N\) points in the 3D space, which is defined as \(\mathbf{P}=\{\mathbf{p}_{i}=[x_{i},y_{i},z_{i},r_{i}]^{T}\in\mathbb{R}^{N\times 4}\}\), where \(x_{i},y_{i},z_{i}\) denote the coordinate values of each point along the axes \(\mathbf{X}\), \(\mathbf{Y}\), \(\mathbf{Z}\), respectively, and \(r_{i}\) is the laser reflection intensity. Given a set of object in the 3D scene \(\mathbf{B}=\{\mathbf{b}_{j}=[x_{j},y_{j},z_{j},h_{j},w_{j},l_{j},\theta_{cj}]^{T }\in\mathbb{R}^{M\times 8}\}\), where \(M\) is the total number of objects, \(b_{i}\) is the \(i\)-th object in the scene, \(x_{j},y_{j},z_{j}\) is the object's center, \(h_{j},w_{j},l_{j}\) is the object's size, \(\theta_{j}\) is the object's heading angle and \(c_{j}\) is the object's class. The task of LiDAR-based 3D object detection is to detect the 3D boxes \(\mathbf{B}\) from the point cloud \(\mathbf{P}\) accurately.
+
+**Quantization for tensor.** The quantization operation is defined as the mapping of a floating-point (FP) value \(x\) (weights or activations) to an integer value \(x_{int}\) according to the following equation:
+
+\[x_{int}=clamp(\lfloor\frac{x}{s}\rceil+z,q_{min},q_{max}) \tag{1}\]
+
+where \(\lfloor\cdot\rceil\) is the rounding-to-nearest operator, which results in the rounding error \(\Delta r\). The function \(clamp(\cdot)\) clips the values that lie outside of the integer range \([q_{min},q_{max}]\), incurring a clipping error \(\Delta c\). \(x_{int}\) represents the quantized integer value. \(z\) is zero-point. \(s\) denotes the quantization scale factor, which reflects the proportional relationship between FP values and integers. \([q_{min},q_{max}]\) is the quantization range determined by the bit-width \(b\). Here, we adopt uniform signed symmetric quantization, as it is the most widely used in TensorRT (Migacz, 2017) and brings significant acceleration effect. Therefore, \(q_{min}=-2^{b-1}\) and \(q_{max}=2^{b-1}-1\). Nonuniform quantization (Jeon et al., 2022) is challenging to deploy on hardware, so we disregard it in this work. Generally, weights can be quantized without any need for calibration data. Therefore, the quantization of weights is commonly solved using grid search or analytical approximations with closed-form solution (Banner et al., 2019; Nagel et al., 2021) to minimize the mean squared error (MSE) in PTQ. However, activation quantization is input-dependent, so often requires a few batches of calibration data for the estimation of the dynamic ranges to converge. To approximate the real-valued input \(x\), we perform the de-quantization step:
+
+\[\hat{x}=(x_{int}-z)\cdot s \tag{2}\]
+
+where \(\hat{x}\) is the de-quantized FP value with an error that is introduced during the quantization process.
+
+**Quantization range.** If we want to reduce clipping error \(\Delta c\), we can increase the quantization scale factor \(s\) to expand the quantization range. However, increasing \(s\) leads to increased rounding error \(\Delta r\) because \(\Delta r\) lies in the range \(\left[-\frac{s}{2},\frac{s}{2}\right]\). Therefore, the key problem is how to choose the quantization range \((x_{min},x_{max})\) to achieve the right trade-off between clipping and rounding error. Specifically, when we set fixed bit-width \(b\), the quantization scale factor \(s\) is determined by the quantization range:
+
+\[s=\left(x_{max}-x_{min}\right)/\left(2^{b}-1\right) \tag{3}\]
+
+There are two common methods for quantization range setting.
+
+i): _Max-min calibration._ We can define the quantization range as:
+
+\[x_{max}=max(|x|),x_{min}=-x_{max} \tag{4}\]
+
+to cover the whole dynamic range of the floating-point value \(x\). This leads to no clipping error. However, this approach is sensitive to outliers as strong outliers may cause excessive rounding errors.
+
+ii): _Entropy calibration._ TensorRT (Migacz, 2017) minimize the information loss between \(x\) and \(\hat{x}\) based on the KL divergence to determine the quantization range:
+
+\[\underset{x_{min},x_{max}}{argmin}\ D_{KL}(x,\hat{x}) \tag{5}\]
+
+where \(D_{KL}\) denotes the Kullback-Leibler divergence function. The entropy calibration will saturate the activations above a certain threshold to remove outliers. More details refer to the appendix.
+
+**Quantization for network.** For a float model with \(N\) layer, we primarily focus on the quantization of convolutional layers or linear layers, which mainly involves the handling of weights and activations. For a given layer \(L_{i}\), we initially execute quantization operations on its weight and input tensor, as illustrated in Eq 1 and 2, yielding \(\hat{W}_{i}\) and \(\hat{I}_{i}\). Consequently, the quantized output of this layer can be expressed as follows.
+
+\[\hat{A}_{i}=f(\textit{BN}(\hat{I}_{i}\otimes\hat{W}_{i}) \tag{6}\]
+
+where \(\copyright\) denotes the convolution operator, _BN_(\(\cdot\)) is the Batch-Normalization procedure, and \(f(\cdot)\) is the activation function. Quantization works generally take into account the convolution, Batch Normalization (BN), and activation layers.
+
+## 3 Methodology
+
+Here, we first conduct PTQ ablation study on the CenterPoint-Pillar (Yin et al., 2021) model using two different calibrators (Entropy and Max-min) on Waymo \(val\) set. As shown in Table 1, when using INT8 quantization, the performance drop is severely compromised for both the calibration method, especially for the entropy calibrator with a significant accuracy drop of **-38.67 mAPH/L2**. However, directly employing the Max-min calibrator yielded better results, yet not unsatisfactory. It is entirely contrary to our experience in 2D model quantization, where entropy calibration effectively mitigates the impact of outliers, thereby achieving superior results (Nagel et al., 2021). Similar observations are also discussed in Stucker et al. (2021). This anomaly prompts us to propose a general and effective PTQ method for 3D LiDAR-based detectors. In Waymo dataset, the official evaluation tools evaluated the methods in two difficulty levels: LEVEL_1 for boxes with more than five LiDAR points, and LEVEL_2 for boxes with at least one LiDAR point. Here we report the metrics in Mean Average Precision with Heading / LEVEL_2 (mAPH/L2), which is a widely adopted metric by the community.
+
+### LiDAR-PTQ Framework
+
+In this paper, we propose a post-training quantization framework for point cloud models, termed LiDAR-PTQ. Our LiDAR-PTQ could enable the quantized model to achieve almost the same performance as the FP mode, and there is no extra huge computation cost and access to labeled training data. This framework primarily comprises three components.
+
+**i) Sparsity-based calibration**: We employ a Max-min calibrator equipped with a lightweight grid search to appropriately initialize the quantization parameters for both weights and activations.
+
+**ii) Task-guided Global Positive Loss (TGPL)**: This component utilizes a specially designed foreground-aware global supervision to further optimize the quantization parameters of activation.
+
+**iii) Adaptive rounding-to-nearest**: This module aims to mitigate the weight rounding error \(\Delta r\) by minimizing the layer-wise reconstruction error.
+
+In summary, our method first initializes the quantization parameters for weights and activations through a search in the parameter space, and then further refine them through a process of supervised optimization in the model space. Consequently, our method is capable of achieving a quantized accuracy that almost matches their float counterparts for certain lidar detectors. We formulate the our LiDAR-PTQ algorithm for a full precision 3D detector in Algorithm 1. Next, we will provide detailed explanations for these three parts.
+
+### Sparsity-based Calibration
+
+Here, in order to delve into the underlying reasons for the huge performance gap (31.29 mAPH/L2 in Tab 1) between Max-min and entropy calibrator. We statistically analyze the numerical distribution of feature maps of both RGB-based models and LiDAR-based object detection models, and visualize the main diversity as shown in Fig 3. The main reasons affecting the quantization performance can be summarized in two points:
+
+**i) Huge sparsity lead to inappropriate quantization range.** As shown in Fig 1 and 3, the sparsity of point cloud makes the whole BEV feature map exist a large number of zero pixels. Therefore, the entropy calibrator will statistic the feature value including zero pixels (\(\approx 90\%\)) to minimize the information loss, which leads to the values outside the quantization range being clipped. However, these truncated values contain rich geometric representations that could used for final object detection.
+
+**ii) Point cloud features are more sensitive to quantization range.** Point cloud explicitly gauges spatial distances, and shapes of objects by collecting laser measurement signals from environments. During voxelization process, the raw point cloud coordinates, i.e., \(x\), \(y\), \(z\) in the ego-vehicle coordinate system are encoded as part of voxel features that preserve essential geometric information. Specif
+
+\begin{table}
+\begin{tabular}{l c|c c c} \hline \hline \multirow{2}{*}{Method} & \multirow{2}{*}{Bits(W/A)} & \multicolumn{3}{c}{LEVEL\_2 mAPH} \\  & & Mean & Vehicle & Pedestrian \\ \hline Full Prec. & 32/32 & 60.32 & 65.42 & 55.23 \\ Entropy & 8/8 & 21.65 (**-38.67**) & 29.41 (**-36.02**) & 11.89 (**-43.34**) \\ Max-Min & 8/8 & 52.91 (**-7.41**) & 55.37 (**-10.05**) & 50.45 (**-4.78**) \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Ablation study.
+
+ically, the arithmetic range of the input point cloud coordinates increases with detection distance. Therefore, the arithmetic range in the voxel feature is strongly correlated with detection distance. In other words, the arithmetic range of point cloud is relevant to the geometrics.
+
+Furthermore, we also conduct an ablation study with different range distances on waymo \(val\) set. As shown in Tab 2, we find that _the decline in accuracy is exacerbated as the distance increases_. For entropy calibrator, the quantized performance on long-range metrics (50m - inf) is terribly damaged (5.90 mAPH/L2, up to 84.5% drop), while accuracy on short-range metrics (0-30m) remains well (60.03 mAPH/L2, 32.4% drop). This is because the entropy calibrator provides an inappropriate quantization range, resulting in a significant clipping error. Therefore, a large number of values with geometrics info are truncated and consequently a substantial degradation in model accuracy. On the contrary, for the Max-min calibrator, which covers the whole dynamic range of the FP activation, the FP activation is not significantly degraded. Therefore, it is also possible to obtain a better estimate of the FP activation.
+
+Drawing upon the above findings, we conclude that the commonly used calibration method for RGB images is sub-optimal, while Max-min is more suitable for 3D point clouds. Therefore, we adopt
+
+\begin{table}
+\begin{tabular}{l l c c c} \hline \hline \multicolumn{2}{l}{**Input**: Pretrained FP model with \(N\) layers; Calibration dataset \(D^{e}\), iteration \(T\). **Output**: quantization parameters of both activation and weight in network, i.e., weight scale \(s_{w}\), weight zero-point \(z_{w}\), activation scale \(s_{a}\), activation zero-point \(z_{a}\) and adaptive rounding value for weight \(\theta\). 1: Optimize only weight quantization parameters \(s_{w}\) and \(z_{w}\) to minimize Eq 7 in every layer using the grid search algorithm; 2: input \(D^{e}\) to FP network to get the FP final output \(O_{fp}\) 3: **for**\(L_{n}=\{L_{i}|i=1,2,...N\}\)**do** 4: Optimize only activation quantization parameters \(s_{a}\) and \(z_{a}\) to minimize Eq 7 in layer \(L_{i}\) using the grid search algorithm; 5: Collect input data \(I_{i}\) to the FP layer \(L_{i}\); 6: Input \(I_{i}\) to quantized layer \(L_{i}^{q}\) and FP layer \(L_{i}\) to get quantized output \(\hat{A}_{i}\) and FP output \(A_{i}\); 7: Input \(\hat{A}_{i}\) to the following FP network to get output \(O_{par}^{{}^{\prime}}\) of partial-quantized network; 8:for all \(j=1,2,\ldots,T\)-iteration **do** 9: Check quantized output \(\hat{A}_{i}\) and FP output and calculate \(L_{local}\) using Eq 11; 10: Check partial-quantized network output \(O_{par}^{{}^{\prime}}\) and FP final output \(O_{fp}\) to calculate \(L_{TGPL}\) using Eq 9; 11: Optimize quantization parameters \(s_{w}\), \(z_{w}\), \(s_{a}\), and \(z_{a}\), \(\theta\) of layer \(L_{i}\) to minimize \(L_{total}\) using Eq 12; 12:endfor 13: Quantize layer \(L_{i}\) with the learnable quantization parameters \(s_{w}\), \(z_{w}\), \(s_{a}\), and \(z_{a}\), \(\theta\); 14:endfor ```
+
+**Algorithm 1** LiDAR-PTQ quantization
+
+Figure 3: The diagram of data distribution for RGB-based and LiDAR-based object detection. Orange and green denote the data distribution of the entire feature map and foreground feature.
+
+Max-min calibrator for both weights and activations to mitigate the impact of high sparsity. Besides, to get more finer-grained scale factor and avoid the influence of outliers on rounding error \(\Delta r\), a lightweight grid search (Banner et al., 2019; Choukroun et al., 2019) is incorporated to further optimize the quantization parameters.
+
+Specifically, for a weight or activation tensor \(X\), firstly obtain the \(x_{max}\) and \(x_{min}\) according to Eq.4, and calculate the initial quantization parameter \(s_{0}\) following Eq. 3. Then linearly divide the interval \([\alpha s_{0},\beta s_{0}]\) into \(T\) candidate bins, denoted as \(\left\{s_{t}\right\}_{t=1}^{T}\). \(\alpha\), \(\beta\) and \(T\) are designed to control the search range and granularity. Finally, search \(\left\{s_{t}\right\}_{t=1}^{T}\) to find the optimal \(s_{opt}\) that minimizes the quantization error,
+
+\[\underset{s_{t}}{argmin}\left\|(X-\hat{X}(s_{l}))\right\|_{F}^{2} \tag{7}\]
+
+\(\|\cdot\|_{F}^{2}\) is the Frobenius norm (MSE Loss). Refer to appendix for more details about grid search.
+
+### Task-Guided Global Positive Loss
+
+The aforementioned calibration initialization approach can effectively improve the quantization accuracy of lidar detectors, but there is still a significant gap compared with the float model. Both empirical and theoretical evidence (Li et al., 2021; Wei et al., 2022; Liu et al., 2023a) suggest that solely minimizing the quantization error in parameter space dose not guarantee equivalent minimization in final task loss within model space. Therefore, it becomes imperative to devise a global supervisory signal specifically tailored for 3D LiDAR-based detection tasks. This supervision would enable further fine-tuning of the quantization parameters \(p\) to achieve higher quantized precision. It is crucial to emphasize that this fine-tuning process does not involve labeled training data. Only need to minimize the distance between original output \(O^{f}\) and the quantized model's output \(\hat{O}\), as depicted in Eq 8
+
+\[\underset{p}{argmin}(O^{f}-\hat{O}) \tag{8}\]
+
+In this paper, we propose Task-guided Global Positive Loss (TGPL) function to constrain the output disparity between the quantized and FP models. Our TGPL function features two characteristics that contribute to improving the performance of the quantized method:
+
+**i) Optimal quantization parameter on model space.** The TGPL function compares the final output difference between the FP and the quantized models rather than the difference in each layer's output.
+
+**ii) Task-guided.** As mentioned in Sec 1 and Fig 1, there exists extreme imbalance between small informative foreground instances and large redundant background areas in Lidar-based detection tasks. For sparse 3D scenes, it is sub-optimal to imitate all feature pixels on dense 2D images. TGPL function is designed to leverage cues in the FP model's classification response to guide the quantized model to focus on the important area (_i.e._ positive sample location) that is relevant to final tasks.
+
+In detail, we filter all prediction boxes from the FP model by a threshold \(\gamma\), then we select the top \(K\) boxes. Then we perform NMS (Neubeck and Van Gool, 2006) to get the final prediction as positive boxes (pusedo-labels). Specifically, inspired by the Gaussian label assignment in CenterPoint (Yin et al., 2021), we define positive positions in a soft way with center-peak Gaussian distribution. Finally, for the classification branch, we use the focal loss (Lin et al., 2017) as the heatmap loss \(\mathcal{L}_{cls}\). For the 3D box regression, we make use of the L1 loss \(\mathcal{L}_{reg}\) to supervise their localization offsets, size and orientation. The overall TGPL loss consists of two parts as follows:
+
+\[\mathcal{L}_{TGPL}=\mathcal{L}_{cls}+\alpha\mathcal{L}_{reg}, \tag{9}\]
+
+### Adaptive Rounding-to-Nearest
+
+Through grid search initialization and TGPL function constrain, the performance of quantized model has been greatly improved, but there is still a gap in achieving comparable accuracy with FP model. Recently, some methods (Wei et al., 2022; Liu et al., 2023a) optimize a variable, called rounding values, to determine whether weight values will be rounded up or down during the quantization process. In this way, the Eq 1 in weight quantization can be formulated as follows:
+
+\[x_{int}=clamp(\lfloor\frac{x+\theta}{s}\rceil+z,q_{min},q_{max}), \tag{10}\]where \(\theta\) is the optimization variable for each weight value to decide rounding results up or down (Nagel et al., 2020), _i.e._, \(\frac{\theta}{S}\) ranges from 0 to 1. Inspired by AdaRound(Nagel et al., 2020), we add a local reconstruction item to help learn the rounding value \(\theta\). The local reconstruction item as follows:
+
+\[L_{Local}=\|(W_{i}\otimes I_{i}-\hat{W}_{i}\otimes I_{i})\|_{F}^{2} \tag{11}\]
+
+where \(\|\cdot\|_{F}^{2}\) is the Frobenius norm and \(\hat{W}_{i}\) are the soft-quantized weights are calculated by Eq 10 and Eq 2. This operation allows us to adapt the rounding value to minimize information loss according to the calibration data, ensuring that the quantization process preserves important details. By adjusting the rounding value, we can achieve better performance of LiDAR-PTQ. Finally, the overall loss of our LiDAR-PTQ consists of two parts as follows:
+
+\[\mathcal{L}_{total}=\lambda_{1}\mathcal{L}_{local}+\lambda_{2}\mathcal{L}_{ TQPL}, \tag{12}\]
+
+## 4 Experiments
+
+**Dataset.** To evaluate the effectiveness of our proposed Lidar-PTQ, we conduct main experiments on two large-scale autonomous driving datasets, the nuScenes dataset (Caesar et al., 2020) and Waymo Open Dataset (WOD) (Sun et al., 2020). NuScenes dataset uses a LiDAR with 32 lines to collect data, containing 1000 scenes with 700, 150, and 150 scenes for training, validation, and testing, respectively. The metrics of the 3D detection task are mean Average Precision (mAP) and the nuScenes detection score (NDS). Waymo Open Dataset uses a LiDAR with 64 beams to collect data, containing 1150 sequences in total, 798 for training, 202 for validation, and 150 for testing. The metrics of the 3D detection task are mAP and mAPH (mAP weighted by heading). In Waymo, LEVEL1 and LEVEL2 are two difficulty levels corresponding to boxes with more than five LiDAR points and boxes with at least one LiDAR point. The detection range in nuScenes and WOD is 50 meters (cover area of 100m x 100m) and 75 meters (cover area of 150m x 150m).
+
+**Implementation Details.** All the FP models in our paper use CenterPoint(Yin et al., 2021) official open-source codes based on Det3D (Zhu et al., 2019) framework. In WOD dataset, we randomly sample 256 frames point cloud data from the training set as the calibration set. The calibration set proportions is 0.16% (256/158,081) for WOD. We set the first and the last layer of the network to keep full precision. We execute block reconstruction for the backbone and layer reconstruction for the neck and the head with a batch size of 4, respectively. Note that we do not consider using Int8 quantization for the PFN in CenterPoint-Pillar, since the input is 3D coordinates, with approximate range \(\pm 10^{2}\) m and accuracy 0.01 m, so that Int8 quantization in FPN would result in a significant loss of information. The learning rate for the activation quantization scaling factor is 5e-5, and for weight quantization rounding, the learning rate is 5e-3. In TGPL loss, we set \(\gamma\) as 0.1, and K as 500 We execute all experiments on a single Nvidia Tesla V100 GPU. For the speed test, the inference time of all comparison methods is measured on an NVIDIA Jetson AGX Orin, a resource-constrained edge GPU platform widely used in real-world autonomous driving.
+
+### Performance Comparison
+
+\begin{table}
+\begin{tabular}{c c c c c c c c c c c} \hline \hline \multirow{2}{*}{Models} & \multirow{2}{*}{Methods} & \multirow{2}{*}{Bits(W/A)} & \multicolumn{2}{c}{Mean (L2)} & \multicolumn{2}{c}{Vehicle (L2)} & \multicolumn{2}{c}{Pedestrian (L2)} & \multicolumn{2}{c}{Cyclist (L2)} \\  & & & mAP & mAPH & mAP & mAPH & mAP & mAPH & mAPH & latency \\ \hline \multirow{6}{*}{CP-} & Full Prec. & 32/32 & 65.78 & 60.32 & 65.92 & 65.42 & 65.65 & 55.23 & - & - & 26.01 \\ \cline{2-11}  & Brecq & 8/8 & 61.73 & 56.27 & 61.87 & 61.36 & 61.59 & 51.18 & - & - & 8.82 \\  & QDdrop & 8/8 & 63.60 & 58.14 & 63.74 & 63.23 & 63.46 & 53.04 & - & - & 8.82 \\  & PD-Quant & 8/8 & 64.59 & 59.06 & 64.87 & 64.21 & 64.32 & 53.91 & - & - & 8.82 \\ \hline \multirow{6}{*}{CP-} & QAT\({}^{\ddagger}\) & 8/8 & 65.56 & 60.08 & 65.69 & 65.17 & 65.44 & 54.99 & - & - & 8.82 \\  & LiDAR-PTQ & 8/8 & **65.50** & **60.12** & **65.64** & **65.14** & **65.85** & **58.11** & - & - & 8.82 \\ \hline \multirow{6}{*}{CP-} & Full Prec. & 32/32 & 67.67 & 65.25 & 66.29 & 65.79 & 68.04 & 62.35 & 68.69 & 67.61 & 30.64 \\ \cline{2-11}  & Brecq & 8/8 & 63.15 & 60.71 & 62.53 & 62.03 & 63.22 & 57.49 & 63.71 & 62.60 & 32.26 \\ \cline{1-1}  & QDdrop & 8/8 & 64.70 & 62.23 & 63.97 & 63.38 & 64.90 & 59.17 & 65.24 & 64.13 & 32.26 \\ \cline{1-1}  & PD-Quant & 8/8 & 66.45 & 64.00 & 65.11 & 64.56 & 66.91 & 61.18 & 67.32 & 66.25 & 32.26 \\ \hline \multirow{6}{*}{CP-} & QAT\({}^{\ddagger}\) & 8/8 & 67.63 & 65.20 & 66.28 & 65.76 & 67.98 & 62.28 & 68.62 & 67.55 & 32.26 \\ \cline{1-1}  & LiDAR-PTQ & 8/8 & **67.60** & **65.18** & **66.27** & **65.78** & **67.95** & **62.24** & **68.60** & **67.52** & 32.26 \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: Performance comparison on Waymo \(val\) set. \(\ddagger\): reimplementation by us.
+
+Due to there are no PTQ methods specially designed for 3D LiDAR-based detection tasks, we reimplement several advanced PTQ methods in 2D RGB-based vision tasks, which are BRECQ (Li et al., 2021), QDROP (Wei et al., 2022) and PD-Quant (Liu et al., 2023a). Specifically, we select well-known CenterPoint (Yin et al., 2021) as our full precision model and report the quantized performance on WOD dataset. Because it includes SPConv-based and SPConv-free models, which could effectively verify the generalization of our LiDAR-PTQ. As shown in Tab 3, LiDAR-PTQ achieves state-of-the-art performance and outperforms BRECQ and QDrop by a large margin of 3.87 and 2.00 on CenterPoint-Pillar model and 4.45 and 2.90 on CenterPoint-Voxel model. For PD-Quant, a state-of-the-art PTQ method specially designed for RGB-based vision tasks, but it has suboptimal performance on LiDAR-based tasks. Specifically, to solve the over-fitting problem on the calibration set, PD-Quant adjusts activation according to FP model's BN layer. However, for the point cloud which is more sensitive to the arithmetic range, this design is ineffective and time-consuming, and will lead to accuracy loss. Notably, our LiDAR-PTQ achieves on-par or even superior accuracy than the QAT model and almost without performance drop than the full precision model.
+
+### Ablation Study
+
+Here, we conduct ablation study of different components in our LiDAR-PTQ based on CenterPoint-Pillar model to verify their effects. As shown in Tab 4, based on the selected Max-min calibrator, we could obtain 5.48 mAPH/L2 performance gain by using a lightweight grid search method. However, grid search only minimizes reconstruction error in parameter space, which is not equivalent to minimize the final performance loss. Therefore, by introducing the proposed TGPL function to fine-tune quantization parameters in model space, the performance of quantized model could be 59.40 mAPH/L2. Finally, by introducing an adaptive rounding value, a freedom degree (Eq 10) is added to mitigate the final performance gap and achieve almost the same performance as the FP model (60.12 vs 60.32). Notably, the performance of FP model is the upper limit of the quantized model because we focus on post-training quantization without labeled training data.
+
+### Inference Acceleration
+
+Here, we compared the speed of CenterPoint before and after quantization on an NVIDIA Jetson AGX Orin. This is a resource-constrained edge GPU platform that is widely used in real-word self-driving cars. The speed of quantized model enjoying \(3\times\) inference speedup, which demonstrates that our LiDAR-PTQ can effectively improve the efficiency of 3D detection model on edge devices.
+
+### Computation Efficiency
+
+LiDAR-PTQ requires additional computation and fine-tuning process compared to other traditional PTQ methods, resulting in increased time costs. The time cost of quantization is shown in Tab. 4. While the quantization time is a limitation of LiDAR-PTQ, compared with other advanced PTQ methods, LiDAR-PTQ's additional time cost is acceptable. Furthermore, compared to quantization-aware training (QAT) method, the quantization time of LiDAR-PTQ is
+
+\begin{table}
+\begin{tabular}{l l c c c c c c c} \hline \hline \multirow{2}{*}{Models} & \multirow{2}{*}{Methods} & \multirow{2}{*}{Bits(W/A)} & \multicolumn{2}{c}{Mean (L2)} & \multicolumn{2}{c}{Vehicle (L2)} & \multicolumn{2}{c}{Pedestrian (L2)} \\  & & & mAP & mAPH & mAP & mAPH & mAP & mAPH \\ \hline \hline \multirow{4}{*}{CP-Pillar} & Full Prec. & 32/32 & 65.78 & 60.32 & 65.92 & 65.42 & 65.65 & 55.23 \\ \cline{2-9}  & Max-min & 8/8 & 57.33 & 52.91 & 55.64 & 55.37 & 59.02 & 50.45 \\  & +Grid S & 8/8 & 63.66 & 58.39 & 63.37 & 62.87 & 63.96 & 53.91 \\ \cline{1-1} \cline{2-9}  & +TGPL & 8/8 & 64.81 & 59.40 & 65.12 & 64.53 & 64.50 & 54.27 \\ \cline{1-1} \cline{2-9}  & +Round & 8/8 & **65.60** & **60.12** & **65.64** & **65.14** & **65.55** & **55.11** \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: Ablation study of different components of LiDAR-PTQ on Waymo \(val\) set.
+
+very short. For example, CenterPoint-Pillar will take 94 GPU/hour to achieve the same performance as the FP model on WOD dataset, while LiDAR-PTQ takes only 3 GPU/hour, which is 30 \(\times\) faster than the QAT method. It also proves that our LiDAR-PTQ is cost-effective.
+
+## 5 Related Work
+
+**Post-training Quantization (PTQ)** As mentioned in (Krishnamoorthi, 2018), existing quantization methods can be divided into two categories: (1) Quantization-Aware Training (QAT) and (2) Post-Training Quantization (PTQ). QAT methods (Wei et al., 2018; Li et al., 2019; Esser et al., 2019; Zhuang et al., 2020; Chen et al., 2021) require access to all labeled training data, which may not be feasible due to data privacy and security concerns. Compared to Quantization-aware Training (QAT) methods, Post-training quantization (PTQ) methods are simpler to use and allow for quantization with limited unlabeled data. Currently, there are many methods (Wu et al., 2020; Nahshan et al., 2021; Yuan et al., 2022; Liu et al., 2023b) designed for 2D vision tasks. AdaRound (Nagel et al., 2020) formulates the rounding task as a layer-wise quadratic unconstrained binary optimization problem and achieves a better performance. Based on AdaRound, BRECQ (Li et al., 2021) proposes utilizing block reconstruction to further enhance the accuracy of post-training quantization (PTQ). After that, QDrop (Wei et al., 2022) randomly drops the quantization of activations during PTQ and achieves new state-of-the-art accuracy. PD-Quant (Liu et al., 2023a) considers the global difference of models before and after quantization and adjusts the distribution of activation by BN layer statistics to alleviate the overfitting problem. However, these methods are specially designed for RGB images, and they are not readily transferable to LiDAR point cloud with substantial modal differences.
+
+**Quantization for 3D Object Detection** With the wide application of 3D object detection in autonomous driving and robotics, some quantization methods are designed to improve inference speed for onboard deployment applications. With the advance of quantization techniques based on RGB image, QD-BEV (Zhang et al., 2023) achieves smaller size and faster speed than baseline BevFormer (Li et al., 2022) using QAT and distillation on multi-camera 3D detection tasks. For LiDAR-based 3D detection, (Stacker et al., 2021) find that directly using INTS quantization for 2D CNN will bring significant performance drop on PointPillars Lang et al., 2019, where the reduction is even more severe for the entropy calibrator. Besides, BiPointNet (Qin et al., 2021) is a binarization quantization method, which focuses on classification and segmentation tasks based on point cloud captured from small CAD simulation. To the best of our knowledge, there is no quantization solution designed for the large outdoor LiDAR-based 3D object detection methods in self-driving.
+
+## 6 Conclusion and Future Work
+
+In this paper, we analyze the root cause of the performance degradation of point cloud data during the quantization process. Then we propose an effective PTQ method called LiDAR-PTQ, which is particularly designed for 3D LiDAR-based object detection tasks. Our LiDAR-PTQ features three main components: (**1**) a sparsity-based calibration method to determine the initialization of quantization parameters (**2**) a Task-guided Global Positive Loss (TGPL) to reduce the disparity on the final task. (**3**). an adaptive rounding-to-nearest operation to minimize the layer-wise reconstruction error. Extensive experiments demonstrate that our LiDAR-PTQ can achieve state-of-the-art performance on CenterPoint (both pillar-based and voxel-based). To our knowledge, for the very first time in lidar-based 3D detection tasks, the PTQ INT8 model's accuracy is almost the same as the FP32 model while enjoying \(3\times\) inference speedup. Moreover, our LiDAR-PTQ is cost-effective being \(30\times\) faster than the quantization-aware training method. Given its effectiveness and efficiency, we hope that our LiDAR-PTQ can serve as a valuable quantization tool for current mainstream grid-based 3D detectors and push the development of practical deployment of 3D detection models on edge devices. Besides, we believe that the low-bit quantization of 3D detectors will bring further efficiency improvement. This remains an open problem for future research.
+
+\begin{table}
+\begin{tabular}{c|c|c c c|c} \hline \hline Model & QAT & BRECQ & QDROP & PD-QUANT & LiDAR-PTQ (Ours) \\ \hline CenterPoint-Pillar & 93.82 & 1.93 & 1.82 & 6.72 & 2.75 \\ CenterPoint-Voxel & 80.51 & 1.73 & 1.64 & 6.13 & 2.12 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Time cost comparison on one Nvidia Tesla V100 (GPU/hour)
+
+## References
+
+* Banner et al. (2019) Ron Banner, Yury Nahshan, and Daniel Soudry. Post training 4-bit quantization of convolutional networks for rapid-deployment. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Caesar et al. (2020) Holger Caesar, Varun Bankiti, Alex Lang, Sourabh Vora, Venice Erin Liong, Qiang Xu, Anush Krishnan, Yu Pan, Giancarlo Baldan, and Oscar Beijbom. Nuscenes: A multimodal dataset for autonomous driving. pp. 11621-11631, 2020.
+* Chen et al. (2021) Peng Chen, Jing Liu, Bohan Zhuang, Mingkui Tan, and Chunhua Shen. Aqd: Towards accurate quantized object detection. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 104-113, 2021.
+* Choukroun et al. (2019) Yoni Choukroun, Eli Kravchik, Fan Yang, and Pavel Kisilev. Low-bit quantization of neural networks for efficient inference. In _2019 IEEE/CVF International Conference on Computer Vision Workshop (ICCVW)_, pp. 3009-3018. IEEE, 2019.
+* Esser et al. (2019) Steven K Esser, Jeffrey L McKinstry, Deepika Bablani, Rathinakumar Appuswamy, and Dharmendra S Modha. Learned step size quantization. _arXiv preprint arXiv:1902.08153_, 2019.
+* Jeon et al. (2022) Yongkweon Jeon, Chungman Lee, Eulrang Cho, and Yeonju Ro. Mr. biq: Post-training non-uniform quantization based on minimizing the reconstruction error. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 12329-12338, 2022.
+* Hongsheng Li Jiageng Mao (2023) Xiaogang Wang Hongsheng Li Jiageng Mao, Shaoshuai Shi. 3d object detection for autonomous driving: A comprehensive survey. _IJCV_, 2023.
+* Krishnamoorthi (2018) Raghuraman Krishnamoorthi. Quantizing deep convolutional networks for efficient inference: A whitepaper. _arXiv preprint arXiv:1806.08342_, 2018.
+* Lang et al. (2019) Alex H Lang, Sourabh Vora, Holger Caesar, Lubing Zhou, Jiong Yang, and Oscar Beijbom. Pointpillars: Fast encoders for object detection from point clouds. In _CVPR_, pp. 12697-12705, 2019.
+* Li et al. (2019) Rundong Li, Yan Wang, Feng Liang, Hongwei Qin, Junjie Yan, and Rui Fan. Fully quantized network for object detection. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 2810-2819, 2019.
+* Li et al. (2021) Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi Zhang, Fengwei Yu, Wei Wang, and Shi Gu. Brecq: Pushing the limit of post-training quantization by block reconstruction. 2021.
+* Li et al. (2022) Zhiqi Li, Wenhai Wang, Hongyang Li, Enze Xie, Chonghao Sima, Tong Lu, Yu Qiao, and Jifeng Dai. Bevformer: Learning bird's-eye-view representation from multi-camera images via spatiotemporal transformers. In _Computer Vision-ECCV 2022: 17th European Conference, Tel Aviv, Israel, October 23-27, 2022, Proceedings, Part IX_, pp. 1-18. Springer, 2022.
+* Lin et al. (2017) Tsung-Yi Lin, Priya Goyal, Ross Girshick, Kaiming He, and Piotr Dollar. Focal loss for dense object detection. In _Proceedings of the IEEE international conference on computer vision_, pp. 2980-2988, 2017.
+* Liu et al. (2023a) Jiawei Liu, Lin Niu, Zhihang Yuan, Dawei Yang, Xinggang Wang, and Wenyu Liu. Pd-quant: Post-training quantization based on prediction difference metric. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 24427-24437, 2023a.
+* Liu et al. (2023b) Yijiang Liu, Huanrui Yang, Zhen Dong, Kurt Keutzer, Li Du, and Shanghang Zhang. Noisyquant: Noisy bias-enhanced post-training activation quantization for vision transformers. 2023b.
+* Migacz (2017) Szymon Migacz. 8-bit inference with tensorrt. In _GPU technology conference_, volume 2, pp. 5, 2017.
+* Nagel et al. (2020) Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos, and Tijmen Blankevoort. Up or down? adaptive rounding for post-training quantization. In _International Conference on Machine Learning_, pp. 7197-7206. PMLR, 2020.
+* Liu et al. (2019)* Nagel et al. (2021) Markus Nagel, Marios Fournarakis, Rana Ali Amjad, Yelysei Bondarenko, Mart Van Baalen, and Tijmen Blankevoort. A white paper on neural network quantization. _arXiv preprint arXiv:2106.08295_, 2021.
+* Nahshan et al. (2021) Yury Nahshan, Brian Chmiel, Chaim Baskin, Evgenii Zheltonozhskii, Ron Banner, Alex M Bronstein, and Avi Mendelson. Loss aware post-training quantization. volume 110, pp. 3245-3262. Springer, 2021.
+* Neubeck & Van Gool (2006) Alexander Neubeck and Luc Van Gool. Efficient non-maximum suppression. In _18th International Conference on Pattern Recognition (ICPR'06)_, volume 3, pp. 850-855. IEEE, 2006.
+* Qin et al. (2021) Haotong Qin, Zhongang Cai, Mingyuan Zhang, Yifu Ding, Haiyu Zhao, Shuai Yi, Xianglong Liu, and Hao Su. Bipointnet: Binary neural network for point clouds. In _ICLR_, 2021.
+* Stacker et al. (2021) Lukas Stacker, Juncong Fei, Philipp Heidenreich, Frank Bonarens, Jason Rambach, Didier Stricker, and Christoph Stiller. Deployment of deep neural networks for object detection on edge ai devices with runtime optimization. In _Proceedings of the IEEE/CVF International Conference on Computer Vision Workshop_, pp. 1015-1022, 2021.
+* Sun et al. (2020) Pei Sun, Henrik Kretzschmar, Xerkes Dotiwalla, Aurelien Chouard, Vijaysai Patnaik, Paul Tsui, James Guo, Yin Zhou, Yuning Chai, Benjamin Caine, et al. Scalability in perception for autonomous driving: Waymo open dataset. pp. 2446-2454, 2020.
+* Wei et al. (2022) Xiuying Wei, Ruihao Gong, Yuhang Li, Xianglong Liu, and Fengwei Yu. Qdrop: randomly dropping quantization for extremely low-bit post-training quantization. 2022.
+* Wei et al. (2018) Yi Wei, Xinyu Pan, Hongwei Qin, Wanli Ouyang, and Junjie Yan. Quantization mimic: Towards very tiny cnn for object detection. In _Proceedings of the European conference on computer vision (ECCV)_, pp. 267-283, 2018.
+* Wu et al. (2020) Di Wu, Qi Tang, Yongle Zhao, Ming Zhang, Ying Fu, and Debing Zhang. Easyquant: Post-training quantization via scale optimization. _arXiv preprint arXiv:2006.16669_, 2020.
+* Yao et al. (2022) Hongyi Yao, Pu Li, Jian Cao, Xiangcheng Liu, Chenying Xie, and Bingzhang Wang. Rapq: Rescuing accuracy for power-of-two low-bit post-training quantization. _arXiv preprint arXiv:2204.12322_, 2022.
+* Yin et al. (2021) Tianwei Yin, Xingyi Zhou, and Philipp Krahenbuhl. Center-based 3d object detection and tracking. pp. 11784-11793, 2021.
+* Yuan et al. (2022) Zhihang Yuan, Chenhao Xue, Yiqi Chen, Qiang Wu, and Guangyu Sun. Ptq4vit: Post-training quantization for vision transformers with twin uniform quantization. pp. 191-207, 2022.
+* Zhang et al. (2023) Yifan Zhang, Zhen Dong, Huanrui Yang, Ming Lu, Cheng-Ching Tseng, Yandong Guo, Kurt Keutzer, Li Du, and Shanghang Zhang. Qd-bev: Quantization-aware view-guided distillation for multi-view 3d object detection. 2023.
+* Zhu et al. (2019) Benjin Zhu, Zhengkai Jiang, Xiangxin Zhou, Zeming Li, and Gang Yu. Class-balanced grouping and sampling for point cloud 3d object detection. _arXiv preprint arXiv:1908.09492_, 2019.
+* Zhuang et al. (2020) Bohan Zhuang, Lingqiao Liu, Mingkui Tan, Chunhua Shen, and Ian Reid. Training quantized neural networks with a full-precision auxiliary module. In _Proceedings of the IEEE/CVF conference on computer vision and pattern recognition_, pp. 1488-1497, 2020.

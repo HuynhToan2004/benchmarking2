@@ -1,0 +1,306 @@
+Compress, Then Prompt: Improving Accuracy-Efficiency Trade-off of LLM Inference with Transferable Prompt
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+While the numerous parameters in Large Language Models (LLMs) contribute to their superior performance, this massive scale makes them inefficient and memory-hungry. Thus, they are hard to deploy on the commodity hardware, such as one single GPU. Given the memory and power constraints of such devices, model compression methods are widely employed to reduce the model size and inference latency, which essentially trades off model quality in return for improved efficiency. Thus, optimizing this accuracy-efficiency trade-off is crucial for the LLM deployment on commodity hardware. In this paper, we introduce a new perspective to optimize this trade-off by prompting compressed models. Specifically, we first observe that for certain questions, the generation quality of a compressed LLM can be significantly improved by adding carefully designed hard prompts, though this isn't the case for all questions. Based on this observation, we propose a soft prompt learning method where we expose the compressed model to the prompt learning process, aiming to enhance the performance of prompts. Our experimental analysis suggests our soft prompt strategy greatly improves the performance of the \(8\times\) compressed Llama-7B model (with a joint 4-bit quantization and 50% weight pruning compression), allowing them to match their uncompressed counterparts on popular benchmarks. Moreover, we demonstrate that these learned prompts can be transferred across various datasets, tasks, and compression levels. Hence with this transferability, we can stitch the soft prompt to a newly compressed model to improve the test-time accuracy in an "in-situ" way.
+
+## 1 Introduction
+
+Large Language Models (LLMs) (Radford et al., 2018, 2019; Brown et al., 2020; Zhang et al., 2022; Touvron et al., 2023a) has revolutionized the field of Natural Language Processing (NLP). Notably, LLMs are known for their in-context learning ability, allowing them to generalize to unseen tasks without additional fine-tuning (Brown et al., 2020). Specifically, LLMs are controlled through user-provided natural language specifications of the task, or _prompts_, which illustrate how to complete a task. Equipped with the in-context learning ability, we only need to serve a single large model to efficiently handle different tasks. Despite of their remarkable adaptability, LLMs are very expensive to deploy (Chen et al., 2023; Wu et al., 2023). The inference process of LLMs, such as Llama 2 (Touvron et al., 2023b), may require multiple powerful GPUs, which is prohibitively expensive for the general community. Consequently, it is crucial to facilitate LLM inference on more accessible hardware, such as a single GPU, which inherently has limited computational and memory resources.
+
+To address this problem, model compression methods are widely employed to reduce the model size and inference latency, such as quantization (Nagel et al., 2020; Dettmers et al., 2022; Xiao et al., 2022; Frantar et al., 2022) and pruning (Frantar and Alistarh, 2023). These methods essentially trade off model quality in return for reduced latency and model size. Thus, there is an inevitable trade-off between accuracy and efficiency, resulting in a noticeable reduction in the model's accuracy and, consequently, the overall performance benefits of LLMs. To get a sense, as shown in Figure 1, the full model (LLaMA-7B) is able to provide accurate answers to all three simple questions. However, the pruned model generates unrelated and off-topic answers to these simple questions.
+
+Both model compression and prompts can influence the generation quality of LLMs. Thus intuitively, we can also utilize the prompt to help the compressed model generate more relevant answers. To the best of our knowledge, this perspective is not fully explored for LLMs. Thus one natural question is, _for a compressed model, can we design a prompt that helps it correct its predictions accordingly?_
+
+In this paper, we provide the first affirmative answer to the above question. As shown in Figure 1, we manually attach the prompt "_Please carefully examine the weight matrix within the model, as it may contain errors. It is crucial to verify its accuracy and make any necessary adjustments to ensure optimal performance_" to the original question. The prompted pruned model, i.e., "LLaMA-7B (62.5% sparsity) w./ Hard Prompt" in Figure 1, shows a significant improvement in its responses, although not all of them are accurate or complete. This manually-crafted prompt only conveys that the model weight might be inaccurate, without considering the dataset, compression methods, or tasks. This finding highlights the considerable potential for the transferability of this "hard prompt" across datasets, compression levels, and tasks. Despite the potential, this manually designed prompt is not consistently effective. Inspired by previous learnable prompt works (Li and Liang, 2021; Lester et al., 2021), we hypothesize that by involving the compressed weight in the prompt learning process, a learnable prompt could potentially surpass the performance of the manually-designed prompt, while maintaining the transferability. Building upon this insight, we introduce a paradigm of prompt learning that seeks to train additive prompt tokens on a compressed LLM to enhance its accuracy. We underscore that the key contribution of our prompt learning approach over the conventional prompt tuning (Li and Liang, 2021; Lester et al., 2021; Tang, 2023) is that earlier methods learn the prompt on task-specific dataset to adapt the model for the corresponding task. Thus they often show poor transferability across different domains and tasks. In contrast, the learned prompt in this paper resembles the hard prompt in Figure 1, which can be transferred between various tasks and even compression methods.
+
+Our experimental analysis suggests our method greatly improves the performance of the \(8\times\) compressed Llama-7B model (with a joint 4-bit quantization and 50% weight pruning compression), allowing them to match their uncompressed counterparts on several standard benchmarks. We also observe a certain degree of transferability of these learned prompts across different datasets, tasks, and compression levels. Moreover, we show that compared to other parameter-efficient fine-tuning methods like LoRA (Hu et al., 2021), our approach has less cost in recovering the performance of compressed LLMs.
+
+## 2 Problem Statement and Related Work
+
+In this section, we will begin by introducing the efficiency bottleneck of LLM inference. Then we will introduce current approximation approaches that are designed to reduce the computation and
+
+Figure 1: The hard prompt enables compressed LLMs to regain commonsense. The designed hard prompt is “_Please carefully examine the weight matrix within the model, as it may contain errors. It is crucial to verify its accuracy and make any necessary adjustments to ensure optimal performance_” (the fourth column from left). We highlight the improved answers with green color.
+
+memory overhead and improve LLM inference latency. Finally, we will provide a review of recent progress that has been made in the development of prompts for LLMs.
+
+### Efficiency Bottleneck of LLM Inference
+
+LLMs adopt a decoder-only, autoregressive approach where token generation is carried out step by step, with each token's generation dependent on the previously generated results. For instance, models such as GPT Radford et al. (2018, 2019); Brown et al. (2020) follow this paradigm. A recent study by Liu et al. (2023) investigates the inference process of OPT-175B models and finds that (1) token generation is the dominant factor contributing to the inference latency, and (2) Multilayer Perceptron (MLP) incurs higher I/O and computation latency compared to attention blocks during token generation. While system-level optimizations Sheng et al. (2023); GitHub (2023a;b) can enhance the inference time of LLMs, they do not directly mitigate the computation and memory I/Os involved in the LLM inference process.
+
+### Approximation in LLM Inference
+
+In addition to optimizing at the system level, there are two primary approaches for reducing both computation and memory I/O to minimize the latency inference. (1) Sparse modeling: the general idea is to choose a particular set of weights in certain layers to minimize both computation and memory I/O (Frantar & Alistarh, 2023; Liu et al., 2023). These techniques are also closely related to pruning (He et al., 2018; Hubara et al., 2021; Kwon et al., 2022; Hubara et al., 2021) in the literature. Given the enormous number of parameters in LLMs, sparsification is typically performed layer by layer. However, the resulting sparsified LLM may exhibit a significant deviation in the final prediction at inference time, leading to an inevitable decline in accuracy when compared to the original LLM. (2) Quantization: it refers to the process of compressing trained weight values in LLMs into lower bits (Nagel et al., 2020; Dettmers et al., 2022; Xiao et al., 2022; Frantar et al., 2022). Empirical evaluations have shown that int8 quantization can provide a great approximation of the predictive performance of the original LLMs (Dettmers et al., 2022). However, there is a significant decline in accuracy when attempting to reduce the number of bits even further.
+
+### Prompt for LLMs
+
+LLMs are known for their in-context learning ability, allowing them to generalize to unseen tasks without additional fine-tuning (Brown et al., 2020). Specifically, LLMs are controlled through user-provided natural language specifications of the task, or _prompts_, which illustrate how to complete a task. In this paradigm, we do not enforce modifications on the LLMs themselves. Instead, we focus on adapting the inputs to the LLMs for better predictive performance in downstream tasks. A typical strategy is to insert tokens before the input sequence to affect the attention mechanism. It has been shown in (Brown et al., 2020) that prompt engineering enables LLMs to match the performance of fine-tuned language models on a variety of language understanding tasks. Moreover, (Lester et al., 2021) empirically indicate that there is an equivalence between modifying the input and fine-tuning the model. Furthermore, (Su et al., 2022) studies the transferability of prompts across similar datasets or even tasks. Since then, we have witnessed the growth of prompt tuning infrastructure (Ding et al., 2022). However, we would like to emphasize that most of the current demonstrations of prompt tuning are task-specific (Li & Liang, 2021; Lester et al., 2021). When considering efficiency, it is desirable for a prompt to exhibit transferability across various settings.
+
+## 3 Motivation
+
+The compression methods reduce the computational complexity at the cost of giving less accurate outputs. Thus, there naturally exists an **accuracy-efficiency trade-off**. In this section, we first empirically evaluate the trade-off of compressed LLMs. Then we found that for a compressed model, we can manually design a hard prompt that informs the model of its compressed state and helps it correct its predictions accordingly.
+
+### Performance of the Existing Approaches
+
+**Experimental Setup.** We assess the trade-off using LLaMA (Touvron et al., 2023a) on C4 dataset (Raffel et al., 2020). Here we adopt two representative post-training compression methods, i.e., GPTQ (Frantar et al., 2022) and SparseGPT (Frantar & Alistarh, 2023), to analyze the trade-off across various compression levels. We note that we choose post-training compression methods primarily for their ease of deployment. For the quantization method, we apply GPTQ to compress the model weights into 2, 3, and 4 bits integer numbers. As for the pruning method, we employ SparseGPT to eliminate 50%, 62.5%, and 75% of the model parameters. We would like to note that the post-training compression is conducted using the training set of C4, and subsequently, we evaluate the performance of the compression with the validation set of C4.
+
+**Quantitative Results.** As shown in Figure 2, we visualize the evaluation perplexity (PPL) (Jelinek et al., 1977) versus the compression level. When we prune 50% of the parameters or quantize the parameters to 4 bits, the PPL remains closer to that of the full LLaMA model. The PPL consistently increases as we decrease the allocated resource (e.g., bit-width/sparsity). Notably, the PPL will explode when the resource is below a certain threshold. For instance, the PPL shifts from 14 to 53 as sparsity increases from 62.5% to 75%. Moreover, the PPL grows significantly from around 11 to around 691 when we lower the quantization bits from 3-bit to 2-bit.
+
+**Qualitative Results.** As shown in the left part of Figure 1, besides PPL, we also do a case study to understand how compression affects model generation results. In this example, the full model is able to provide accurate and relevant answers to all three simple questions. Specifically, it correctly identifies Long Beach as a city in Los Angeles County, California, pinpoints Tulsa in northeastern Oklahoma, and describes asparagus as a spring vegetable belonging to the lily family. However, the pruned model with 62.5% weight sparsity struggles to generate meaningful responses. Instead of providing the requested information, its answers seem unrelated and tangential. For example, the pruned model responds with a statement about seeking a job when asked about Long Beach, mentions being a student at the University of Tulsa when asked about Tulsa's location, and admits uncertainty about Asparagus. This case study demonstrates that **aggressive model compression, such as the 62.5% weight sparsity applied to the pruned model, can lead to a significant degradation in the quality of generated responses.**
+
+### Prompt Compressed Models
+
+In-context learning refers to the ability of adapting to the context provided within the input data through user-provided natural language specifications (Xie et al., 2022; Min et al., 2022), often referred to as _prompts_. Prompts serve to guide LLMs toward generating desired predictions by offering useful contextual information. As shown in Figure 1, the compressed model generates answers that are unrelated and off-topic when responding to these simple questions. Thus one natural question is, _for a compressed model, can we design a specific prompt that helps it correct its predictions accordingly?_
+
+Following the question, we manually design the hard prompt as "_Please carefully examine the weight matrix within the model, as it may contain errors. It is crucial to verify its accuracy and make any necessary adjustments to ensure optimal performance_". The results are shown in the fourth column of Figure 1. The observations are summarized as follows:
+
+**The prompted pruned model, i.e., "LLaMA-7B (62.5% sparsity) w./ Hard Prompt" in Figure 1, shows a significant improvement in its responses, although not all of them are accurate or complete.** Specifically, (1) when explicitly told about its compressed state, the prompted pruned model correctly identifies that Long Beach is located in the United States. However, it does not provide further information about the city, such as its presence in Los Angeles County, California. (2) Regarding the second question about Tulsa, Oklahoma, the prompted pruned model fails to provide a
+
+Figure 2: The validation perplexity of LLaMA-7B on C4 dataset at different compression level. The green line is the PPL of the original model.
+
+relevant answer, instead repeating our prompt about the compression state, which is unrelated to the question. (3) When asked about asparagus, the prompted pruned model correctly identifies it as a plant used for cooking.
+
+**Insights.** By explicitly informing the model of its compressed state, LLMs can generate more relevant responses for certain questions. The success of the designed prompt implies three great potentials:
+
+1. **Cross-Dataset Transferability.** This human-designed prompt only provides the information that model weight is inaccurate. So intuitively, irrespective of the specific dataset being used, we hypothesize that the LLMs can generate more relevant responses with the same prompt.
+2. **Cross-Compression Transferability.** Similarly, the human-designed prompt only mentions that the weight is inaccurate, without specifying the exact compression level or method. We hypothesize that LLMs can generate more relevant responses with the same prompt across different compression levels and methods.
+3. **Cross-Task Transferability.** If LLMs can understand their compressed state and adjust accordingly, this adaptability is not limited to specific tasks or problem domains. Instead, it can be extended to a wide range of tasks.
+
+However, despite the potential, as we analyzed at the beginning of this section, the manually designed prompt is not consistently effective. In other words, it only works for some problems, and not all answers generated are accurate or complete. Inspired by previous learnable prompt work (Li & Liang, 2021; Lester et al., 2021), we hypothesize that by involving the compressed weight in the prompt learning process, a learnable prompt could potentially surpass the performance of the hard prompt while still retaining the transferability aspects of the hard prompt.
+
+## 4 Learning Prompt for Efficient LLM Inference
+
+In this section, we will begin by introducing the formulation of the prompt learning paradigm. Then, we will shift our focus to the maximum likelihood objective of learning the prompt. Finally, we will delve into the transferability of the learned prompts.
+
+### Formulation
+
+Section 3.2 has shown that incorporating prompts can enhance the predictive performance of compressed LLMs. However, discovering effective language-based prompts through trial and error is a cumbersome and inefficient process that requires exploring a vast vocabulary space. Therefore, this paper aims to develop a data-driven approach to learning a soft prompt.
+
+Typically an LLM would have a tokenizer that maps each input sentence into a sequence of integers \([x_{0},x_{1},\cdots,x_{n}]\). Afterwards, each token \(x_{i}\in[v]\) represents a \(d\)-dimensional row vector in the embedding matrix \(W\in\mathbb{R}^{v\times d}\). In the inference phase of LLM, we are given an input sequence \([x_{0},x_{1},\cdots,x_{m}]\) with \(m\) tokens. We would like to generate tokens after \(x_{m}\) step by step using an LLM. We denote prompt as a sequence of integers \([e_{1},e_{2},\cdots,e_{k}]\) with length \(k\). Every token \(e_{j}\in[k]\) represents a \(d\)-dimensional row vector in the prompt embedding matrix \(E\in\mathbb{R}^{k\times d}\).
+
+### Learning Objectives
+
+In this study, we present a prompt learning strategy that can be utilized as a post-training process for compressed LLMs. Given an LLM model with parameters denoted as \(\theta\), we start with either sparsification (Frantar & Alistarh, 2023; Liu et al., 2023) or quantization (Frantar et al., 2022) approach that compresses the model parameters. We denote the parameters after the compression as \(\tilde{\theta}\). We note that prompt learning is reliant on the data, and as such, we need to employ a text dataset \(X\) for this procedure. Next, for every sequence \([x_{0},x_{1},\cdots,x_{n}]\in X\), we insert \(k\) prompt tokens \([e_{1},e_{2},\cdots,e_{k}]\) before it. Next, we optimize the following objective.
+
+\[\min_{E}\mathcal{L}_{\tilde{\theta}}=\min_{E}\sum_{t=1}^{n}-\log\Pr_{\tilde{ \theta}}[x_{t}|e_{1},\cdots,e_{k},x_{0},\cdots x_{t-1}]. \tag{1}\]
+
+We note that the model parameter \(\widetilde{\theta}\) is fixed and not updated. And the trainable parameters are the embedding of the prompt tokens \([e_{1},e_{2},\cdots,e_{k}]\), which are denoted by the matrix \(E\in\mathbb{R}^{k\times d}\).
+
+Following (Lester et al., 2021), we initialize \(E\) such that each row in \(E\) corresponds to a vector randomly selected from the token embedding matrix \(W\) of the LLM. The prompt token sequence remains the same for all sequences in \(X\). This means that we use the representation of prompt tokens to influence LLM's attention mechanisms between the tokens in the sequence \([x_{0},x_{1},\cdots,x_{n}]\). Specifically, the Eq (1) aims to maximize the likelihood of correctly predicting the next token in the sequence, given the preceding tokens. In this way, the learned prompt is aware of the compressed weights, as the gradient flows through these compressed weights during the optimization process. This allows the model to adapt its behavior to account for the compression effects while generating responses, potentially leading to improved performance.
+
+### Transferability of Learned Prompt
+
+The findings derived from Section 3.2 have provided us with a compelling impetus to delve into the exploration of the transferability of prompt tokens acquired through Eq (1). The representation of these prompt tokens, as well as their acquisition through one dataset, could have a significant impact on other NLP applications. Specifically, we have chosen to concentrate on the scenarios below.
+
+**Cross-Dataset Transferability.** We aim to investigate whether prompt tokens trained from one dataset are applicable to other datasets. Prompt learning, while more efficient than fine-tuning, necessitates significant computational power and memory. With a single Nvidia-A100 possessing 40GB of memory, only the prompt learning of the LLaMA-7B model using a batch size of 1, sequence length of 1024, and 100 prompt tokens can be supported. If we perform a single round of prompt learning for a compressed LLM and achieve favorable outcomes across various datasets, we can substantially enhance the accuracy-efficiency trade-offs of the LLM during inference.
+
+**Cross-Compression Transferability.** We aim to investigate the feasibility of utilizing learned prompts trained from a compressed LLM to another compressed LLM with different compression levels. For instance, we assess whether a prompt trained on a sparse LLM with a 75% sparsity can effectively boost the performance of an LLM with a 50% weight sparsity. Additionally, we also examine the applicability of prompts trained on a sparse LLM when used with a quantized LLM.
+
+**Cross-Task Transferability.** We aim to investigate whether the learned prompt trained from Eq (1) on token generation tasks can be applied to other NLP tasks. This exploration will prove the effectiveness of prompts in improving the accuracy-efficiency trade-offs in the zero-shot generalization of LLMs in downstream tasks such as question answering.
+
+## 5 Experiment
+
+In this section, we assess the effectiveness of our prompt strategy in enhancing the trade-off between accuracy and efficiency during LLM inference. We commence by outlining the experimental setup, followed by presenting the results of token generation. Furthermore, we investigate the transferability of prompts across different datasets and compression levels. For additional experiments related to transferability and efficiency, please refer to Appendix A, where we have included further details.
+
+### Experiment Setting
+
+In our experimental framework, we incorporated the use of an Nvidia V100 GPU to conduct inference and prompt learning in LLMs. The datasets we utilized for token generation were comprehensive, including the Common Crawl's web corpus (C4) Raffel et al. (2020), Wikitext-2 Merity et al. (2017), and the Penn Treebank (PTB) Marcus et al. (1994) databases. We set the sequence length for these datasets to 1024. For the token generation task, we use perplexity (PPL) Jelinek et al. (1977) as the evaluation metric. We also introduce some downstream tasks to evaluate the cross-task transferability of the learned prompt. We will introduce the task information in the specific section. At the core of our modeling approach, we adopted the Open Pre-trained Transformer (OPT) Language Models (Zhang et al., 2022) and Large Language Model Architecture (LLaMA) (Touvron et al., 2023). To compress the OPT and LLaMA model, we employed techniques from both SparseGPT (Frantar & Alistarh, 2023) and GPTQ (Frantar et al., 2022) methodologies. We refer the readers to Appendix A.1 for more experimental details.
+
+### Token Generation Results
+
+On the C4 training set, we compress the OPT-1.3B, OPT-2.7B, OPT-6.7B, and LLaMA-7B using SparseGPT (Frantar & Alistarh, 2023). We utilize sparsity levels of 50%, 62.5%, and 75% for compression. Additionally, we employ GPTQ (Frantar et al., 2022) for 2-bit, 3-bit, and 4-bit quantization. Furthermore, prompt learning is applied to each compressed model using the methodology introduced in Eq (1). We set \(k\) in Eq. 1 to 100, i.e., incorporating 100 learnable prompt tokens. We also conduct the ablation on the impact of the number of soft tokens in Appendix A.6. We note that the whole xprompt tuning process can be done in five hours with on four RTX 8000 48G GPUs.
+
+Figure 3 demonstrates the impact of our approach on the validation set of C4. We observe a significant improvement in PPL across all compression levels. Firstly, by employing soft prompt tokens, the compressed LLMs using SparseGPT with 50% sparsity even outperform the full model counterparts, exhibiting lower PPL. This trend is also observed in the 4-bit quantization of LLMs using GPTQ. Secondly, even with further enhanced compression, the compressed LLMs with soft prompt tokens learned from Eq (1) still maintain comparable PPL to their original counterparts. Notably, prompts learned from each of the four 3-bit quantized models aid in surpassing the performance of their respective full model counterparts. We also observe a similar effect in sparse models with 62.5% sparsity for OPT-1.3B and OPT-2.7B. Conversely, prompts learned from both OPT-6.7B and LLaMA-7B assist in achieving the same PPL as their full model counterparts. Lastly, our approach significantly enhances the predictive performance of extreme scale compression. In both SparseGPT with 75% sparsity and GPTQ with 2-bit quantization, we find that the prompt learning strategy substantially improves the PPL across all four models. For example, prompts learned over the 2-bit GPTQ compression of OPT-1.3B reduce the PPL from 2337.8 to 59.
+
+### Cross-Dataset Transferability
+
+Intuitively, a model compressed using one dataset should achieve decent predictive performance when transferred to other datasets (Frantar et al., 2022; Frantar & Alistarh, 2023). Here we assess whether the prompt tokens learned from one dataset exhibit similar transferability across different datasets. Specifically, we first compress a model with SparseGPT or GPTQ using C4 training set. We then learn the prompt with the compressed model on C4 training set. Finally, we evaluate the performance of this compressed model with and without the learned prompts on other datasets, e.g., Wikitext-2 and PTB dataset. **We emphasize the entire process does not involve any task-specific data, and our results thus remain "zero-shot".**
+
+Figure 4 presents the performance of OPT-1.3B, OPT-2.7B, OPT-6.7B, and LLaMA-7B on the test set of Wikitext-2 and the PTB dataset. For each LLM model, we also include the performance of its compressed versions with 50%, 62.5%, and 75% sparsity using SparseGPT. Additionally, we include the performance of each model's compressed version with 2-bit, 3-bit, and 4-bit quantization using GPTQ. The figures demonstrate the consistent advantages of prompt tokens across the two datasets. For every model with 50% sparsity or 4-bit quantization, learning prompts from the C4 dataset result in a lower PPL compared to the full model counterpart. Moreover, we observe a substantial
+
+Figure 3: OPT-1.3B, OPT-2.7B, OPT-6.7B, and LLaMA-7B on C4 dataset, validation set at different bit-width and sparsity. Here the “Baseline” (green line) represents the uncompressed model.
+
+improvement in PPL when using learned prompt tokens as the model becomes more compressed. This phenomenon validates that the prompts learned on top of compressed models can be effectively transferred across datasets.
+
+We also compare the transferred soft prompts against the soft prompts that are directly trained on the downstream dataset. Given direct prompt receives a domain-specific loss, our transferred prompt is, as expected, not as competitive as the direct one. However, such transferred prompt may significantly bridge the gap between a compressed and full model -- e.g., our 3-bit & 4-bit quantized LLaMA-7B with transferred prompt can deliver on-par or better PPL than the full model on PTB and Wikitext2. We'd say this is an especially worthy contribution in practice, as one may possibly download the open-sourced transferable prompt to help on a compressed model with little effort.
+
+Here we emphasize that the prompt trained with a domain-specific loss can no longer be transferred between different datasets. Below we present the results of transferring the soft prompts learned on Wikitext2 ( featured articles on Wikipedia) to PTB (Wall Street Journal material) and C4 (collection of common web text corpus). The results, as shown in the table below, highlight a significant disparity in performance when using domain-specific prompts across different domains. The prompt trained on Wikitext-2, when applied to PTB and C4, leads to a drastic increase in perplexity, indicating a severe degradation in model performance. In contrast, if the prompt is learned on general text datasets like C4, then it can be transferred to different domains e.g., PTB and Wikitext2, and tasks, e.g., QA and language understanding (Appendix A.3).
+
+\begin{table}
+\begin{tabular}{c|c c} \hline \hline Model & PTB & Wikitext2 \\ \hline Full Model & 11.02 & 6.33 \\ \hline Full Model w./ direct prompt & 6.86 & 5.57 \\ \hline \multirow{3}{*}{4-bit} & w./o. prompt & 11.65 & 6.92 \\ \cline{2-3}  & w./ direct prompt & 7.04 & 5.88 \\ \cline{2-3}  & w./ transferred prompt & 9.25 & 6.26 \\ \hline \multirow{3}{*}{3-bit} & w./o. prompt & 15.74 & 9.45 \\ \cline{2-3}  & w./ direct prompt & 7.76 & 6.33 \\ \cline{2-3}  & w./ transferred prompt & 10.81 & 6.90 \\ \hline \multirow{3}{*}{2-bit} & w./o. prompt & 5883.13 & 2692.81 \\ \cline{2-3}  & w./ direct prompt & 14.98 & 16.67 \\ \cline{1-1} \cline{2-3}  & w./ transferred prompt & 29.82 & 20.56 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Perplexity comparison between full model and quantized models with different prompts, where we report test perplexity on PTB and Wikitext-2 dataset. “w./o. prompt” refers to the quantized model without soft prompts.“w./ direct prompt” means the soft prompts are directly trained on the target dataset.“w./ transferred prompt” means the prompt is trained on C4 dataset and then transferred to the target dataset.
+
+\begin{table}
+\begin{tabular}{c c c} \hline \hline
+**Model** & **PTB** & **C4** \\ \hline Full Model & 11.02 & 7.59 \\
+3-bit w./o. prompt & 15.74 & 10.74 \\
+3-bit w./ prompt learned on Wikitext2 & 294.16 & 160.64 \\
+3-bit w./ prompt learned on C4 & **10.81** & **7.48** \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Perplexity comparison of transferring prompts learned on Wikitext2 to PTB and C4.
+
+### Combination of Sparsification and Quantization
+
+In this section, we explore the effectiveness of the prompt strategy in the combination of sparsification and quantization for compressing LLM. Since sparsification and quantization target different aspects of compression, it is natural to combine them to achieve better efficiency. Table 3 presents the PPL before and with, and without the learned prompt on the validation set of C4, as well as the test sets of Wikitext-2 and PTB. We choose the LLaMA-7B model compressed using 50% sparsity and 4-bit quantization from the training set of C4. We should note that the prompt learning process also takes place on the training set of C4. Our results demonstrate that the prompt learning strategy remains effective when combining sparsification and quantization. Additionally, with the prompt, the 50% sparse and 4-bit compressed model still performs comparably to the original LLaMA-7B.
+
+## 6 Conclusion
+
+In this paper, we optimize the trade-off between computational efficiency and accuracy in LLMs via prompting compressed models. We propose a soft prompt learning method where we expose the compressed model to the prompt learning process. Our experimental analysis suggests our soft prompt strategy greatly improves the performance of the compressed models, allowing them to match their uncompressed counterparts. The research also highlights the transferability of these learned prompts across different datasets, tasks, and compression levels.
+
+Figure 4: OPT-1.3B, OPT-2.7B, OPT-6.7B, and LLaMA-7B on Wikitext-2 and PTB test set at different bit-width and sparsity. Here the “Baseline” (green line) represents the uncompressed model.
+
+\begin{table}
+\begin{tabular}{c c c c} \hline \hline Models & C4 & Wikitext-2 & PTB \\ \hline Full & 7.59 & 6.34 & 11.02 \\ \hline
+50\% + 4-bit (w./o. prompt) & 10.94 & 9.67 & 17.39 \\
+50\% + 4-bit (w./ prompt) & **7.38** & 7.31 & **10.64** \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: The PPL of joint 50% sparsity + 4-bit quantization with learned prompts on the validation set of C4 and a test set of Wikitext-2 and PTB. The prompt is learned on C4 training set.
+
+## References
+
+* Bisk et al. (2020) Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng Gao, and Yejin Choi. PIQA: reasoning about physical commonsense in natural language. In _The Thirty-Fourth AAAI Conference on Artificial Intelligence, AAAI 2020, The Thirty-Second Innovative Applications of Artificial Intelligence Conference, IAAI 2020, The Tenth AAAI Symposium on Educational Advances in Artificial Intelligence, EAAI 2020, New York, NY, USA, February 7-12, 2020_, pp. 7432-7439. AAAI Press, 2020. URL [https://ojs.aaai.org/index.php/AAAI/article/view/6239](https://ojs.aaai.org/index.php/AAAI/article/view/6239).
+* Brown et al. (2020) Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. _Advances in neural information processing systems_, 33:1877-1901, 2020.
+* Chen et al. (2023) Lingjiao Chen, Matei Zaharia, and James Zou. Frugalgrt: How to use large language models while reducing cost and improving performance. _arXiv preprint arXiv:2305.05176_, 2023.
+* Dettmers et al. (2022) Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Llm. int8 (): 8-bit matrix multiplication for transformers at scale. _arXiv preprint arXiv:2208.07339_, 2022.
+* Ding et al. (2022) Ning Ding, Shengding Hu, Weilin Zhao, Yulin Chen, Zhiyuan Liu, Haitao Zheng, and Maosong Sun. Openprompt: An open-source framework for prompt-learning. In _Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics: System Demonstrations_, pp. 105-113, 2022.
+* Frantar & Alistarh (2023) Elias Frantar and Dan Alistarh. Sparsegpt: Massive language models can be accurately pruned in one-shot, 2023.
+* Frantar et al. (2022) Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training quantization for generative pre-trained transformers. _arXiv preprint arXiv:2210.17323_, 2022.
+* Gao et al. (2021) Leo Gao, Jonathan Tow, Stella Biderman, Sid Black, Anthony DiPofi, Charles Foster, Laurence Golding, Jeffrey Hsu, Kyle McDonnell, Niklas Muenninghoff, Jason Phang, Laria Reynolds, Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. A framework for few-shot language model evaluation, September 2021. URL [https://doi.org/10.5281/zenodo.5371628](https://doi.org/10.5281/zenodo.5371628).
+* GitHub (2023a) GitHub. [https://github.com/mlc-ai/mlc-llm](https://github.com/mlc-ai/mlc-llm), 2023a.
+* GitHub (2023b) GitHub. [https://github.com/mlc-ai/web-llm](https://github.com/mlc-ai/web-llm), 2023b.
+* Gugger et al. (2022) S Gugger, L Debut, T Wolf, P Schmid, Z Mueller, and S Mangrulkar. Accelerate: Training and inference at scale made simple, efficient and adaptable. [https://github.com/huggingface/accelerate](https://github.com/huggingface/accelerate), 2022.
+* He et al. (2018) Yihui He, Ji Lin, Zhijian Liu, Hanrui Wang, Li-Jia Li, and Song Han. Amc: Automl for model compression and acceleration on mobile devices. In _Proceedings of the European conference on computer vision (ECCV)_, pp. 784-800, 2018.
+* Hendrycks et al. (2020) Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt. Measuring massive multitask language understanding. _arXiv preprint arXiv:2009.03300_, 2020.
+* Hu et al. (2021) Edward J Hu, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, Weizhu Chen, et al. Lora: Low-rank adaptation of large language models. In _International Conference on Learning Representations_, 2021.
+* Hubara et al. (2021a) Itay Hubara, Brian Chmiel, Moshe Island, Ron Banner, Joseph Naor, and Daniel Soudry. Accelerated sparse neural training: A provable and efficient method to find n: m transposable masks. _Advances in Neural Information Processing Systems_, 34:21099-21111, 2021a.
+* Hubara et al. (2021b) Itay Hubara, Yury Nahshan, Yair Hanani, Ron Banner, and Daniel Soudry. Accurate post training quantization with small calibration sets. In _International Conference on Machine Learning_, pp. 4466-4475. PMLR, 2021b.
+
+* Jelinek et al. (1977) Fred Jelinek, Robert L Mercer, Lalit R Bahl, and James K Baker. Perplexity--a measure of the difficulty of speech recognition tasks. _The Journal of the Acoustical Society of America_, 62(S1):S63-S63, 1977.
+* Kwon et al. (2022) Woosuk Kwon, Sehoon Kim, Michael W Mahoney, Joseph Hassoun, Kurt Keutzer, and Amir Gholami. A fast post-training pruning framework for transformers. _arXiv preprint arXiv:2204.09656_, 2022.
+* Lester et al. (2021) Brian Lester, Rami Al-Rfou, and Noah Constant. The power of scale for parameter-efficient prompt tuning. In _Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing_, pp. 3045-3059, 2021.
+* Li & Liang (2021) Xiang Lisa Li and Percy Liang. Prefix-tuning: Optimizing continuous prompts for generation. _arXiv preprint arXiv:2101.00190_, 2021.
+* Liu et al. (2023) Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song, Anshumali Shrivastava, Ce Zhang, Yuandong Tian, Christopher Re, and Beidi Chen. Deja vu: Contextual sparsity for efficient lms at inference time. In _International Conference on Machine Learning_. PMLR, 2023.
+* Loshchilov & Hutter (2019) Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In _7th International Conference on Learning Representations, ICLR 2019, New Orleans, LA, USA, May 6-9, 2019_. OpenReview.net, 2019. URL [https://openreview.net/forum?id=Bkg6RiCqY7](https://openreview.net/forum?id=Bkg6RiCqY7).
+* Marcus et al. (1994) Mitch Marcus, Grace Kim, Mary Ann Marcinkiewicz, Robert MacIntyre, Ann Bies, Mark Ferguson, Karen Katz, and Britta Schasberger. The penn treebank: Annotating predicate argument structure. In _Human Language Technology: Proceedings of a Workshop held at Plainsboro, New Jersey, March 8-11, 1994_, 1994.
+* Merity et al. (2017) Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models. In _5th International Conference on Learning Representations, ICLR 2017, Toulon, France, April 24-26, 2017, Conference Track Proceedings_. OpenReview.net, 2017. URL [https://openreview.net/forum?id=Byj72udxe](https://openreview.net/forum?id=Byj72udxe).
+* Mihaylov et al. (2018) Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. Can a suit of armor conduct electricity? a new dataset for open book question answering. In _Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing_, pp. 2381-2391, 2018.
+* Min et al. (2022) Sewon Min, Xinxi Lyu, Ari Holtzman, Mikel Artetxe, Mike Lewis, Hannaneh Hajishirzi, and Luke Zettlemoyer. Rethinking the role of demonstrations: What makes in-context learning work? _arXiv preprint arXiv:2202.12837_, 2022.
+* Nagel et al. (2020) Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos, and Tijmen Blankevoort. Up or down? adaptive rounding for post-training quantization. In _International Conference on Machine Learning_, pp. 7197-7206. PMLR, 2020.
+* Radford et al. (2018) Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya Sutskever, et al. Improving language understanding by generative pre-training. 2018.
+* Radford et al. (2019) Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language models are unsupervised multitask learners. _OpenAI blog_, 1(8):9, 2019.
+* Raffel et al. (2020) Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text transformer. _The Journal of Machine Learning Research_, 21(1):5485-5551, 2020.
+* Sheng et al. (2023) Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y Fu, Zhiqiang Xie, Beidi Chen, Clark Barrett, Joseph E Gonzalez, and othersi. High-throughput generative inference of large language models with a single gpu. In _International Conference on Machine Learning_. PMLR, 2023.
+* Su et al. (2022) Yusheng Su, Xiaozhi Wang, Yujia Qin, Chi-Min Chan, Yankai Lin, Huadong Wang, Kaiyue Wen, Zhiyuan Liu, Peng Li, Juanzi Li, et al. On transferability of prompt tuning for natural language processing. In _Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies_, pp. 3949-3969, 2022.
+
+* Tang (2023) Yuxin Tang. Chain-of-thought prompting under streaming batch: A case study. _arXiv preprint arXiv:2306.00550_, 2023.
+* Touvron et al. (2023a) Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothee Lacroix, Baptiste Roziere, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and efficient foundation language models. _arXiv preprint arXiv:2302.13971_, 2023a.
+* Touvron et al. (2023b) Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. _arXiv preprint arXiv:2307.09288_, 2023b.
+* Wu et al. (2023) Bingyang Wu, Yinmin Zhong, Zili Zhang, Gang Huang, Xuanzhe Liu, and Xin Jin. Fast distributed inference serving for large language models. _arXiv preprint arXiv:2305.05920_, 2023.
+* Xiao et al. (2022) Guangxuan Xiao, Ji Lin, Mickael Seznec, Julien Demouth, and Song Han. Smoothquant: Accurate and efficient post-training quantization for large language models. _arXiv preprint arXiv:2211.10438_, 2022.
+* Xie et al. (2022) Sang Michael Xie, Aditi Raghunathan, Percy Liang, and Tengyu Ma. An explanation of in-context learning as implicit bayesian inference. In _The Tenth International Conference on Learning Representations, ICLR 2022, Virtual Event, April 25-29, 2022_. OpenReview.net, 2022. URL [https://openreview.net/forum?id=RdJVFFCHjUMI](https://openreview.net/forum?id=RdJVFFCHjUMI).
+* Yuan et al. (2022) Binhang Yuan, Yongjun He, Jared Davis, Tianyi Zhang, Tri Dao, Beidi Chen, Percy S Liang, Christopher Re, and Ce Zhang. Decentralized training of foundation models in heterogeneous environments. _Advances in Neural Information Processing Systems_, 35:25464-25477, 2022.
+* Zellers et al. (2019) Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a machine really finish your sentence? In _Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics_, pp. 4791-4800, 2019.
+* Zhang et al. (2022) Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained transformer language models. _arXiv preprint arXiv:2205.01068_, 2022.
+
+**Appendix**
+
+## Appendix A More Experiments
+
+### Experiment Details
+
+In the experiment, we employed the AdamW Loshchilov & Hutter (2019) optimizer as our chosen optimizer. We conducted iterative prompt updates using a batch size of 4, a weight decay of \(10^{-5}\), and a learning rate of \(10^{-3}\). We set the total optimization steps as 30,000 and use the model corresponding to the best validation perplexity as the final model. To facilitate mix-precision training and system-level optimization, we leveraged the accelerate library Gugger et al. (2022).
+
+All experiments are conducted on a server with eight Nvidia V100 (32GB) GPUs, 1.5T main memory, and two Intel Xeon CPU E5-2699A. The software and package version is specified below:
+
+### Ablation on the Cross-Compression Transferability
+
+Here we assess the transferability of learned prompts across various compression levels. Specifically, we aim to address the following questions: Can the prompt learned from a compressed model be applied to the same model but compressed at different levels or types?
+
+In Figure 5, we display the Perplexity (PPL) outcomes on the C4 validation set, along with the results on the Wikitext-2 and PTB test sets. These results are obtained by applying prompts learned from a source compressed model to a different target compressed model. Here, "target" denotes the specific compression type and degree used in the model receiving the prompts. While "source" refers to the compression type and degree of the model from which the prompts are originally learned. For example, "source 4-bit" indicates that the prompt is learned from a compressed model with 4-bit quantization. Based on the figures, we observe that (1) For sparse LLMs, prompts learned from higher sparsity can be effectively transferred to models with lower sparsity, while achieving comparable performance.. (2) For quantized LLMs, prompts learned from lower bit quantization levels can be successfully applied to models with higher bit quantization, while achieving comparable performance. (3) There is a certain degree of transferability of prompts learned between different compression types, especially when the compression level is less. For instance, a prompt learned from a LLaMA-7B model with 4-bit quantization can be transferred to a LLaMA-7B model with 50% sparsity.
+
+\begin{table}
+\begin{tabular}{c c} \hline Package & Version \\ \hline CUDA & 11.6 \\ pytorch & 2.0.1 \\ transformers & 4.30.0.dev0 \\ accelerate & 0.18.0 \\ \hline \end{tabular}
+\end{table}
+Table 4: Package configurations of our experiments.
+
+Figure 5: LLaMA-7B transfer between different sparsity and bit-width. The “target” refers to the compression type and level for the compressed model, while the“source” represents the type and level of the compressed model from which the prompt is learned. For example, “4-bit” in source indicates that the prompt is learned from a compressed model with 4-bit quantization.
+
+### Cross-Task Transferability
+
+In this section, we explore the transferability of learned prompts across different tasks. Specifically, we aim to assess the effectiveness of prompts learned from token generation tasks, as indicated by Eq (1), in downstream tasks of LLM. As an illustrative example, we consider the zero-shot generalization tasks of LLaMA-7B Touvron et al. (2023a). For evaluation purposes, we have chosen OpenbookQA Mihaylov et al. (2018), Hellaswag Zellers et al. (2019), PIQA Bisk et al. (2020), and the high school European history task from Hendrycks et al. (2020). The European history task is particularly interesting due to its inclusion of a lengthy context sentence for each question. We employ the lm-evaluation-hardness framework Gao et al. (2021), incorporating adapters from Yuan et al. (2022), for the purpose of conducting the experiment.
+
+Table 5 presents the results in terms of normalized accuracy, and we also include the standard deviation, as indicated by Gao et al. (2021). The table clearly demonstrates that the learned prompt significantly enhances the accuracy of these tasks. These findings imply that prompts acquired through token generation tasks can effectively enhance the accuracy-efficiency trade-off of compressed LLMs.
+
+### Efficiency Profiling
+
+In this section, we analyze how the inclusion of prompt tokens impacts the latency of LLM inference. Figure 6 illustrates the latency of three OPT models and the LLaMA-7B model utilized in this paper, considering the insertion of additional prompt tokens with varying lengths. For token generation, we set the sequence length to 1024. The figure demonstrates that the addition of prompt tokens does not significantly increase the latency of LLM inference, particularly when the inserted tokens account for less than 10% of the original sequence length. Furthermore, our observations indicate that the latency does not exhibit a linear correlation with the length of the inserted tokens, highlighting the effectiveness of the prompt in facilitating efficient LLM inference.
+
+### More Experiments on Large LLMs
+
+We perform our methods and LoRA (Hu et al., 2021) on LLaMA-2-13B and bloom-7B models. The results are summarized on Table 6. Following LoRA experimental setting (Hu et al., 2021), we insert LoRA layers to all query and value layers with a rank \(r=32\), \(\alpha=32\), and a 0.1 dropout rate. We train the LoRA using the Adam optimizer with a \(2e-4\) learning rate. It suggests that our approach outperforms LoRA with lower PPL. Moreover, we can recover the performance of GPTQ 3-bit LLaMA-2-13B and GPTQ 3-bit BLOOM-7B with even better performance than their fp16 counterparts.
+
+We also test the transferability of ours and LoRA on wikitext2 dataset. We summarize the results in Table 7. It suggests that our soft prompt can be transferred to other dataset while still outperforming LoRA for the performance recovery of compressed LLMs.
+
+Figure 6: Latency benchmark of inference speed with prompt tokens
+
+### Ablation on the Number of Soft Tokens
+
+In Table 8, we conduct the ablation study on the impact of the number of soft tokens using 3-bit quantized LLama-7B on PTB dataset. We observe that there is still a significant improvement with 25 prompt tokens, and we can improve the performance by increasing the prompt size.
+
+## Appendix B Discussion
+
+**Limitations.** One limitation of our study is its reliance on GPUs for executing computational tasks. It is crucial to acknowledge that GPUs can be expensive to procure and maintain, thus imposing financial constraints on researchers or organizations with limited resources. In order to address this issue, future endeavors should investigate alternative computational architectures or optimizations that can alleviate the dependence on costly GPUs. By doing so, the accessibility and applicability of our proposed methodology can be expanded, making it more widely accessible to a broader range of researchers and organizations.
+
+**Potential Negative Societal Impacts.** While our research primarily centers on diminishing the energy consumption of LLM during inference, it is crucial to acknowledge that the carbon emissions stemming from LLM inference may still contribute to environmental concerns. As part of our future endeavors, we aspire to enhance the efficiency of LLM inference on low-energy devices.
+
+## Appendix C More Visualization
+
+In this section, we present further visualizations of compression-aware prompts, as demonstrated in Figure 1 in Section 1. The results unveil a significant improvement achieved by utilizing a hard,
+
+\begin{table}
+\begin{tabular}{l|l|l|l|l|l} \hline Dataset & Model & Precision & Recover method & Trainable Params (M) & PPL \\ \hline C4 & Llama-2-13B & fp16 & NA & NA & 6.96 \\ \hline C4 & Llama-2-13B & 3bit & NA & NA & 9.24 \\ \hline C4 & Llama-2-13B & 3bit & Soft Prompt & 0.5 & **6.75** \\ \hline C4 & Llama-2-13B & 3bit & LoRA & 26 & 8.15 \\ \hline C4 & bloom-7B & fp16 & NA & NA & 15.87 \\ \hline C4 & bloom-7B & 3bit & NA & NA & 18.40 \\ \hline C4 & bloom-7B & 3bit & Soft Prompt & 0.4 & **13.54** \\ \hline C4 & bloom-7B & 3bit & LoRA & 15.7 & 17.26 \\ \hline \end{tabular}
+\end{table}
+Table 6: The validation PPL of Llama-2-13B and Bloom-7B models on C4 dataset.
+
+\begin{table}
+\begin{tabular}{c c c c c c} \hline \hline Models & & OpenbookQA & Hellaswag & PIQA & 
+\begin{tabular}{c} High School \\ European History \\ \end{tabular} \\ \hline Full & & 0.410\(\pm\)0.022 & 0.497\(\pm\)0.005 & 0.702\(\pm\)0.011 & 0.364\(\pm\)0.038 \\ \hline
+50\% & w/o. Prompt & 0.412\(\pm\)0.022 & 0.449\(\pm\)0.005 & 0.682\(\pm\)0.011 & 0.364\(\pm\)0.038 \\ \cline{2-6}  & + Learned Prompt & 0.400\(\pm\)0.022 & 0.469\(\pm\)0.005 & 0.689\(\pm\)0.011 & 0.358\(\pm\)0.037 \\ \hline
+62.5\% & w/o. Prompt & 0.396\(\pm\)0.022 & 0.380\(\pm\)0.005 & 0.638\(\pm\)0.011 & 0.345\(\pm\)0.037 \\ \cline{2-6}  & + Learned Prompt & 0.402\(\pm\)0.022 & 0.433\(\pm\)0.005 & 0.668\(\pm\)0.011 & 0.345\(\pm\)0.037 \\ \hline
+75\% & w/o. Prompt & 0.366\(\pm\)0.022 & 0.280\(\pm\)0.004 & 0.549\(\pm\)0.012 & 0.315\(\pm\)0.036 \\ \cline{2-6}  & + Learned Prompt & 0.358\(\pm\)0.021 & 0.344\(\pm\)0.005 & 0.614\(\pm\)0.011 & 0.358\(\pm\)0.037 \\ \hline
+4-bit & w/o. Prompt & 0.410\(\pm\)0.022 & 0.487\(\pm\)0.005 & 0.690\(\pm\)0.011 & 0.358\(\pm\)0.037 \\ \cline{2-6}  & + Learned Prompt & 0.418\(\pm\)0.022 & 0.487\(\pm\)0.005 & 0.692\(\pm\)0.011 & 0.352\(\pm\)0.037 \\ \hline
+3-bit & w/o. Prompt & 0.378\(\pm\)0.022 & 0.446\(\pm\)0.005 & 0.674\(\pm\)0.011 & 0.358\(\pm\)0.037 \\ \cline{2-6}  & + Learned Prompt & 0.404\(\pm\)0.022 & 0.459\(\pm\)0.005 & 0.688\(\pm\)0.011 & 0.358\(\pm\)0.037 \\ \hline
+2-bit & w/o. Prompt & 0.354\(\pm\)0.021 & 0.240\(\pm\)0.004 & 0.491\(\pm\)0.012 & 0.315\(\pm\)0.036 \\ \cline{2-6}  & + Learned Prompt & 0.350\(\pm\)0.021 & 0.294\(\pm\)0.005 & 0.563\(\pm\)0.012 & 0.333\(\pm\)0.037 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: The zero-shot results on transforming the learned prompt to OpenBookQA, Hellaswag, PIQA, and High School European History dataset.
+
+task-independent prompt on compressed LLMs. Additionally, we showcase the visualization of responses generated using our prompt derived from the C4 training set. It is worth noting that, in certain instances, the task-independent and learned prompt outperforms the hard prompt.
+
+\begin{table}
+\begin{tabular}{l|l|l|l|l|l} \hline Dataset & Model & Precision & Method & Transferred Params (M) & PPL \\ \hline Wikitext2 & Llama-2-13B & fp16 & NA & NA & 5.58 \\ Wikitext2 & Llama-2-13B & 3bit & NA & NA & 7.88 \\ Wikitext2 & Llama-2-13B & 3bit & Soft Prompt & 0.5 & **5.89** \\ Wikitext2 & Llama-2-13B & 3bit & LoRA & 26 & 7.07 \\ Wikitext2 & BLOOM-7B & fp16 & NA & NA & 13.26 \\ Wikitext2 & BLOOM-7B & 3bit & NA & NA & 16.06 \\ Wikitext2 & BLOOM-7B & 3bit & Soft Prompt & 0.4 & **12.42** \\ Wikitext2 & BLOOM-7B & 3bit & LoRA & 15.7 & 15.65 \\ \hline \end{tabular}
+\end{table}
+Table 7: The zero-shot test PPL of transferred soft prompt and Lora on Wikitext2 dataset.
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline \multicolumn{1}{c}{**\# tokens**} & \multicolumn{1}{c}{**Perplexity**} \\ \hline Baseline (0 tokens) & 15.74 \\
+25 tokens & 9.26 \\
+50 tokens & 8.61 \\
+75 tokens & 8.17 \\
+100 tokens & 7.76 \\ \hline \hline \end{tabular}
+\end{table}
+Table 8: Ablation study on the impact of the number of soft tokens using 3-bit quantized LLama-7B on PTB dataset.
+
+Figure 7: Case study for the effect of prompts on a pruned LLaMA-7B with a 62.5% weight sparsity.
+
+Figure 8: Case study for the effect of prompts on a pruned LLaMA-7B with a 4-bit quantization.
+
+Understanding The Learned Prompts From Natural Language Aspect
+
+With the learned prompt outperforming the hard counterpart, we raise an intriguing question: How do the learned prompt tokens look when viewed from the perspective of natural language? In this section, we present the ablation study to answer the above question. Specifically, for each of the learned prompt token embeddings, we identify the words whose embedding is closest to the learned prompt token embedding via the nearest neighbor search technique, where the similarity measure is cosine similarity. In Figure 9, we plot the histogram of the cosine similarity between each learned prompt token and the top-100 nearest embeddings to it, where the prompt is learned with a pruned LLaMA-7B with a 50% weight sparsity. **We observe that there is no word whose embedding closely matches the learned one within the embedding space.** The cosine similarity for nearly all comparisons falls below 0.16, suggesting a considerable disparity between the learned prompt embeddings and their nearest equivalents. Below we also report the nearest word for each of the learned prompt token embedding. We observe that (1) almost all of them are meaningless. (2) several learned prompt tokens may be mapped to the same word.
+
+**Nearest word for each of the learned prompt token:** "heits", "<s>", "</s>", "<0x00>", "<0x01>", "<0x02>", "<0x03>", "<0x04>", "<0x05>", "<0x06>", "<0x07>", "<0x08>", "<0x09>", "<0x03>", "<0x02>", "<0x05>", "<0x01>", "<0x10>", "<0x11>", "<0x12>", "<0x13>", "<0x14>", "<0x15>", "<0x16>", "<0x17>", "<0x18>", "<0x19>", "<0x10>", "<0x12>", "<0x18>", "<0x15>", "<0x10>", "<0x11>", "<0x11>", "<0x11>", "<0x12>", "<0x12>", "<0x12>", "<0x13>", "<0x14

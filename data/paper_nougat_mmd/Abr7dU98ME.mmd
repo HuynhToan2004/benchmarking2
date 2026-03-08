@@ -1,0 +1,488 @@
+## Forward Learning of Graph Neural Networks
+
+**Anonymous authors**
+
+Paper under double-blind review
+
+## Abstract
+
+Graph neural networks (GNNs) have achieved remarkable success across a wide range of applications, such as recommendation, drug discovery, and question answering. Behind the success of GNNs lies the backpropagation (BP) algorithm, which is the de facto standard for training deep neural networks. However, despite its effectiveness, BP imposes several constraints, which are not only biologically implausible, but also limit the scalability, parallelism, and flexibility in learning neural networks. Examples of such constraints include the storage of neural activities computed in the forward pass for use in the subsequent backward pass, and the dependence of parameter updates on non-local signals. To address these limitations, the forward-forward algorithm (FF) was recently proposed as an alternative to BP in the image classification domain, which trains neural networks by performing two forward passes over positive and negative data. Inspired by this advance, we propose ForwardGNN in this work, a new forward learning procedure for GNNs, which avoids the constraints imposed by BP via an effective layer-wise local forward training. ForwardGNN extends the original FF to deal with graph data and GNNs, and makes it possible to operate without generating negative inputs (hence no longer forward-forward). Further, ForwardGNN enables each layer to learn from both the bottom-up and top-down signals without relying on the backpropagation of errors. Extensive experiments involving five real-world datasets and three representative GNNs show the effectiveness and generality of the proposed forward graph learning framework.
+
+## 1 Introduction
+
+Graph neural networks (GNNs) (Zhou et al., 2020; Wu et al., 2021) are a family of deep learning methods designed to operate on graph-structured data, such as social networks, knowledge graphs, and citation networks. In recent years, GNNs have achieved state-of-the-art results across a wide range of applications that involve graphs, such as recommendation (Fan et al., 2019), drug discovery (Zhang et al., 2022), traffic forecasting (Jiang and Luo, 2022), question answering (Park et al., 2022), and program analysis (Allamanis, 2022). Behind the huge success of GNNs, as well as other types of neural networks, lies the backpropagation (BP) algorithm (Rumelhart et al., 1986; Plaut et al., 1986), which is the de facto standard for training deep neural networks.
+
+BP adjusts the parameters of a neural network in a way that reduces the discrepancy between the network's output and the target value (_e.g._, ground-truth class labels). Specifically, these updates by BP are performed in two passes. First, in the forward pass, the input is fed forward through the network to produce an output, while storing intermediate activations of the neurons. Then, in the backward pass, an error between the output and target gets propagated backward through the network using the chain rule, which uses the stored activations to calculate the gradients of the loss with respect to the network parameters. Then using gradient descent (Kiefer and Wolfowitz, 1952; Robbins and Monro, 1951), parameters are adjusted in the negative direction of the gradients, thereby reducing the loss.
+
+Spurred by the effectiveness of BP, several prior works investigated whether BP could be a model of how the brain learns (Lillicrap et al., 2020; Scellier and Bengio, 2017; Crick, 1989). However, there is no evidence that the brain follows the learning constraints imposed by BP, _e.g._, (i) neural activations computed in the forward pass need to be stored for use in the backward pass, which increases memory overhead, (ii) parameter updates depend on the signals from all downstream neurons, while biological synapses learn locally, _i.e._, from the signals of locally connected neurons (Whittington and Bogacz, 2019), and (iii) parameter updates occur only after the forward pass, and in its reverse order (_i.e._, from the last down to the first layer). These constraints not only render BP biologically implausible, but also limits the scalability, parallelism, and flexibility in learning neural networks.
+
+The forward-forward algorithm (FF) (Hinton, 2022) is a representative recent approach designed to be a biologically plausible alternative to BP. FF avoids the above constraints of BP by replacing the forward and backward passes in BP with two forward passes, which operate on the positive and negative data, respectively, with opposite objectives. By adopting a layer-wise forward-only training scheme, FF avoids the restriction of BP that a perfect knowledge of the computations in the forward pass needs to be retained to compute the derivatives for backpropagation. In preliminary experiments on image classification, FF showed comparable classification performance to BP.
+
+The training of GNNs is limited by the same constraints of BP as discussed above, which restrict the scalability and flexibility of model training, as well as rendering the learning process biologically implausible. While FF and its recent variants (Hinton, 2022; Zhao et al., 2023; Lee & Song, 2023; Paliotta et al., 2023) saw promising results, they fail to provide an effective and efficient alternative for learning GNNs for the following reasons. First, the FF algorithm involves generating negative data, which is a task-specific process (_e.g._, handcrafting masks for images with varying long range correlations, and manipulating images via overlaying class labels), and needs to be defined to be used for new tasks. Existing FF methods are mainly designed for image classification, and thus are difficult or ineffective for handling graph data. Second, the current way FF generates negative data is not scalable as it takes an increasing amount of memory and computation time as more negative samples are used. To date, the potential of FF for the fundamental graph learning (GL) tasks, _i.e._, node classification and link prediction, has not been studied, and it remains to be explored how effectively FF or alternative forward learning procedures can train GNNs for fundamental GL tasks.
+
+To bridge this gap, we develop ForwardGNN in this paper, a forward learning framework for GNNs, which builds upon and improves the FF algorithm (Hinton, 2022) in learning GNNs for graph learning tasks. First, ForwardGNN proposes two orthogonal graph-specific approaches for extending the FF algorithm for GNNs. Importantly, ForwardGNN removes the need to explicitly construct negative inputs needed for FF to work (_i.e._, ForwardGNN requires just a single forward pass, and hence is no longer forward-forward). This greatly improves the efficiency of both training and inference processes. Further, in the local layer-wise training of ForwardGNN, each layer not only receives input from the lower layer, but also incorporates what the upper layers have learned without relying on the backpropagation of errors, which leads to a further performance improvement as more GNN layers are involved in the forward learning. We demonstrate the effectiveness and generality of the proposed forward graph learning framework in an extensive evaluation using three representative GNNs on five real-world graphs. In summary, we make the following contributions.
+
+* **Forward Graph Learning.** We systematically investigate the potential of forward graph learning, _i.e._, biologically plausible forward-only learning of graph neural networks for fundamental graph learning tasks, namely, node classification and link prediction.
+* **Novel Learning Framework.** We develop ForwardGNN, a novel forward learning framework for GNNs. ForwardGNN is agnostic to the message passing schemes of GNNs, and is capable of learning GNNs via a single forward pass, while incorporating top-down signals.
+* **Effectiveness.** Extensive experiments show that (1) ForwardGNN outperforms, or performs on par with BP on link prediction and node classification tasks, respectively, while using less memory for training; and (2) the proposed single-forward approach improves upon the FF-based methods.
+
+## 2 Background and Related Work
+
+### Graph Neural Networks
+
+Given a graph \(G=(V,E)\) with nodes \(V\) and edges \(E\), graph neural networks (GNNs) learn the representation of a node in graph \(G\) by repeatedly performing a neighborhood aggregation or message passing over its local neighborhood across multiple layers. Let \(\mathbf{x}_{i}\in\mathbb{R}^{F_{1}}\) be the input features of node \(i\), \(\mathbf{h}_{i}^{(\ell)}\in\mathbb{R}^{H}\) be the representations or embeddings of node \(i\) learned by layer \(\ell\)\((\ell\geq 1)\), and \(\mathbf{e}_{(j,i)}\in\mathbb{R}^{F_{2}}\) be optional features of the edge \((j,i)\) from nodes \(j\) to \(i\). The message passing procedure that produces the embeddings of node \(i\) via the \(\ell\)-th GNN layer can be described as follows:
+
+\[\mathbf{h}_{i}^{(\ell)}=\gamma^{(\ell)}\Bigg{(}\mathbf{h}_{i}^{(\ell-1)},\bigoplus_{j \in\mathcal{N}(i)}\psi^{(\ell)}\left(\mathbf{h}_{i}^{(\ell-1)},\mathbf{h}_{j}^{(\ell-1 )},\mathbf{e}_{(j,i)}\right)\Bigg{)}. \tag{1}\]
+
+Here, \(\mathbf{h}_{i}^{(0)}\) is set to \(\mathbf{x}_{i}\), \(\mathcal{N}(i)\) is the neighbors of node \(i\), and \(\psi(\cdot)\) is a function that extracts a message for neighborhood aggregation, which summarizes the information of the nodes \(i\) and \(j\), as well as the optional edge features \(\mathbf{e}_{(j,i)}\) if available. \(\bigoplus(\cdot)\) denotes a permutation-invariant function (_e.g._, _mean_ or _max_) to aggregate incoming messages, and \(\gamma(\cdot)\) is a function that produces updated embeddings of node \(i\) by combining node \(i\)'s embeddings with aggregated messages. With multi-layer GNNs, the embeddings of a node learned via local message passing capture information from its \(k\)-hop neighbors. This message passing scheme can be considered as generalizing the convolution operator in CNNs to irregularly-structured graph data (Zhou et al., 2020; Daigavane et al., 2021), where connections among nodes are often highly skewed and irregular in contrast to grid-structured images.
+
+Various GNN architectures can be described by this framework, including graph convolutional networks (GCN) (Kipf and Welling, 2017), GraphSAGE (Hamilton et al., 2017), and graph attention networks (GAT) (Velickovic et al., 2018). They differ in terms of how they define the functions in Eq. (1), _i.e._, \(\gamma^{(\ell)}(\cdot)\), \(\bigoplus(\cdot)\), and \(\psi^{(\ell)}(\cdot)\). For instance, to define the aggregator \(\bigoplus(\cdot)\), GraphSAGE examines a few options, such as the mean operator, and a max pooling on top of trainable neighbor transformations, while GAT uses an attention mechanism to perform a learnable weighted averaging. As GNN training is done by BP, it inherits the same constraints of BP discussed in Section 1. In this work, we develop an alternative learning procedure for GNNs without those constraints.
+
+### The Forward-Forward Algorithm
+
+The forward-forward algorithm (FF) (Hinton, 2022) is a greedy layer-wise learning procedure for optimizing multi-layer neural networks (NNs). That is, FF trains layers one at a time, going from the bottom to the top, and trained layers are no longer further optimized when upper layers are trained. The main idea of FF is to replace the forward and backward passes of BP with two forward passes, which operate on the positive (real) and negative (incorrect) data. Given images and their class labels, FF constructs positive samples by overlaying each image with its one-hot encoded labels. Negative samples are constructed in the same way, but using a randomly chosen incorrect label.
+
+**Goodness.** In FF, each layer has its own objective, which is to make the forward pass at the layer assign high goodness to positive data, and low goodness to negative data. As positive and negative data differ only in the included labels, the layer is then trained to ignore the features that do not correlate with the label. Specifically, FF defines the goodness of a layer to be the sum of the squares of the ReLU activations. Let \(\mathbf{a}_{i}^{(\ell)}\) denote the ReLU activation that the \(\ell\)-th layer produces by processing an input vector for object \(i\). The goodness \(\mathcal{G}_{i}^{(\ell)}\) of object \(i\) by the \(\ell\)-th layer is computed as
+
+\[\mathcal{G}_{i}^{(\ell)}=\big{\|}\mathbf{a}_{i}^{(\ell)}\big{\|}_{2}^{2}. \tag{2}\]
+
+To train each layer to be able to distinguish between positives and negatives using goodness, FF defines the probability that object \(i\) is considered to be positive by layer \(\ell\) as follows:
+
+\[p(\text{positive})=\sigma\left(\mathcal{G}_{i}^{(\ell)}-\theta\right) \tag{3}\]
+
+where \(\sigma(a)=\nicefrac{{1}}{{(1+e^{-a})}}\) is the logistic function, and \(\theta\) is a threshold, which is to make the goodness be well above the given value for positive data, and well below it for negative data.
+
+**Normalization.** Note that Eq. (3) uses activation's length in L2 norm to compute the goodness. To prevent the next layer from distinguishing positive from negative data by just using the length of the input vector (in L2 norm), FF normalizes the length of the activation before passing it down to the next layer. This way, the next layer is guided to use the orientation of the input vector, not its length.
+
+**Applications and Extensions.** FF was recently used for several applications, _e.g._, biomedical and hyperspectral image classification (Angulo and Paheding, 2023; Paheding and Angulo, 2023), on-device training (De Vita et al., 2023), imitation learning (Chung et al., 2023), and optical NN training (Oguz et al., 2023). A few studies also presented extensions of the FF algorithm. Instead of training the layers to predict goodness (Eq. 2), CaFo (Zhao et al., 2023) attaches a class predictor to each layer. In CaFo, the given NNs are randomly initialized and fixed the whole time, and only the layer-wise predictors are locally trained. SymBa (Lee and Song, 2023) adopts an alternative loss to maximize the goodness gap between positive and negative items via direct comparison. In contrast to FF and all follow-up works designed for image classification, GFF (Paliotta et al., 2023) adapts FF to graph classification by defining the goodness of a graph. However, GFF is designed specifically for graph classification, and cannot be applied to the two fundamental graph learning (GL) tasks, _i.e._, node classification and link prediction. ForwardGNN enables forward learning for these GL tasks for the first time, and greatly improves upon GFF and others by removing the need to generate negative inputs, and letting each layer learn from both bottom-up and top-down signals without relying on BP.
+
+## 3 Forward Learning of Graph Neural Networks
+
+We develop new forward learning procedures for GNNs in this section. We start by extending the FF algorithm for GNNs, and design a forward graph learning procedure with just a single forward pass. We then extend them so that both the bottom-up and top-down signals can inform the training. Figure 1 provides an overview of the proposed forward graph learning approaches and BP.
+
+### Adapting the Forward-Forward Algorithm for Graph Neural Networks
+
+Positive and negative samples play an essential role in FF, as layers are trained to tell them apart in terms of the goodness (Eq. 2). Designed for image classification, FF creates them by overlaying correct or incorrect labels over images. To adapt this idea to deal with graph data and GNNs, we propose two orthogonal approaches for extending node features and graph structure using labels (Fig. 1b).
+
+**Extending Node Features With Node Labels.** In this approach, we transform node labels into auxiliary features and use them to augment node features. Formally, the extended features \(\mathbf{x}_{i}^{\prime}\) of node \(i\) is
+
+\[\mathbf{x}_{i}^{\prime}=[\mathbf{x}_{i}\,\|\,\textit{Label-To-Feat}(i)], \tag{4}\]
+
+where \(\textit{Label-To-Feat}(i)\) is a function that maps node \(i\)'s label to additional features, and \([\mathbf{x}\|\mathbf{y}]\) denotes a concatenation of vectors \(\mathbf{x}\) and \(\mathbf{y}\). Positive and negative features are created by using variants of \(\textit{Label-To-Feat}(i)\), which return the one-hot encoding of the correct, and randomly selected incorrect labels for node \(i\), respectively. Note that not all nodes have labels, as some nodes are held out for testing, or nodes may have been partially labeled from the beginning. This differs from the image classification setup, where all training images are labeled. For nodes without labels, we define \(\textit{Label-To-Feat}(\cdot)\) to be a uniform distribution over the node classes such that all classes contribute equally for these nodes. This approach affects only the node features, while retaining the graph structure. Thus the positive and negative embeddings of training nodes are obtained by running GNNs (Eq. 1) on the same graph \(G\) using differently altered features \(\mathbf{x}_{i}^{\text{pos}\prime}\) and \(\{\mathbf{x}_{i}^{\text{neg},j\prime}\}_{j}\) as \(\mathbf{h}_{i}^{(0)}\).
+
+**Extending Graph Structure With Virtual Nodes.** This approach introduces virtual nodes corresponding to the node classes (_i.e._, there are as many virtual nodes as the classes), and use the links between real and virtual nodes to make positive and negative samples. For positive samples, each real node is linked to the correct virtual node, that is, the one corresponding to the true label of the node. For negative samples, real nodes are linked with randomly chosen incorrect virtual nodes. Formally, given a set \(C=\{c_{k}\}_{k=1}^{K}\) of \(K\) virtual nodes, the augmented graph \(G^{\prime}=(V^{\prime},E^{\prime})\) is defined to be
+
+\[G^{\prime}=(V\cup C,\;\;E\cup\{(i,c)\;\mid\;i\in V_{\text{labeled}},\;c\in C, \;\textit{Label-Re}(i)=\textit{Label-VR}(c)\}), \tag{5}\]
+
+where \(V_{\text{labeled}}\subseteq V\) is the set of labeled nodes, and \(\textit{Label-RE}(i)\) and \(\textit{Label-VR}(c)\) are functions that map real node \(i\) and virtual node \(c\) to the class labels, respectively. Specifically, in order to create positive and negative samples, \(\textit{Label-RE}(i)\) returns correct, and randomly chosen incorrect labels, respectively, for real node \(i\), while \(\textit{Label-VR}(c)\) consistently returns the true label for virtual node \(c\)
+
+Figure 1: Backpropagation (BP) and proposed forward learning methods for GNNs. (a) BP involves one forward pass, followed by one backward pass through the network. (b) Forward-forward (Sec. 3.1) involves two forward passes on positive and negative inputs. (c) Single forward (Sec. 3.2) learns via just one forward pass. (d) Single forward is extended to incorporate top-down signals (Sec. 3.3).
+
+With this augmented graph structure, real nodes aggregate information from both their real neighbors and a virtual node. Similarly, virtual nodes aggregate information from the real nodes they are linked with, which makes them representative of those connected real nodes. _E.g._, with positive connections, virtual nodes can be considered as class representatives, as virtual nodes are only connected to the real nodes that belong to the virtual node's class. From the perspective of real nodes, the only difference between positive and negative cases is the link to the virtual node. All in all, GNN layers are trained to utilize this difference to assign the goodness (Eq. 2) appropriately, _e.g._, by ignoring or downplaying some of the aggregated node features that do not correlate well with the node label. The positive and negative embeddings of training nodes are generated by running GNNs (Eq. 1) on differently augmented graphs \(G^{\text{post}}\) and \(\{G^{\text{neg},j^{\prime}}\}_{j}\) with the same input features \(\mathbf{x}_{i}=\mathbf{h}_{i}^{(0)}\). Alg. 1 in Appendix C presents the forward learning algorithm discussed in this subsection.
+
+**Inference.** After training GNNs with the above methods, GNN layers can produce the goodness of a node with respect to label \(l\), _i.e._, by running GNNs with node features extended with label \(l\) (Eq. 4), or an extended graph where test nodes are linked to the virtual node corresponding to label \(l\) (Eq. 5). To predict for a given node, we compute the goodness for all classes using each GNN layer, and accumulate the goodness of all layers. Then the label with the highest accumulated goodness is selected.
+
+### Forward Graph Learning via a Single Forward Pass
+
+Based on FF, the approaches in Section 3.1 operate by learning to distinguish between positive and negative inputs. Specifically, this process involves (1) creating positive and negative inputs in the form of differently augmented graphs or node features, and (2) performing multiple forward passes of GNNs with those augmented graphs and features, which overall has high computational and memory requirements. This limitation is because they incorporate the label information at the _input_ level, _i.e._, by perturbing the inputs to create positive (real) and negative (incorrect) samples, which require separate processing. We tackle this limitation by designing a learning framework that can utilize the label information for the forward GNN training with just a single forward pass (Fig. 1c).
+
+**Framework.** Our main idea is to enable the network to generate learning signals based on the available node labels, instead of requiring positive and negative samples to start the training, which are created by perturbing the input data using labels. In other words, we want the GNN layer to avoid the need for positive and negative samples by generating its own training targets in one forward pass, which can then be used to learn node embeddings that reflect the class structure among the nodes.
+
+To this end, we empower GNN layers to generate class representatives as their learning targets via graph convolution (Eq. 1). Specifically, we turn to our proposed idea of graph augmentation (Eq. 5), and use the positively augmented graph \(G^{\text{post}}\) for the forward pass, in place of the original graph \(G\). As discussed in Sec. 3.1, a virtual node in \(G^{\text{post}}\) can be considered to be representative of the nodes in the corresponding class due to its label-based connections to real nodes and the message passing process. This way, GNNs can produce the embeddings of real nodes and class representatives simultaneously in just one forward pass, without having to design a separate architecture to obtain class representatives. As a result, compared to the forward-forward algorithm that involves two forward passes, this framework is no longer forward-forward, and hence a significant departure from FF.
+
+**Learning Signals.** Given the embeddings and labels of real nodes as well as class representatives, we would want the learning signals to train GNNs in such a way that nodes that are similar and in the same class would be close to each other in the embedding space learned by GNNs, while nodes that are dissimilar and in different classes would be away from each other. To train the \(\ell\)-th GNN layer, we generate such learning signals with the following contrastive learning objective \(\mathcal{L}^{(\ell)}\),
+
+\[\mathcal{L}^{(\ell)}=\frac{1}{|V_{\text{labeled}}|}\sum\nolimits_{i\in V_{ \text{labeled}}}\mathcal{L}(\mathbf{h}_{i}^{(\ell)},i,\ell),\ \ \ \ \mathcal{L}(\mathbf{h},i,\ell)=-\log\frac{\exp(C(\mathbf{h},\mathbf{c}_{\text{ Label}(i)}^{(\ell)})/\tau)}{\sum\nolimits_{k\in\llbracket 1,K\rrbracket}\exp(C(\mathbf{h},\mathbf{c}_{k}^{(\ell)})/\tau)}, \tag{6}\]
+
+where \(\mathbf{h}_{i}^{(\ell)}\) and \(\mathbf{c}_{k}^{(\ell)}\) are embeddings of node \(i\) and class \(k\) learned by the \(\ell\)-th GNN layer; \(K\) is the number of node classes; \(Label(i)\) maps node \(i\) into its class; \(\mathcal{C}(\cdot,\cdot)\) is a critic function that measures the similarity of two embeddings (_e.g._, dot product); and \(\tau\) is the temperature parameter. This objective produces the learning targets by contrasting real nodes with class representatives, and maximizes the probability of discriminating the correct (node, class) pair among negative unmatched pairs. Alg. 2 in Appendix C presents the algorithm for the proposed single forward approach.
+
+**Inference.** Once GNNs are trained, GNN layers can produce the probability of a node belonging to each class via the softmax inside the logarithm of Eq. (6). To predict for the given node, we compute the class distribution across all GNN layers, and select the label with the highest average probability.
+
+### Incorporating Top-Down Signals
+
+In the above forward learning frameworks (Secs. 3.1 and 3.2), GNN layers are trained progressively from bottom to top, _i.e._, once a layer is trained, it remains fixed while upper layers are trained. As a result, when layer \(\ell\in\llbracket 1,L\rrbracket\) is trained, it can only use the bottom-up signals from lower layers \(1\) to \(\ell-1\), but not the top-down signals from upper layers \(\ell+1\) to \(L\). By contrast, with BP, layers can also learn from the top-down signals via the backpropagation of errors throughout the network. Inspired by Hinton (2021, 2022), which study the part-whole hierarchy representation in NNs, we extend the single forward pass approach (Sec. 3.2) to incorporate top-down signals via two paths (Fig. 1d).
+
+**Signal Path: Top-To-Input.** This path allows to incorporate the output of upper layers into the input of a GNN layer. We now consider the forward pass training to be done over time, such that the training of GNN layers at time \(t\) incorporates the top-down signals from the previous time step \(t-1\). Let \(\mathbf{h}_{i,t}^{(\ell-1)}\) be the embeddings of node \(i\) produced by layer \(\ell-1\) at time \(t\). The output of upper layers at the previous time \(t-1\), _i.e._, \(\{\mathbf{h}_{i,t-1}^{(\ell+1)},\dots,\mathbf{h}_{i,t-1}^{(L)}\}\), constitutes top-down signals for node \(i\). Then
+
+\[\mathbf{h}_{i,t}^{(\ell-1)\prime}=\textit{Merge}(\mathbf{h}_{i,t}^{(\ell-1)},\{\mathbf{h}_ {i,t-1}^{(\ell+1)},\dots,\mathbf{h}_{i,t-1}^{(L)}\}) \tag{7}\]
+
+is given to layer \(\ell\) as input instead of \(\mathbf{h}_{i,t}^{(\ell-1)}\). There are several choices for _Merge_(\(\cdot\)), _e.g._, top-down signals can be averaged over all or a subset of layers, and then added or concatenated with \(\mathbf{h}_{i,t}^{(\ell-1)}\). With this signal path, each layer can learn from the node representations learned by upper layers.
+
+**Signal Path: Top-To-Loss.** This path allows to incorporate the output from upper layers into the output of a GNN layer to be used in the loss computation and the inference step. Specifically, the following loss replaces Eq. (6) so that both bottom-up and top-down signals can inform the training,
+
+\[\mathcal{L}_{t}^{(\ell)\prime}=\Big{(}\sum\nolimits_{i\in V_{\text{labeled}}} \mathcal{L}(\mathbf{h}_{i,t}^{(\ell)\prime\prime},i,\ell)\Big{)}\Big{/}|V_{\text{ labeled}}|\quad\text{where}\quad\mathbf{h}_{i,t}^{(\ell)\prime\prime}=\textit{Merge}(\mathbf{h}_{i,t}^{(\ell)},\{\mathbf{h}_{i,t-1}^{(n)}\}_{n=\ell+1}^{L}) \tag{8}\]
+
+which uses augmented embeddings \(\mathbf{h}_{i,t}^{(\ell-1)\prime\prime}\) that incorporate top-down signals, instead of \(\mathbf{h}_{i,t}^{(\ell-1)}\). This way, each layer can learn to generate outputs in light of what the upper layers have learned.
+
+Note that even with these signal paths, no gradient flows through GNN layers, and hence the learning procedure remains to be forward only. Alg. 3 in App. C lists steps for top-down signal incorporation.
+
+### Application to Link Prediction
+
+The ideas proposed in Secs. 3.1 and 3.2 use the label information (_e.g._, label-based virtual nodes), with a focus on the node classification task. Here we discuss that the proposed framework can be naturally used for the forward learning of the link prediction (LP) task. We note that the standard procedure for training and evaluating GNNs for LP shares a lot of similarities with the FF algorithm, and is thus readily adaptable for use in the forward learning framework. Given embeddings \(\mathbf{h}_{i}\) and \(h_{j}\) of nodes \(i\) and \(j\), the link probability \(p_{i,j}\) between nodes \(i\) and \(j\) is modeled as follows:
+
+\[p_{i,j}=\textit{LinkProb}(\textit{EdgeEmb}(\mathbf{h}_{i},\mathbf{h}_{j})), \tag{9}\]
+
+where \(\textit{EdgeEmb}(\mathbf{h}_{i},\mathbf{h}_{j})\) is a function that returns the embedding of edge \((i,j)\) (_e.g._, element-wise product), and \(\textit{LinkProb}(\cdot)\) transforms the edge embedding into a probability (_e.g._, summation followed by a sigmoid function). The training goal is to learn to distinguish between the existing (positive) and nonexistent (negative) edges in terms of the estimated link probability. This process is similar to FF in the sense that both aim to tell positive and negative samples apart using the learned scores (_i.e._, link probability and goodness). Differently from the FF applied for node classification (Fig. 1b), positive and negative edge embeddings can be generated via a single forward pass using the standard training process for LP. Notably, this forward learning approach differs from the BP-based LP training in that each layer is locally trained without backpropagation of errors. The idea in Sec. 3.3 can also be used to incorporate top-down signals in learning the embeddings of nodes, and thus the embeddings of edges. The forward learning algorithm for LP is given in Alg. 4 in App. C.
+
+**Inference.** Once GNNs are trained, each GNN layer produces the probability of a given edge. We compute the link probability to be the average of the link probabilities estimated by all layers.
+
+## 4 Experiments
+
+### Evaluation Setup
+
+Our goal is to systematically evaluate the effectiveness and generality of the proposed forward graph learning approach on fundamental graph learning tasks, namely, node classification and link prediction, using representative GNN models and real-world graphs.
+
+**Node Classification.** Given a graph where each node is assigned to a single class, the task is to predict the class of the given node. We randomly generate the train-validation-test node splits with a ratio of 64%-16%-20%, and evaluate the performance in terms of classification accuracy.
+
+**Link Prediction.** The task is to predict whether the given edge is positive (existing) or not. We split the edges randomly into train-validation-test sets, with a ratio of 64%-16%-20%, which form positive edge sets. We randomly select the same amount of nonexistent edges as the positive edges, which form negative edge sets. We obtain the link probability (Eq. 9) via dot product of the two nodes' embeddings, followed by sigmoid. We measure the performance using the ROC-AUC score.
+
+For both tasks, we perform evaluation using five randomly generated splits, and measure the average and standard deviation of the corresponding performance metric.
+
+**Datasets.** We use five real-world graphs drawn from three domains: PubMed, CiteSeer, and CoraML are citation networks; Amazon is a co-purchase network; GitHub is a followership graph. Table 1 provides the summary statistics of these graphs, and Appendix A presents a detailed description of these datasets.
+
+**Graph Neural Networks.** We evaluate ForwardGNN and BP using three representative GNNs, namely, graph convolutional network (GCN) (Kipf & Welling, 2017), GraphSAGE (SAGE) (Hamilton et al., 2017), and graph attention network (GAT) (Velickovic et al., 2018).
+
+Experimental settings, _e.g._, details of GNNs and software used in this work, are given in Appendix B.
+
+### Comparison With the Backpropagation Algorithm
+
+We compare the proposed forward learning method with backpropagation (BP) using two criteria, namely, (1) task-specific performance (_e.g._, accuracy) and (2) GPU memory usage increase as more layers are used. Among several forward graph learning approaches we develop in Sec. 3, we use the single-forward learning approach (SF) with top-down paths (Sec. 3.3) for node classification, and the SF method with the cross entropy loss for link prediction, since they achieve overall best results considering both criteria, as the comparison among forward learning approaches in Sec. 4.3 shows.
+
+**Result Visualization.** In Figure 2, we show the task-specific performance (y-axis) and the memory usage of multi-layer GNN compared to the 1-layer GNN (x-axis), obtained with training GNNs with the proposed SF and BP. In Figure 2, the shape and color of a symbol indicate the type of GNNs and dataset, respectively, and symbols that are filled and empty, respectively, denote that the corresponding GNN was trained with BP and SF. For ease of comparison, the filled and empty symbols corresponding to the same GNN on the same dataset are linked by a dotted line.
+
+**Node Classification** (Figure 1(a)). Using this visualization, we make the following observations.
+
+* _The proposed forward learning method (SF) performs similarly to BP in many cases_ (which correspond to the near horizontal lines), _or even outperforms BP in several cases_ (corresponding to the lines that go towards the lower right corner), across different GNNs and graphs.
+* _As we use GNNs with a larger number of layers, BP requires more memory for training_ (longer horizontal distance between the filled and empty symbols), _while the memory required by SF remains nearly the same_ (empty symbols are located near the left end of the figures). The memory usage increase when using BP goes up to \(18\times\) as we use four layers.
+
+**Link Prediction** (Figure 1(b)). With the same visualization, we have the following observations.
+
+* _The proposed SF mostly achieves a higher link prediction performance than BP_ (most lines go towards the lower right corner). This is mainly because the link prediction performance of the GNNs trained with BP declines as more GNN layers are used, while the performance of GNNs trained with SF improves to varying degrees (or remains nearly the same) as more layers are used.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline
+**Dataset** & **\# Nodes** & **\# Edges** & **\# Features** & **\# Classes** \\ \hline PubMed & 19,717 & 88,648 & 500 & 3 \\ CiteSeer & 4,230 & 10,674 & 602 & 6 \\ CoraML & 2,995 & 16,316 & 2,879 & 7 \\ Amazon & 7,650 & 238,162 & 745 & 8 \\ GitHub & 37,700 & 578,006 & 128 & 2 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Summary of the graph datasets.
+
+* As in the node classification result, _BP incurs more memory usage as the number of layers increases, while the amount of memory required by SF remains the same_.
+
+* CaFo uses the least amount of memory, but performs significantly worse than the proposed methods. This is because CaFo optimizes only the layer-wise predictors, but not the GNN model itself. Also, PEPITA fails to train GNNs effectively for node classification.
+* _Overall, SF-TopDown achieves the best results._ As the comparison of SF-TopDown and SF in Fig. 3 shows, incorporating top-down signals lets SF perform node classification more accurately.
+
+**Link Prediction.** We evaluate the following forward learning methods, which are applicable for link prediction: (1) **ForwardGNN-CE**, (2) **ForwardGNN-FF**, and (3) **ForwardGNN-SymBa**, which are all based on the proposed single-forward framework (Sec. 3.4), while using different learning objectives (_i.e._, binary cross entropy (BCE), forward-forward objective (Eq. 3), and the objective in (Lee and Song, 2023), respectively); and (4) **CaFo**(Zhao et al., 2023), which uses layer-wise link predictors trained with BCE. Other forward learning methods used above (_e.g._, PEPITA) are not applicable for link prediction as they are designed specifically for node classification.
+
+Fig. 5 shows the link prediction result (y-axis) and memory usage (x-axis) of different GNNs.
+
+* _The proposed forward learning methods_, especially, ForwardGNN-CE and ForwardGNN-SymBa, _consistently outperform CaFo by a large margin_. Freezing the GNN layers is too stringent a restriction for CaFo to effectively learn to do link prediction.
+* _ForwardGNN-CE shows the overall best results considering both the accuracy and stability of predictions_. ForwardGNN-SymBa often suffers from high variability in the prediction accuracy.
+
+**Further Results.** We present the performance and memory usage for all learning methods, GNNs, and graphs in Tables 2 and 3 for node classification, and in Tables 4 and 5 for link prediction.
+
+## Ethics Statement
+
+This paper develops a new learning framework for graph neural networks. To evaluate the proposed framework, we only use public datasets, which do not contain any personally identifiable information or offensive materials to the best of our knowledge. Also, experiments in this work focus on evaluating the prediction accuracy and memory usage, and do not involve human subjects. We do not foresee any ethical concerns with this work.
+
+### Reproducibility Statement
+
+For reproducibility, we describe our experimental settings in Section 4.1 and Appendices A and B, including details of data splitting, evaluation tasks and metrics (Sec. 4.1), dataset description and statistics (App. A and Table 1), hyperparameter settings and hardware specifications (App. B). All datasets used in this work are publicly accessible (Sec. 4.1). The code and data used in this work are planned to be released upon the publication of this work.
+
+## References
+
+* Allamanis (2022) Miltiadis Allamanis. Graph neural networks in program analysis. _Graph neural networks: foundations, frontiers, and applications_, pp. 483-497, 2022.
+* Reyes Angulo & Paheding (2023) Abel A. Reyes Angulo and Sidike Paheding. The forward-forward algorithm as a feature extractor for skin lesion classification: A preliminary study. _CoRR_, abs/2307.00617, 2023.
+* Belilovsky et al. (2019) Eugene Belilovsky, Michael Eickenberg, and Edouard Oyallon. Greedy layerwise learning can scale to imagenet. In _ICML_, volume 97 of _Proceedings of Machine Learning Research_, pp. 583-593. PMLR, 2019.
+* Bojchevski & Gunnemann (2018) Aleksandar Bojchevski and Stephan Gunnemann. Deep gaussian embedding of graphs: Unsupervised inductive learning via ranking. In _ICLR (Poster)_. OpenReview.net, 2018.
+* Carreira-Perpinan & Wang (2014) Miguel A. Carreira-Perpinan and Weiran Wang. Distributed optimization of deeply nested systems. In _AISTATS_, volume 33 of _JMLR Workshop and Conference Proceedings_, pp. 10-19. JMLR.org, 2014.
+* Chung et al. (2023) Insik Chung, Isaac Han, and Kyung-Joong Kim. Imitation learning using the forward-forward algorithm, 2023. URL [https://openreview.net/forum?id=baF9FqIdY](https://openreview.net/forum?id=baF9FqIdY).
+* Crick (1989) Francis Crick. The recent excitement about neural networks. _Nature_, 337(6203):129-132, 1989.
+* Dai et al. (2018) Hanjun Dai, Zornitsa Kozareva, Bo Dai, Alexander J. Smola, and Le Song. Learning steady-states of iterative algorithms over graphs. In _ICML_, volume 80 of _Proceedings of Machine Learning Research_, pp. 1114-1122. PMLR, 2018.
+* Daigavane et al. (2021) Ameya Daigavane, Balaraman Ravindran, and Gaurav Aggarwal. Understanding convolutions on graphs. _Distill_, 2021. doi: 10.23915/distill.00032. [https://distill.pub/2021/understanding-gnns](https://distill.pub/2021/understanding-gnns).
+* De Vita et al. (2023) Fabrizio De Vita, Rawan M. A. Nawaiseh, Dario Bruneo, Valeria Tomaselli, Marco Lattuada, and Mirko Falchetto. \(\upmu\)-ff: On-device forward-forward training algorithm for microcontrollers. In _2023 IEEE International Conference on Smart Computing (SMARTCOMP)_, pp. 49-56, 2023.
+* Dellaferrera & Kreiman (2022) Giorgia Dellaferrera and Gabriel Kreiman. Error-driven input modulation: Solving the credit assignment problem without a backward pass. In _ICML_, volume 162 of _Proceedings of Machine Learning Research_, pp. 4937-4955. PMLR, 2022.
+* Fan et al. (2019) Wenqi Fan, Yao Ma, Qing Li, Yuan He, Yihong Eric Zhao, Jiliang Tang, and Dawei Yin. Graph neural networks for social recommendation. In _WWW_, pp. 417-426. ACM, 2019.
+* Fey & Lenssen (2019) Matthias Fey and Jan Eric Lenssen. Fast graph representation learning with pytorch geometric. _CoRR_, abs/1903.02428, 2019.
+* Hamilton et al. (2017) William L. Hamilton, Zhitao Ying, and Jure Leskovec. Inductive representation learning on large graphs. In _NIPS_, pp. 1024-1034, 2017.
+
+* Hinton (2021) Geoffrey E. Hinton. How to represent part-whole hierarchies in a neural network. _CoRR_, abs/2102.12627, 2021.
+* Hinton (2022) Geoffrey E. Hinton. The forward-forward algorithm: Some preliminary investigations. _CoRR_, abs/2212.13345, 2022.
+* Jiang & Luo (2022) Weiwei Jiang and Jiayun Luo. Graph neural network for traffic forecasting: A survey. _Expert Syst. Appl._, 207:117921, 2022.
+* Kiefer & Wolfowitz (1952) Jack Kiefer and Jacob Wolfowitz. Stochastic estimation of the maximum of a regression function. _The Annals of Mathematical Statistics_, pp. 462-466, 1952.
+* Kipf & Welling (2017) Thomas N. Kipf and Max Welling. Semi-supervised classification with graph convolutional networks. In _ICLR (Poster)_. OpenReview.net, 2017.
+* Lee & Song (2023) Heung-Chang Lee and Jeonggeun Song. Symba: Symmetric backpropagation-free contrastive learning with forward-forward algorithm for optimizing convergence. _CoRR_, abs/2303.08418, 2023.
+* Li et al. (2016) Yujia Li, Daniel Tarlow, Marc Brockschmidt, and Richard S. Zemel. Gated graph sequence neural networks. In _ICLR (Poster)_, 2016.
+* Lillicrap et al. (2020) Timothy P Lillicrap, Adam Santoro, Luke Marris, Colin J Akerman, and Geoffrey Hinton. Backpropagation and the brain. _Nature Reviews Neuroscience_, 21(6):335-346, 2020.
+* Oguz et al. (2023) Ilker Oguz, Junjie Ke, Qifei Wang, Feng Yang, Mustafa Yildirim, Niyazi Ulas Dinc, Jih-Liang Hsieh, Christophe Moser, and Demetri Psaltis. Forward-forward training of an optical neural network. _CoRR_, abs/2305.19170, 2023.
+* Paheding & Angulo (2023) Sidike Paheding and Abel A. Reyes Angulo. Forward-forward algorithm for hyperspectral image classification: A preliminary study. _CoRR_, abs/2307.00231, 2023.
+* Paliotta et al. (2023) Daniele Paliotta, Mathieu Alain, Balint Mate, and Francois Fleuret. Graph neural networks go forward-forward. _CoRR_, abs/2302.05282, 2023.
+* Park et al. (2022) Namyong Park, Fuchen Liu, Purvanshi Mehta, Dana Cristofor, Christos Faloutsos, and Yuxiao Dong. EvoKG: Jointly modeling event time and network structure for reasoning over temporal knowledge graphs. In _WSDM_, pp. 794-803. ACM, 2022.
+* Paszke et al. (2019) Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Kopf, Edward Z. Yang, Zachary DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and Soumith Chintala. Pytorch: An imperative style, high-performance deep learning library. In _NeurIPS_, pp. 8024-8035, 2019.
+* Plaut et al. (1986) David C Plaut, Steven J Nowlan, and Geoffrey E Hinton. Experiments on learning by back propagation. 1986.
+* Robbins & Monro (1951) Herbert Robbins and Sutton Monro. A stochastic approximation method. _The annals of mathematical statistics_, pp. 400-407, 1951.
+* Rozemberczki et al. (2021) Benedek Rozemberczki, Carl Allen, and Rik Sarkar. Multi-scale attributed node embedding. _J. Complex Networks_, 9(2), 2021.
+* Rumelhart et al. (1986) David E Rumelhart, Geoffrey E Hinton, and Ronald J Williams. Learning representations by back-propagating errors. _nature_, 323(6088):533-536, 1986.
+* Scarselli et al. (2009) Franco Scarselli, Marco Gori, Ah Chung Tsoi, Markus Hagenbuchner, and Gabriele Monfardini. The graph neural network model. _IEEE Trans. Neural Networks_, 20(1):61-80, 2009.
+* Scellier & Bengio (2017) Benjamin Scellier and Yoshua Bengio. Equilibrium propagation: Bridging the gap between energy-based models and backpropagation. _Frontiers in computational neuroscience_, 11:24, 2017.
+* Shchur et al. (2018) Oleksandr Shchur, Maximilian Mumme, Aleksandar Bojchevski, and Stephan Gunnemann. Pitfalls of graph neural network evaluation. _CoRR_, abs/1811.05868, 2018.
+
+* Taylor et al. (2016) Gavin Taylor, Ryan Burmeister, Zheng Xu, Bharat Singh, Ankit B. Patel, and Tom Goldstein. Training neural networks without gradients: A scalable ADMM approach. In _ICML_, volume 48 of _JMLR Workshop and Conference Proceedings_, pp. 2722-2731. JMLR.org, 2016.
+* Tiezzi et al. (2020) Matteo Tiezzi, Giuseppe Marra, Stefano Melacci, Marco Maggini, and Marco Gori. A lagrangian approach to information propagation in graph neural networks. In _ECAI_, volume 325 of _Frontiers in Artificial Intelligence and Applications_, pp. 1539-1546. IOS Press, 2020.
+* Tiezzi et al. (2022) Matteo Tiezzi, Giuseppe Marra, Stefano Melacci, and Marco Maggini. Deep constraint-based propagation in graph neural networks. _IEEE Trans. Pattern Anal. Mach. Intell._, 44(2):727-739, 2022.
+* Velickovic et al. (2018) Petar Velickovic, Guillem Cucurull, Arantxa Casanova, Adriana Romero, Pietro Lio, and Yoshua Bengio. Graph attention networks. In _ICLR (Poster)_. OpenReview.net, 2018.
+* Wang et al. (2020) Yewen Wang, Jian Tang, Yizhou Sun, and Guy Wolf. Decoupled greedy learning of graph neural networks. 2020.
+* Whittington and Bogacz (2019) James CR Whittington and Rafal Bogacz. Theories of error back-propagation in the brain. _Trends in cognitive sciences_, 23(3):235-250, 2019.
+* Wu et al. (2021) Zonghan Wu, Shirui Pan, Fengwen Chen, Guodong Long, Chengqi Zhang, and Philip S. Yu. A comprehensive survey on graph neural networks. _IEEE Trans. Neural Networks Learn. Syst._, 32(1):4-24, 2021.
+* You et al. (2020) Yuning You, Tianlong Chen, Zhangyang Wang, and Yang Shen. L2-GCN: layer-wise and learned efficient training of graph convolutional networks. In _CVPR_, pp. 2124-2132. Computer Vision Foundation / IEEE, 2020.
+* Zhang et al. (2022) Zehong Zhang, Lifan Chen, Feisheng Zhong, Dingyan Wang, Jiaxin Jiang, Sulin Zhang, Hualiang Jiang, Mingyue Zheng, and Xutong Li. Graph neural network approaches for drug-target interactions. _Current Opinion in Structural Biology_, 73:102327, 2022.
+* Zhao et al. (2023) Gongpei Zhao, Tao Wang, Yidong Li, Yi Jin, Congyan Lang, and Haibin Ling. The cascaded forward algorithm for neural network training. _CoRR_, abs/2303.09728, 2023.
+* Zhou et al. (2020) Jie Zhou, Ganqu Cui, Shengding Hu, Zhengyan Zhang, Cheng Yang, Zhiyuan Liu, Lifeng Wang, Changcheng Li, and Maosong Sun. Graph neural networks: A review of methods and applications. _AI Open_, 1:57-81, 2020.
+
+In the appendix, we provide the dataset description (Appendix A), experimental settings (Appendix B), algorithms of the proposed forward graph learning approach (Appendix C), and additional experimental results (Appendix E).
+
+## Appendix A Dataset Description
+
+In experiments, we use the following five real-world graphs drawn from three different data domains.
+
+* PubMed, Citeseer, and CoraML are citation networks from Bojchevski & Gunnemann (2018), where nodes represent documents, and edges denote citations between the corresponding papers. Node labels denote the topic of the paper, and node features correspond to the bag-of-words representation of the paper.
+* Amazon is a co-purchase network from Shchur et al. (2018), which corresponds to the Photo segment, where nodes represent goods, and edges denote that two goods are frequently bought together. Node labels represent item categories, and node features denote the bag-of-words representation of the product review.
+* GttHub is a followership graph from Rozemberczki et al. (2021), where nodes are developers, and edges denote mutual follower relationships. Nodes are classified into two groups of web and ML developers, and node features denote the developer's information, such as employer name and email address.
+
+The statistics of these graph datasets are provided in Table 1.
+
+## Appendix B Experimental Settings
+
+**Hyperparameter Settings and Model Configurations.** Following the default configurations, we ran graph convolutional network (GCN) (Kipf & Welling, 2017) with a normalized adjacency matrix, _i.e._, self-loops were added and symmetric normalization was applied. We used the mean aggregator with GraphSAGE (SAGE) (Hamilton et al., 2017). For graph attention network (GAT) (Velickovic et al., 2018), we used four attention heads, and concatenated the multi-head attention. Also, based on the default settings of GAT, we added self-loops to the graph, and used a negative slope of 0.2 for LeakyReLU nonlinearity. For all GNNs and across all graph learning tasks, we set the size of hidden units to 128. We used the Adam optimizer with a learning rate of 0.001, and a weight decay of 0.0005. For both tasks, we split the data (_i.e._, nodes and edges) randomly into train-validation-test sets, with a ratio of 64%-16%-20%. Also, we set the max training epochs to 1000, and applied validation-based early stopping with a patience of 100, for both tasks. In the node classification tasks, some learning algorithms, such as the Forward-Forward algorithm (FF), explicitly construct negative samples for training. For those algorithms, we used all available classes to create negative samples for each node, _i.e._, given \(K\) node classes, \(K-1\) negative samples were used for the training of each node. For FF and its variants, we set the threshold parameter \(\theta\) to 2.0, and for FF-SymBa, we set its \(\alpha\) parameter to 4.0, both following the settings used in the original papers. We set the temperature parameter \(\tau\) to 1.0 in Eq. (6). We define the _Merge_ function in Eq. (7) to incorporate the signal from the immediate upper layer, _i.e._, \(\mathbf{h}_{i,t-1}^{(\ell+1)}\), and concatenate it with the input \(\mathbf{h}_{i,t}^{(\ell-1)}\). For Eq. (8), we define the _Merge_ function to incorporate signals from upper layers, which affect only the loss, but are not fed into the input for the next layer. In evaluating FF-SymBa (Lee & Song, 2023) for node classification, we used FF-SymBa on top of the proposed virtual node technique (Section 3.1) so it can be used for GNNs.
+
+**Software.** We implemented the proposed forward learning frameworks in Python 3.8, using PyTorch (Paszke et al., 2019) v1.13.1. We used PyTorch Geometric (Fey & Lenssen, 2019) v.2.2.0 for the implementations of GCN, SAGE, and GAT, and for the edge splitting and sampling module used for link prediction. For PEPITA (Dellarerra & Kreiman, 2022), we adapted the original implementation1 for GNNs, _i.e._, after performing forward passes through GNN layers, we compute the error with respect to node labels, and use it to construct modulated inputs for the training nodes.
+
+Footnote 1: [https://github.com/GiorgiaD/PEPITA](https://github.com/GiorgiaD/PEPITA)
+
+**Hardware.** Experiments were performed on a Linux server running Ubuntu 20.04.5 LTS on AWS, with an NVIDIA A100 SXM4 GPU with 40GB memory, Intel Xeon Platinum 8275CL CPUs @ 3.00GHz, and 1.1TB RAM.
+
+Algorithms
+
+We present the algorithms of the proposed forward graph learning approach for node classification, _i.e._, the forward-forward learning approach (Alg. 1), the single-forward learning approach (Alg. 2), and the single-forward learning approach with top-down signal incorporation (Alg. 3). We then present the forward learning algorithm for link prediction in Alg. 4.
+
+```
+0: GNN \(\mathcal{G}\), graph \(G\), input features \(\mathbf{X}\), node labels \(\mathbf{y}\)
+0: trained GNN \(\mathcal{G}\) /* Construct positive and negative inputs
+1ifextending graph \(\mathcal{G}\) with virtual nodesthen
+2\(G^{\text{pos}},G^{\text{neg}}\leftarrow\) positive and negative graphs built using virtual nodes and labels \(\mathbf{y}\) (Sec. 3.1)
+3\(\mathbf{X}^{\text{pos}},\mathbf{X}^{\text{neg}}\leftarrow\mathbf{X},\mathbf{X}\)
+4elseifextending input features \(\mathbf{X}\) by appending labelsthen
+5\(G^{\text{pos}},G^{\text{neg}}\gets G,G\)
+6\(\mathbf{X}^{\text{pos}},\mathbf{X}^{\text{neg}}\leftarrow\) positive and negative features built by appending labels using \(\mathbf{y}\) (Sec. 3.1)
+7 end if
+8
+9:\(\mathbf{f}^{\text{neg}}\) Train layer by layer progressively from the bottom to the top \(\bullet\)/\(\mathbf{H}^{\text{pos}},\mathbf{H}^{\text{neg}}\leftarrow\mathbf{X}^{\text{pos}}, \mathbf{X}^{\text{neg}}\)
+10:forlayer in GNN \(\mathcal{G}\)'s layersdo
+11whilenot convergeddo
+12\(\mathbf{H}^{\text{pos}}_{\text{red}}\gets layer.\text{forward}(G^{\text{pos} \prime},\mathbf{H}^{\text{pos}\prime})\)
+13\(\mathbf{H}^{\text{neg}}_{\text{red}}\gets layer.\text{forward}(G^{\text{neg} \prime},\mathbf{H}^{\text{neg}})\)
+14 Compute the local loss (_e.g._, the FF loss (Eq. 3)) for _layer_ using \(\mathbf{H}^{\text{pos}}_{\text{red}}\) and \(\mathbf{H}^{\text{neg}\prime}_{\text{red}}\)
+15 Update _layer_'s parameters using an optimizer of choice, _e.g._, SGD and Adam
+16 end while
+17:\(best\_layer\leftarrow\) load the best layer found during the local training (lines 10 to 15)
+18ifextending graph \(\mathcal{G}\) with virtual nodesthen
+19\(\mathbf{H}^{\text{pos}},\mathbf{H}^{\text{neg}}\gets best\_layer.\text{forward}(G^{ \text{pos}},\mathbf{H}^{\text{pos}\prime}),\text{ }best\_layer.\text{forward}(G^{\text{pos}},\mathbf{H}^{\text{pos}\prime})\)
+20elseifextending input features \(\mathbf{X}\) by appending labelsthen
+21\(\mathbf{H}^{\text{pos}},\mathbf{H}^{\text{neg}}\gets best\_layer.\text{forward}(G^{ \text{pos}},\mathbf{H}^{\text{pos}\prime}),\text{ }best\_layer.\text{forward}(G^{\text{neg} \prime},\mathbf{H}^{\text{neg}})\)
+22 end if
+23:\(\mathbf{H}^{\text{pos}},\mathbf{H}^{\text{neg}}\leftarrow\mathbf{H}^{\text{pos}\prime}. \text{detach}(),\mathbf{H}^{\text{neg}}.\text{detach}()\)
+24 end while
+```
+
+**Algorithm 2**Single-Forward Learning of GNNs for Node Classification (Section 3.2)
+
+```
+0: GNN \(\mathcal{G}\), graph \(G\), input features \(\mathbf{X}\), node labels \(\mathbf{y}\)
+0: trained GNN \(\mathcal{G}\)
+1:\(G^{\prime}\leftarrow\) a positively augmented graph using virtual nodes and node labels \(\mathbf{y}\) (Section 3.2)
+2:/* Train layer by layer progressively from the bottom to the top \(\bullet\)/\(\mathbf{H}\leftarrow\mathbf{X}\)
+3forlayer in GNN \(\mathcal{G}\)'s layers do
+4whilenot convergeddo
+5\(\mathbf{H}_{\text{fwd}}\gets layer.\text{forward}(G^{\prime},\mathbf{H})\)
+6 Compute the local loss given by Eq. (6) for _layer_ using \(\mathbf{H}_{\text{fwd}}\)
+7: Update _layer_'s parameters using an optimizer of choice, _e.g._, SGD and Adam
+8:end
+9:\(best\_layer\leftarrow\) load the best layer found during the local training (lines 4 to 8)
+10:\(\mathbf{H}\leftarrow\)\(best\_layer.\text{forward}(G^{\prime},\mathbf{H})\)
+11:\(\mathbf{H}\leftarrow\mathbf{H}.\text{detach}()\)
+12:end
+```
+
+**Algorithm 3**Single-Forward Learning of GNNs for Node Classification (Section 3.3)
+```
+0: GNN \(\mathcal{G}\), graph \(G\), input features \(\mathbf{X}\), node labels \(\mathbf{y}\)
+0: trained GNN \(\mathcal{G}\)
+1\(G^{\prime}\leftarrow\) a positively augmented graph using virtual nodes and node labels \(\mathbf{y}\) (Section 3.2)
+2 Initialize \(\{\mathbf{H}_{t-1}^{(\ell)}\}_{\ell}\) and \(\{\mathbf{H}_{t}^{(\ell)}\}_{\ell}\) // to store embeddings at the previous and current time steps /* Forward-only training with top-down signal incorporation */
+3whilenot convergeddo
+4for\(\ell\), layer in enumerate(GNN \(\mathcal{G}\)'s layers) do
+5ifsignal-path = "top-to-input"then
+6 Construct \(\mathbf{H}_{t}^{(\ell-1)\prime}\) by applying Eq. (7) with \(\{\mathbf{H}_{t-1}^{(\ell)}\}_{\ell}\) and \(\{\mathbf{H}_{t}^{(\ell)}\}_{\ell}\)
+7else
+8\(\mathbf{H}_{t}^{(\ell-1)\prime}\leftarrow\mathbf{H}_{t}^{(\ell-1)}\)
+9 end if
+10\(\mathbf{H}_{t}^{(\ell)}\leftarrow\)layer.forward(\(G^{\prime}\), \(\mathbf{H}_{t}^{(\ell-1)\prime}\)).detach()
+11ifsignal-path = "top-to-loss"then
+12 Compute the local loss given by Eq. (8) for layer using \(\{\mathbf{H}_{t-1}^{(\ell)}\}_{\ell}\) and \(\{\mathbf{H}_{t}^{(\ell)}\}_{\ell}\)
+13else
+14 Compute the local loss given by Eq. (6) for layer using \(\mathbf{H}_{t}^{(\ell)}\)
+15 end if
+16 Update layer's parameters using an optimizer of choice, _e.g._, SGD and Adam
+17
+18 end for
+19foreach\(\ell\in[1,L]\)do
+20\(\mathbf{H}_{t-1}^{(\ell)}\leftarrow\mathbf{H}_{t}^{(\ell)}\)
+21 end for
+```
+
+**Algorithm 3**Single-Forward Learning of GNNs with Top-Down Signal Paths for Node Classification (Section 3.3)
+
+```
+0: GNN \(\mathcal{G}\), graph \(G\), input features \(\mathbf{X}\)
+0: trained GNN \(\mathcal{G}\)
+1\(E^{\text{post}}\), \(E^{\text{neg}}\) \(\leftarrow\) positive and negative edges sampled from graph \(G\) (Section 3.4) /* Train layer by layer progressively from the bottom to the top */
+2\(\mathbf{H}\leftarrow\mathbf{X}\)
+3forlayer in GNN \(\mathcal{G}\)'s layers do
+4whilenot convergeddo
+5\(\mathbf{H}_{\text{fwd}}\leftarrow\)layer.forward(\(G\), \(\mathbf{H}\))
+6 Compute the local loss for layer using the link probability (Eq. 9) with node embeddings \(\mathbf{H}_{\text{fwd}}\), and positive and negative edge sets \(E^{\text{post}}\) and \(E^{\text{neg}}\)
+7 Update layer's parameters using an optimizer of choice, _e.g._, SGD and Adam
+8
+9 end for
+10\(\textit{best\_layer}\leftarrow\) load the best layer found during the local training (lines 4 to 8)
+11\(\mathbf{H}\leftarrow\)best_layer.forward(\(G\), \(\mathbf{H}\))
+12\(\mathbf{H}\leftarrow\mathbf{H}\).detach()
+13
+14 end while
+```
+
+**Algorithm 4**Single-Forward Learning of GNNs for Link Prediction (Section 3.4)
+
+Additional Related Work
+
+In Section 2, we discuss recent alternatives to backpropagation (BP) for learning GNNs based on the forward-forward algorithm (Hinton, 2022). In this section, we review other alternative learning approaches and related works for the training of GNNs.
+
+Carreira-Perpinan & Wang (2014) and Taylor et al. (2016) proposed alternative approaches to BP for learning neural networks (NNs), where the learning of NNs is cast as a constrained optimization problem in the Lagrangian framework, with neural computations expressed as constraints. These approaches are inherently local, in the sense that the gradient computation relies on neighboring neurons, not on the BP over the entire network. However, they are not scalable due to the high memory requirement, and thus are inapplicable to large-scale problems.
+
+Based on this Lagrangian-based approach, Tiezzi et al. (2020, 2022) presented an alternative method for learning GNNs. Specifically, they simplified the learning process of the GNN* model (Scarselli et al., 2009), a representative recurrent GNN model, which performs graph diffusion repeatedly until it converges to a stable fixed point. The LP-GNN proposed in Tiezzi et al. (2020, 2022) adopts a mixed strategy to enable a more efficient training of GNN*, which employs a constraint-based propagation scheme, thereby avoiding the explicit computation of the fixed point of the diffusion process in GNN*, while using BP in updating the NNs that model the state transition and output functions. Accordingly, although LP-GNN departs from the usual BP-based GNN training, it still relies on BP for learning GNNs. By contrast, ForwardGNN is free from BP as a forward-only learning scheme for GNNs.
+
+Stochastic steady-state embedding (SSE) (Dai et al., 2018) presents another alternative learning algorithm, in the context of learning steady-state solutions of iterative algorithms over graphs, _e.g._, PageRank scores and connected components. To obtain steady-state solutions efficiently, SSE proposes a stochastic fixed-point gradient descent process, inspired by the policy iteration in reinforcement learning. While SSE presents an alternative learning approach, SSE is not, per se, a general training scheme for GNNs like ForwardGNN, as its goal is to learn an algorithm achieving steady-state solutions of iterative graph algorithms, which greatly differs from the task of GNN training ForwardGNN addresses.
+
+Another line of works investigated layer-wise approaches for learning GNNs. A layer-wise learning idea closely related to our work first appeared in the vision domain (Belilovsky et al., 2019), which proposed a greedy layer-wise learning technique for deep convolutional neural networks (CNNs), and obtained promising results on large-scale datasets such as ImageNet. In Belilovsky et al. (2019), a CNN model gets trained progressively and greedily, _i.e._, layer by layer from the bottom to the top. To enable a layer-wise training, they formulate and solve an auxiliary problem for each layer, where an auxiliary classifier is attached to the layer, forming a block, and the original CNN layer and the auxiliary classifier in the block are jointly optimized in terms of the training accuracy of the auxiliary classifier. You et al. (2020) extended this approach for a layer-wise training of GNNs, in which the CNN layers are replaced with the GNN layers. Furthermore, You et al. (2020) streamlined the graph convolution operation by decoupling the feature aggregation and transformation, and introduced a learnable RNN controller, which automatically decides when to stop the training of each layer via reinforcement learning. A follow-up work presented by Wang et al. (2020) further improved the efficiency of layer-wise GNN training of You et al. (2020) via the proposed parallel training and lazy update scheme. While these methods train GNNs layer by layer, they still rely on BP, since each block is a multi-layer architecture, and as a result, the error derivatives are propagated across the layers in the block for optimization. By contrast, ForwardGNN operates in the forward-only learning regime, which is the focus of this work. Further, their optimization framework allows only bottom-up signal propagation, and does not provide a way to incorporate the top-down signals. Thus, using the above layer-wise methods, the training of each layer cannot be informed by what the upper layers have learned as in ForwardGNN. Also, these studies only investigate the node classification task, and miss out the other fundamental graph learning task of link prediction. In this work, we systematically explore the potential of forward-only learning for both node classification and link prediction tasks.
+
+Additional Experimental Results
+
+### Node Classification Results
+
+* Figure 6 presents the node classification accuracy (y-axis) vs. memory usage (x-axis) per graph neural networks.
+* Table 2 presents the node classification performance of GCN, SAGE, and GAT models averaged over five runs on five real-world graphs, obtained with a different number of layers, and using different learning approaches.
+* Table 3 presents the GPU memory usage (in MB) during the GNN training for node classification, observed with a different number of layers, and using different learning approaches.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline \multicolumn{5}{c}{(a) Amazon} \\ \hline \hline \multirow{2}{*}{**Method**} & \multicolumn{4}{c}{**Accuracy (\(\uparrow\))**} \\ \cline{2-5}  & \# Layers-1 & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & 45.22\(\pm\)0.7 & 70.69\(\pm\)13.8 & 90.75\(\pm\)1.0 & 91.22\(\pm\)0.8 \\ SymBa-GCN & 60.77\(\pm\)0.8 & 59.62\(\pm\)1.8 & 59.71\(\pm\)4.3 & 59.29\(\pm\)2.4 \\ CaFe-GCN & 41.39\(\pm\)0.6 & 58.56\(\pm\)6.3 & 58.84\(\pm\)7.9 & 58.56\(\pm\)7.8 \\ PEPTA-GCN & 11.65\(\pm\)5.1 & 20.86\(\pm\)6.3 & 20.22\(\pm\)7.3 & 19.87\(\pm\)7.1 \\ FL-LA-GCN (Sec 3.1) & 90.48\(\pm\)0.8 & 67.80\(\pm\)7.0 & 53.50\(\pm\)10.7 & 53.49\(\pm\)9.9 \\ FV-FN-GCN (Sec 3.1) & 23.45\(\pm\)2.8 & 21.23\(\pm\)2.7 & 22.14\(\pm\)2.8 & 22.38\(\pm\)2.1 \\ SF-GCN (Sec 3.2) & 92.00\(\pm\)0.8 & 92.14\(\pm\)1.2 & 92.26\(\pm\)1.0 & 91.83\(\pm\)1.1 \\ SF-Top-Top-Loss-GCN (Sec 3.3) & 93.92\(\pm\)0.4 & 78.77\(\pm\)7.0 & 58.51\(\pm\)1.5 & 50.07\(\pm\)5.4 \\ SF-Top-Top-Inqut-GCN (Sec 3.3) & 93.07\(\pm\)0.8 & 92.88\(\pm\)0.9 & **92.38\(\pm\)1.1** & **92.99\(\pm\)1.1** \\ \hline Backpropagation-SAGE & 41.23\(\pm\)8.2 & 91.99\(\pm\)0.9 & **94.21\(\pm\)1.0 & 93.22\(\pm\)0.8 \\ SymBa-SAGE & 92.20\(\pm\)1.0 & 92.20\(\pm\)0.9 & 91.75\(\pm\)0.7 & 91.12\(\pm\)0.9 \\ CaFe-SAGE & 35.36\(\pm\)5.4 & 41.37\(\pm\)5.8 & 41.07\(\pm\)5.9 & 40.37\(\pm\)5.8 \\ PEPTTA-SAGE & 11.22\(\pm\)5.9 & 25.57\(\pm\)2.0 & 24.72\(\pm\)3.5 & 22.16\(\pm\)4.9 \\ FL-LA-SAGE (Sec 3.1) & 98.16\(\pm\)1.7 & 88.92\(\pm\)1.1 & 87.49\(\pm\)2.2 & 88.69\(\pm\)0.7 \\ FV-V-SAGE (Sec 3.1) & 20.26\(\pm\)0.3 & 30.82\(\pm\)18.1 & 22.26\(\pm\)1.9 & 33.79\(\pm\)20.9 \\ SF-SAGE (Sec 3.2) & 90.05\(\pm\)0.8 & 91.12\(\pm\)0.6 & 91.50\(\pm\)0.8 & 91.56\(\pm\)0.5 \\ SF-Top-Top-Loss-SAGE (Sec 3.3) & **93.42\(\pm\)**0.7 & 88.93\(\pm\)1.8 & 87.78\(\pm\)1.2 & 85.03\(\pm\)2.0 \\ SF-Top-Top-Inqut-GCN (Sec 3.3) & 92.95\(\pm\)0.8 & 93.15\(\pm\)0.8 & 93.54\(\pm\)0.7 & 93.22\(\pm\)0.8 \\ \hline Backpropagation-GAT & 30.47\(\pm\)5.6 & 57.91\(\pm\)20.7 & 90.60\(\pm\)1.1 & 8.898\(\pm\)1.1 \\ SymBa-GAT & **92.81\(\pm\)**0.5 & 78.93\(\pm\)29.0 & **93.35\(\pm\)**0.6 & **92.76\(\pm\)**0.9 \\ CaFe-GAT & 41.66\(\pm\)3.9 & 47.92\(\pm\)8.8 & 47.76\(\pm\)8.6 & 47.35\(\pm\)5.9 \\ PEPTA-GAT & 13.40\(\pm\)3.7 & 23.50\(\pm\)21.2 & 17.19\(\pm\)6.8 & 21.53\(\pm\)3.7 \\ FF-LA-GAT (Sec 3.1) & 90.75\(\pm\)0.8 & 60.33\(\pm\)20.2 & 58.38\(\pm\)22.0 & 55.62\(\pm\)2.31 \\ FV-V-GAT (Sec 3.1) & 28.82\(\pm\)4.2 & 34.86\(\pm\)20.1 & 74.36\(\pm\)9.0 & 43.97\(\pm\)2.6 & 27.49\(\pm\)5.0 \\ SF-GAF (Sec 3.2) & 88.89\(\pm\)0.9 & **91.88\(\pm\)**0.9 & 91.99\(\pm\)0.8 & 92.08\(\pm\)0.9 \\ SF-Top-To-Loss-GAT (Sec 3.3) & 61.36\(\pm\)6.4 & 90.12\(\pm\)0.8 & 90.84\(\pm\)0.9 & 89.39\(\pm\)1.8 \\ SF-Top-To-Inqut-GCN (Sec 3.3) & 89.73\(\pm\)2.0 & 90.88\(\pm\)1.2 & 90.78\(\pm\)1.0 & 91.03\(\pm\)1.0 \\ \hline \hline \end{tabular} 
+\begin{tabular}{l c c c c} \hline \hline \multicolumn{5}{c}{(b) GiftHub} \\ \hline \hline \multirow{2}{*}{**Method**} & \multicolumn{4}{c}{**Accuracy (\(\uparrow\))**} \\ \cline{2-5}  & \# Layers=1 & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & 74.40\(\pm\)0.4 & 74.41\(\pm\)0.4 & 79.24\(\pm\)5.9 & **86.49\(\pm\)**0.3 \\ SymBa-GCN & 74.41\(\pm\)0.4 & 74.89\(\pm\)1.0 & 74.96\(\pm\)0.6 & 74.96\(\pm\)0.7 \\ CaFe-GCN & 74.40\(\pm\)0.4 & 74.41\(\pm\)0.4 & 74.41\(\pm\)0.4 & 74.41\(\pm\)0.4 \\ PEPTA-GCN & 64.42\(\pm\)1.9 & 74.50\(\pm\)0.4 & 74.39\(\pm\)0.4 & 74.42\(\pm\)0.4 \\ FE-LA-GCN (Sec 3.1) & 81.87\(\pm\)7.1 & 79.33\(\pm\)2.3 & 77.76\(\pm\)2.7 & 76.51\(\pm\)2.2 \\ FV-FN-GCN (Sec 3.1) & 74.41\(\pm\)0.4 & 64.51\(\pm\)19.7 & 75.01\(\pm\)0.6 & 73.74\(\pm\)1.2 \\ SF-GCN (Sec 3.2) & 81.45\(\pm\)0.5 & 83.12\(\pm\)0.7 & 83.32\(\pm\)0.5 & 83.28\(\pm\)0.5 \\ SF-Top-To-Loss-GCN (Sec 3.3) & **86.16\(\pm\)**0.3 & 75.93\(\pm\)20.0 & 74.41\(\pm\)0.4 & 74.41\(\pm\)0.4 \\ SF-Top-To-Input-GCN (Sec 3.3) & **81.04\(\pm\)**0.2 & **83.15\(\pm\)**0.8 & **84.37\(\pm\)**0.2 & 84.59\(\pm\)0.4 \\ \hline Backpropagation-SAGE & 74.41\(\pm\)0.4 & **86.17\(\pm\)**0.4 & **86.73\(\pm\)**0.4 & **86.86\(\pm\)**0.3 \\ SymBa-SAGE & 84.89\(\pm\)0.5 & 85.65\(\pm\)0.3 & 85.03\(\pm\)10.10 & 86.12\(\pm\)0.5 \\ CaFe-SAGE & 74.40\(\pm\)0.4 & 74.41\(\pm\)0.4 & 74.41\(\pm\)0.4 & 74.41\(\pm\)0.4 \\ PEPTA-SAGE & 64.52\(\pm\)1.6 & 74.75\(\pm\)0.6 & 74.41\(\pm\)0.4 & 74.42\(\pm\)0.4 \\ FE-LA-SAGE (Sec 3.1) & 75.33\(\pm\)10.7 & 74.85\(\pm\)10.7 & 74.93\(\pm\)12.4 & 74.88\(\pm\)1.3 \\ FE-V-SAGE (Sec 3.1) & **82.4\(\pm\)**0.2 & 86.03\(\pm\)0.2 & 86.01\(\pm\)0.8 & 86.1\(\pm\)0.3 \\ SF-SAGE (Sec 3.2) & 81.51\(\pm\)0.4 & 83.15\(\pm\)0.8 & 83.85\(\pm\)0.8 & 84.37\(\pm\)0.5 \\ SF-Top-To-Loss-GCN (Sec 3.5) & 80.14\(\pm\)0.7 & 82.12\(\pm\)0.8 & 83.03\(\pm\)0.3 & 82.92\(\pm\)1.0 \\ SF-Top-To-Inqut-SAGE (Sec 3.3) & 82.33\(\pm\)0.3 & 85.23\(\pm\)0.3 & 85.23\(\pm\)0.3 \\ \hline Backpropagation-GAT & 74.41\(\pm\)0.4 & 74.41\(\pm\)0.4 & 76.75\(\pm\)4.5 & 81.62\(\pm\)5.6 \\ SymBa-GAT & **86.70\(\pm\)**0.6 & **86.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline  & \multicolumn{4}{c}{**Accuracy (\(\uparrow\))**} \\ \cline{2-5}
+**Method** & \# Layers=1 & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & 83.92\(\pm\)0.9 & 94.59\(\pm\)0.2 & 95.32\(\pm\)0.3 & 95.44\(\pm\)0.2 \\ SymBa-GCN & 87.34\(\pm\)0.7 & 89.49\(\pm\)0.7 & 89.04\(\pm\)0.7 & 89.23\(\pm\)0.5 \\ CaFo-GCN & 69.33\(\pm\)1.3 & 69.85\(\pm\)1.1 & 69.33\(\pm\)1.9 & 69.68\(\pm\)1.9 \\ PEPTIA-GCN & 13.44\(\pm\)2.5 & 19.24\(\pm\)2.1 & 19.72\(\pm\)2.2 & 21.37\(\pm\)1.6 \\ FF-LA-GCN (Sec 3.1) & **95.37\(\pm\)**0.5 & **95.89\(\pm\)**0.5 & **95.68\(\pm\)**0.3 & **95.96\(\pm\)**0.6 \\ FF-VN-GCN (Sec 3.1) & 50.34\(\pm\)7.1 & 59.86\(\pm\)2.5 & 60.17\(\pm\)8.8 & 59.93\(\pm\)1.2 \\ SF-GCN (Sec 3.2) & 93.67\(\pm\)0.7 & 92.50\(\pm\)0.6 & 48.88\(\pm\)0.6 & 95.30\(\pm\)0.5 \\ SF-Top-To-Loss-GCN (Sec 3.3) & 93.46\(\pm\)0.5 & 93.74\(\pm\)0.9 & 94.83\(\pm\)0.5 & 94.83\(\pm\)0.5 \\ SF-Top-To-Input-GCN (Sec 3.3) & 94.33\(\pm\)0.5 & 94.55\(\pm\)0.4 & 95.16\(\pm\)0.3 & 94.85\(\pm\)0.3 \\ \hline Backpropagation-SAGE & 87.07\(\pm\)0.7 & 95.02\(\pm\)0.2 & **95.80\(\pm\)**0.3 & 95.21\(\pm\)0.4 \\ SymBa-SAGE & 88.69\(\pm\)0.9 & 91.76\(\pm\)1.1 & 91.57\(\pm\)0.8 & 92.44\(\pm\)1.3 \\ CaFo-SAGE & 61.70\(\pm\)2.0 & 60.61\(\pm\)2.2 & 59.46\(\pm\)2.6 & 59.17\(\pm\)2.6 \\ PEPTIA-SAGE (Sec 3.1) & 14.05\(\pm\)2.6 & 21.44\(\pm\)2.1 & 19.60\(\pm\)2.0 & 16.91\(\pm\)3.4 \\ FF-LA-SAGE (Sec 3.1) & 95.45\(\pm\)0.3 & **95.70\(\pm\)**0.5 & 95.77\(\pm\)0.4 & **95.72\(\pm\)**0.5 \\ FF-VN-SAGE (Sec 3.1) & 89.16\(\pm\)0.7 & 91.66\(\pm\)0.3 & 93.15\(\pm\)1.1 & 94.21\(\pm\)2.1 \\ SF-SAGE (Sec 3.2) & 88.29\(\pm\)0.9 & 91.69\(\pm\)1.3 & 92.70\(\pm\)0.6 & 92.56\(\pm\)0.1 \\ SF-Top-To-Loss-SAGE (Sec 3.3) & 80.54\(\pm\)1.2 & 92.37\(\pm\)0.8 & 93.98\(\pm\)0.6 & 94.33\(\pm\)0.4 \\ SF-Top-To-Input-SAGE (Sec 3.3) & 91.48\(\pm\)0.9 & 93.48\(\pm\)0.6 & 93.18\(\pm\)0.9 & 93.20\(\pm\)1.0 \\ \hline Backpropagation-GAT & 80.57\(\pm\)1.2 & 94.12\(\pm\)0.8 & 95.02\(\pm\)0.6 & 95.04\(\pm\)0.4 \\ SymBa-GAT & 91.85\(\pm\)0.4 & 94.78\(\pm\)0.6 & 95.23\(\pm\)0.2 & 95.06\(\pm\)0.5 \\ CaFo-GAT & 73.72\(\pm\)1.6 & 93.72\(\pm\)1.9 & 73.20\(\pm\)2.8 & 73.39\(\pm\)2.2 \\ PEPTIA-GAT & 17.73\(\pm\)4.4 & 16.91\(\pm\)2.2 & 19.27\(\pm\)3.6 & 20.09\(\pm\)3.6 \\ FF-LA-GAT (Sec 3.1) & **94.83\(\pm\)**0.7 & **95.77\(\pm\)**0.2 & **95.63\(\pm\)**0.4 & **95.37\(\pm\)**0.5 \\ FF-VN-GAT (Sec 3.1) & 91.78\(\pm\)0.5 & 94.05\(\pm\)0.8 & 94.97\(\pm\)0.4 & 95.23\(\pm\)0.4 \\ SF-GAT (Sec 5.2) & 87.89\(\pm\)1.6 & 92.47\(\pm\)1.2 & 92.87\(\pm\)0.5 & 93.44\(\pm\)0.5 \\ SF-Top-To-Loss-GAT (Sec 3.3) & 80.71\(\pm\)0.9 & 92.47\(\pm\)1.0 & 91.76\(\pm\)1.7 & 91.95\(\pm\)1.3 \\ SF-Top-To-Input-GAT (Sec 3.3) & 89.28\(\pm\)1.7 & 93.86\(\pm\)0.5 & 94.19\(\pm\)0.3 & 93.91\(\pm\)0.5 \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: _(Continued from the previous table)_ Node classification performance of GCN, SAGE, and GAT averaged over five runs on five real-world graphs, obtained with a different number of layers, and using different learning methods. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+
+\end{table}
+Table 2: _(Continued from the previous table)_ Node classification performance of GCN, SAGE, and GAT averaged over five runs on five real-world graphs, obtained with a different number of layers, and using different learning methods. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+
+\end{table}
+Table 3: GPU memory usage (in MB) for node classification. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline  & \multicolumn{4}{c}{**GPU Memory Usage (\(\downarrow\))**} \\ \cline{2-5}
+**Method** & \# Layers=1 & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & 5.11\(\pm\)0.0 & 13.54\(\pm\)0.0 & 21.96\(\pm\)0.0 & 30.38\(\pm\)0.0 \\ SymBs-GCN & 104.36\(\pm\)0.1 & 104.65\(\pm\)0.2 & 104.79\(\pm\)0.1 & 104.82\(\pm\)0.1 \\ CaFG-GCN & **4.07\(\pm\)**0.0 & **4.07\(\pm\)**0.0 & **4.09\(\pm\)**0.0 & **4.09\(\pm\)**0.0 \\ PEPTA-GCN (Sec 3.1) & 41.03\(\pm\)0.0 & 51.84\(\pm\)0.0 & 62.67\(\pm\)0.0 & 73.49\(\pm\)0.0 \\ FE-LA-GCN (Sec 3.1) & 87.06\(\pm\)0.0 & 88.92\(\pm\)0.0 & 88.92\(\pm\)0.0 & 88.89\(\pm\)0.0 \\ FF-VN-GCN (Sec 3.1) & 89.90\(\pm\)0.1 & 90.20\(\pm\)0.2 & 90.33\(\pm\)0.1 & 90.36\(\pm\)0.1 \\ SF-GCN (Sec 3.2) & 33.35\(\pm\)0.0 & 33.35\(\pm\)0.0 & 33.35\(\pm\)0.0 & 33.35\(\pm\)0.0 \\ SF-Top-Top-Loss-GCN (Sec 3.3) & 18.78\(\pm\)0.0 & 23.22\(\pm\)0.0 & 26.22\(\pm\)0.0 & 30.70\(\pm\)0.0 \\ SF-Top-Top-Inputi-GCN (Sec 3.3) & 33.26\(\pm\)0.0 & 37.26\(\pm\)0.0 & 37.33\(\pm\)0.0 & 38.06\(\pm\)0.1 \\ \hline Backpropagation-SAGE & 22.16\(\pm\)0.0 & 29.66\(\pm\)0.0 & 37.16\(\pm\)0.0 & 44.66\(\pm\)0.0 \\ SymBs-SAGE & 240.30\(\pm\)0.0 & 240.30\(\pm\)0.0 & 34.00\(\pm\)0.0 & 240.30\(\pm\)0.0 \\ CaFG-SAGE & **4.07\(\pm\)**0.0 & 4.07\(\pm\)0.0 & 4.07\(\pm\)0.0 & **4.07\(\pm\)**0.0 \\ PEPTA-SAGE & 58.34\(\pm\)0.0 & 68.00\(\pm\)0.0 & 77.86\(\pm\)0.0 & 87.72\(\pm\)0.0 \\ FE-LA-SAGE (Sec 3.2) & 27.00\(\pm\)0.0 & 27.00\(\pm\)0.3 & 26.86\(\pm\)0.0 & 226.86\(\pm\)0.0 \\ FF-VN-SAGE (Sec 3.1) & 225.85\(\pm\)0.0 & 22.85\(\pm\)0.0 & 225.85\(\pm\)0.0 & 225.85\(\pm\)0.0 \\ SF-SAGE (Sec 3.2) & 50.48\(\pm\)0.0 & 50.48\(\pm\)0.0 & 50.48\(\pm\)0.0 & 50.48\(\pm\)0.0 \\ SF-Top-Top-Loss-GCN (Sec 3.3) & 35.72\(\pm\)0.0 & 39.46\(\pm\)0.0 & 43.20\(\pm\)0.0 & 47.85\(\pm\)0.0 \\ SF-Top-Top-Inputi-SAGE (Sec 3.3) & 50.48\(\pm\)0.0 & 57.98\(\pm\)0.0 & 58.28\(\pm\)0.0 & 58.28\(\pm\)0.2 \\ \hline Backpropagation-GAT & 50.86\(\pm\)0.0 & 197.13\(\pm\)0.0 & 343.41\(\pm\)0.0 & 489.68\(\pm\)0.0 \\ SymBs-GAT & 1253.79\(\pm\)0.1 & 1253.84\(\pm\)0.1 & 1254.40\(\pm\)0.2 & 1254.40\(\pm\)0.2 \\ CaFG-GAT & 40.47\(\pm\)0.0 & **4.07\(\pm\)**0.0 & **4.07\(\pm\)**0.0 & **4.07\(\pm\)**0.0 \\ PEPTA-GAT & 51.89\(\pm\)0.0 & 200.51\(\pm\)0.0 & 349.40\(\pm\)0.0 & 498.46\(\pm\)0.0 \\ FF-LA-GAT (Sec 3.1) & 1191.88\(\pm\)0.0 & 1191.93\(\pm\)0.0 & 1191.93\(\pm\)0.0 & 1192.40\(\pm\)0.2 \\ FF-VN-GAT (Sec 3.1) & 1239.23\(\pm\)0.0 & 1239.33\(\pm\)0.0 & 1239.89\(\pm\)0.0 & 1239.93\(\pm\)0.3 \\ SF-GAT (Sec 3.2) & 177.04\(\pm\)0.0 & 177.04\(\pm\)0.0 & 177.04\(\pm\)0.0 & 177.04\(\pm\)0.0 \\ SF-Top-To-Loss-GAT (Sec 3.3) & 161.01\(\pm\)0.0 & 165.22\(\pm\)0.0 & 168.09\(\pm\)0.0 & 171.74\(\pm\)0.0 \\ SF-Top-To-Inputi-GAT (Sec 3.3) & 174.96\(\pm\)0.0 & 179.04\(\pm\)0.0 & 179.16\(\pm\)0.0 & 179.35\(\pm\)0.4 \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: _(Continued from the previous table)_ GPU memory usage (in MB) for node classification. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline \multicolumn{5}{c}{**GPU Memory Usage (\(\downarrow\))**} \\ \cline{2-5} \multicolumn{1}{c}{**Method**} & \multicolumn{4}{c}{**\# Layers=1} & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & **12.40\(\pm\)**0.0 & 42.55\(\pm\)0.0 & 72.71\(\pm\)0.0 & 102.86\(\pm\)0.0 \\ SymBa-GCN & 86.66\(\pm\)0.0 & 86.76\(\pm\)0.0 & 80.75\(\pm\)0.0 & 87.75\(\pm\)0.0 \\ CarG-GCN & 18.96\(\pm\)0.0 & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 \\ PEPTTA-GCN & 42.77\(\pm\)0.0 & 84.71\(\pm\)0.0 & 126.64\(\pm\)0.0 & 168.57\(\pm\)0.0 \\ FLA-GCN (Sec 3.1) & 84.24\(\pm\)0.0 & 84.24\(\pm\)0.0 & 84.43\(\pm\)0.0 & 84.62\(\pm\)0.0 \\ F-FV-GCN (Sec 3.1) & 86.76\(\pm\)0.0 & 86.76\(\pm\)0.0 & 87.55\(\pm\)0.0 & 87.57\(\pm\)0.0 \\ SF-CGCN (Sec 3.2) & 62.67\(\pm\)0.0 & 62.67\(\pm\)0.0 & 62.67\(\pm\)0.0 & 62.75\(\pm\)0.0 \\ SF-Top-To-Loss-GCN (Sec 3.3) & 79.80\(\pm\)0.0 & 98.21\(\pm\)0.0 & 116.62\(\pm\)0.0 & 135.03\(\pm\)0.0 \\ SF-Top-To-Input-GCN (Sec 3.3) & 61.68\(\pm\)0.0 & 80.44\(\pm\)0.0 & 79.80\(\pm\)0.0 & 80.15\(\pm\)0.0 \\ \hline Backpropagation-SAGE & 19.07\(\pm\)0.0 & 56.03\(\pm\)0.0 & 92.99\(\pm\)0.0 & 129.95\(\pm\)0.0 \\ SymBa-SAGE & 97.57\(\pm\)0.0 & 97.57\(\pm\)0.0 & 97.57\(\pm\)0.0 & 97.57\(\pm\)0.0 \\ CaFe-SAGE & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 \\ PEPTTA-SAGE & 49.44\(\pm\)0.0 & 89.84\(\pm\)0.0 & 146.43\(\pm\)0.0 & 152.35\(\pm\)0.0 \\ F-FL-SAGE (Sec 3.1) & 98.14\(\pm\)0.0 & 98.14\(\pm\)0.0 & 98.14\(\pm\)0.0 & 98.14\(\pm\)0.0 \\ F-FV-SAGE (Sec 3.1) & 97.57\(\pm\)0.0 & 97.57\(\pm\)0.0 & 97.57\(\pm\)0.0 & 97.57\(\pm\)0.0 \\ SF-SAGE (Sec 3.2) & 68.18\(\pm\)0.0 & 68.18\(\pm\)0.0 & 68.18\(\pm\)0.0 & 68.18\(\pm\)0.0 \\ SF-Top-To-Loss-SAGE (Sec 3.3) & 86.01\(\pm\)0.0 & 104.42\(\pm\)0.0 & 122.83\(\pm\)0.0 & 141.24\(\pm\)0.0 \\ SF-Top-To-Input-SAGE (Sec 3.3) & 68.18\(\pm\)0.0 & 104.42\(\pm\)0.0 & 104.42\(\pm\)0.0 & 105.57\(\pm\)0.0 \\ \hline Backpropagation-GAT & 68.85\(\pm\)0.0 & 45.29\(\pm\)0.0 & 83.73\(\pm\)0.0 & 1221.76\(\pm\)0.0 \\ SymBa-GAT & 850.57\(\pm\)0.0 & 851.40\(\pm\)0.0 & 851.40\(\pm\)0.0 & 851.60\(\pm\)0.0 \\ CaFe-GAT & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 & **18.96\(\pm\)**0.0 \\ PEPTTA-GAT & 55.10\(\pm\)0.0 & 45.29\(\pm\)0.0 & 85.85\(\pm\)0.0 & 128.90\(\pm\)0.2 \\ FF-LA-GAT (Sec 3.1) & 796.54\(\pm\)0.0 & 797.01\(\pm\)0.0 & 797.01\(\pm\)0.0 & 797.22\(\pm\)0.3 \\ FF-V-MAT (Sec 3.1) & 80.57\(\pm\)0.0 & 851.40\(\pm\)0.0 & 851.40\(\pm\)0.0 & 851.60\(\pm\)0.0 \\ SF-GAP (Sec 3.2) & 443.09\(\pm\)0.0 & 443.49\(\pm\)0.0 & 443.09\(\pm\)0.0 & 443.09\(\pm\)0.0 \\ SF-Top-To-Loss-GAT (Sec 3.3) & 449.90\(\pm\)0.0 & 468.31\(\pm\)0.0 & 486.72\(\pm\)0.0 & 505.12\(\pm\)0.0 \\ SF-Top-To-Input-GCN (Sec 3.3) & 431.78\(\pm\)0.0 & 449.85\(\pm\)0.0 & 449.85\(\pm\)0.0 & 449.85\(\pm\)0.0 \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: _(Continued from the previous table)_ GPU memory usage (in MB) for node classification. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+### Link Prediction Results
+
+* Figure 7 presents the link prediction accuracy (y-axis) vs. memory usage (x-axis) per graph neural networks.
+* Table 4 presents the link prediction performance of GCN, SAGE, and GAT models averaged over five runs on five real-world graphs, obtained with a different number of layers, and using different learning approaches.
+* Table 5 presents the GPU memory usage (in MB) during the GNN training for link prediction, observed with a different number of layers, and using different learning approaches.
+
+\begin{table}
+
+\end{table}
+Table 4: Link prediction performance of GCN, SAGE, and GAT averaged over five runs on five real-world graphs, obtained with a different number of layers, and using different learning methods. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+
+\end{table}
+Table 4: _(Continued from the previous table)_ Link prediction performance of GCN, SAGE, and GAT averaged over five runs on five real-world graphs, obtained with a different number of layers, and using different learning methods. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline  & \multicolumn{4}{c}{**ROC AUC (\(\uparrow\))**} \\ \cline{2-5}
+**Method** & \# Layers=1 & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & 89.75\(\pm\)0.1 & 91.45\(\pm\)0.1 & 91.78\(\pm\)0.1 & 91.85\(\pm\)0.1 \\ CaF0-GCN & 91.15\(\pm\)0.1 & 91.44\(\pm\)0.1 & 91.34\(\pm\)0.1 & 91.28\(\pm\)0.1 \\ ForwardGNN-SymBa-GCN & 89.33\(\pm\)0.1 & **89.44\(\pm\)**0.1 & **90.45\(\pm\)**0.1 & 89.45\(\pm\)0.1 \\ ForwardGNN-FF-GCN & 93.25\(\pm\)0.1 & **93.47\(\pm\)**0.1 & **93.47\(\pm\)**0.1 & **93.47\(\pm\)**0.1 \\ ForwardGNN-CE-GCN & 91.88\(\pm\)0.1 & 91.81\(\pm\)0.1 & 91.44\(\pm\)0.1 & 91.22\(\pm\)0.1 \\ ForwardGNN-CE-Top-Top-ICon-200 & **94.09\(\pm\)**0.2 & 92.40\(\pm\)0.3 & 91.58\(\pm\)0.2 & 91.10\(\pm\)0.4 \\ \hline Backpropagation-SAGE & 84.22\(\pm\)0.2 & 84.16\(\pm\)0.2 & 84.69\(\pm\)0.3 & 87.22\(\pm\)0.6 \\ CaF0-SAGE & 76.66\(\pm\)1.0 & 77.06\(\pm\)0.8 & 77.32\(\pm\)0.8 & 77.48\(\pm\)0.7 \\ ForwardGNN-SymBa-SAGE & **93.93\(\pm\)**0.1 & **93.93\(\pm\)**0.1 & **93.71\(\pm\)**0.1 & 84.25\(\pm\)10.2 \\ ForwardGNN-FF-SAGE & 89.62\(\pm\)0.9 & 89.61\(\pm\)0.9 & 89.61\(\pm\)0.9 & **89.60\(\pm\)**0.9 \\ ForwardGNN-CE-SAGE & 87.01\(\pm\)0.4 & 87.71\(\pm\)0.4 & 88.82\(\pm\)0.3 & 88.30\(\pm\)0.3 \\ ForwardGNN-CE-Top-To-Input-SAGE & 88.54\(\pm\)0.8 & 85.54\(\pm\)0.4 & 84.29\(\pm\)1.1 & 84.59\(\pm\)0.9 \\ \hline Backpropagation-GAT & 78.75\(\pm\)0.1 & 73.08\(\pm\)1.3 & 73.69\(\pm\)0.7 & 68.73\(\pm\)1.9 \\ CaF0-GAT & 80.27\(\pm\)2.0 & 81.02\(\pm\)2.4 & 81.29\(\pm\)2.4 & 81.52\(\pm\)2.5 \\ ForwardGNN-SymBa-GAT & **93.11\(\pm\)**0.2 & **93.12\(\pm\)**0.2 & **92.44\(\pm\)**0.3 & **90.80\(\pm\)**3.7 \\ ForwardGNN-FF-GAT & 88.67\(\pm\)1.0 & 88.98\(\pm\)0.8 & 88.96\(\pm\)0.8 & 89.93\(\pm\)0.8 \\ ForwardGNN-CE-GAT & 88.23\(\pm\)0.4 & 81.99\(\pm\)0.3 & 81.90\(\pm\)0.3 & 82.31\(\pm\)0.9 \\ ForwardGNN-CE-Top-To-Input-GAT & 89.92\(\pm\)0.3 & 80.21\(\pm\)1.6 & 80.48\(\pm\)0.8 & 81.10\(\pm\)1.0 \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: _(Continued from the previous table)_ Link prediction performance of GCN, SAGE, and GAT averaged over five runs on five real-world graphs, obtained with a different number of layers, and using different learning methods. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline  & \multicolumn{4}{c}{**GPU Memory Usage (\(\downarrow\))**} \\ \cline{2-5}
+**Method** & \# Layers=1 & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & **8.98\(\pm\)**0.0 & 12.05\(\pm\)0.0 & 14.73\(\pm\)0.0 & 16.21\(\pm\)0.0 \\ CaF0-GCN & 11.77\(\pm\)0.0 & 11.77\(\pm\)0.0 & 11.81\(\pm\)0.0 & 11.81\(\pm\)0.0 \\ ForwardGNN-SymBa-GCN & 16.64\(\pm\)0.0 & 16.86\(\pm\)0.0 & 16.86\(\pm\)0.0 & 16.98\(\pm\)0.3 \\ ForwardGNN-FF-GCN & 16.67\(\pm\)0.0 & 16.89\(\pm\)0.0 & 16.89\(\pm\)0.0 & 17.02\(\pm\)0.3 \\ ForwardGNN-CE-GCN & 9.95\(\pm\)0.0 & **9.95\(\pm\)**0.0 & **9.95\(\pm\)**0.0 & **9.95\(\pm\)**0.0 \\ ForwardGNN-CE-Top-To-Input-GCN & 12.92\(\pm\)0.0 & 21.94\(\pm\)0.0 & 21.76\(\pm\)0.0 & 22.16\(\pm\)0.0 \\ \hline Backpropagation-SAGE & 20.03\(\pm\)0.0 & 23.42\(\pm\)0.0 & 26.78\(\pm\)0.0 & 30.92\(\pm\)0.0 \\ CaF0-SAGE & **10.83\(\pm\)**0.0 & **11.58\(\pm\)**0.0 & **11.58\(\pm\)**0.0 & **11.58\(\pm\)**0.0 \\ ForwardGNN-SymBa-SAGE & 26.71\(\pm\)0.0 & 26.71\(\pm\)0.0 & 26.71\(\pm\)0.0 & 26.71\(\pm\)0.0 \\ ForwardGNN-FF-SAGE & 26.74\(\pm\)0.0 & 26.74\(\pm\)0.0 & 26.74\(\pm\)0.0 & 26.74\(\pm\)0.0 \\ ForwardGNN-CE-SAGE & 18.48\(\pm\)0.0 & 18.48\(\pm\)0.0 & 18.48\(\pm\)0.0 & 18.48\(\pm\)0.0 \\ ForwardGNN-CE-Top-To-Input-SAGE & 28.22\(\pm\)0.0 & 33.37\(\pm\)0.0 & 33.34\(\pm\)0.0 & 33.72\(\pm\)0.4 \\ \hline Backpropagation-GAT & 49.35\(\pm\)0.4 & 59.66\(\pm\)0.0 & 71.90\(\pm\)0.0 & 81.61\(\pm\)0.0 \\ CaF0-GAT & **11.77\(\pm\)**0.0 & 11.77\(\pm\)0.0 & **11.77\(\pm\)**0.0 & **11.77\(\pm\)**0.0 \\ ForwardGNN-SymBa-GAT & 24.47\(\pm\)0.0 & 25.33\(\pm\)0.0 & 25.44\(\pm\)0.0 & 25.44\(\pm\)0.0 \\ ForwardGNN-FF-GAT & 24.50\(\pm\)0.0 & 25.35\(\pm\)0.0 & 25.47\(\pm\)0.0 & 25.47\(\pm\)0.0 \\ ForwardGNN-CE-GAT & 17.26\(\pm\)0.0 & 17.26\(\pm\)0.0 & 18.81\(\pm\)0.0 & 18.81\(\pm\)0.0 \\ ForwardGNN-CE-Top-To-Input-GAT & 29.25\(\pm\)0.0 & 30.92\(\pm\)0.0 & 30.39\(\pm\)0.0 & 30.39\(\pm\)0.0 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: GPU memory usage (in MB) for link prediction. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+
+\end{table}
+Table 5: _(Continued from the previous table)_ GPU memory usage (in MB) for link prediction. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+\begin{table}
+
+\end{table}
+Table 5: _(Continued from the previous table)_ GPU memory usage (in MB) for link prediction. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+### Training Time
+
+To evaluate the training efficiency of different learning approaches, we report in Table 6 the time taken to train GNNs for 100 epochs for node classification on GitHub and CiteSeer, with a varying number of GNN layers. From Table 6, we make the following observations.
+
+* **The proposed forward learning approaches in Sections 3.1 and 3.2 train GCN and SAGE models much faster than backpropagation (up to 11 times when using four layers)**. With these greedy forward learning approaches, such as those presented in Sections 3.1 and 3.2, GNN training can be made much more efficient than with backpropagation by exploiting the fact that the neighborhood aggregation procedure can be performed just once while each GNN layer is optimized over multiple training epochs, since the input to each layer (_i.e._, the output from the lower layer) remains the same throughout the training of the layer, and thus the neighborhood aggregation results also do not change due to the way the greedy forward training scheme and the GNNs works. This way, only the feature update step after the aggregation needs to be performed multiple times during the training, while the aggregation is done only once, which can lead to a significant speedup in training GNNs, especially for large-scale graphs.
+* **While the training with forward learning approaches takes longer than BP in some other cases, the increase in training time in such cases is still modest in comparison to BP (_e.g._, \(\sim\)**1.6-1.9 times on GitHub with four layers).** With models like GAT, or with forward learning approaches with top-down signal paths, the aforementioned speedup cannot be used, as the output from the neighborhood aggregation procedure does no longer remain the same throughout the training of the layer, due to the changes in the parameters used in aggregation, or changes in the input due to the incorporation of the top-down signals. Still, the training time increase in such cases is not that significant, and the forward learning methods is more memory efficient than BP.
+* **The single-forward (SF) approach improves the training efficiency of the forward-forward based approaches** as SF avoids the computational overhead to perform multiple forward passes.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline \multirow{2}{*}{**Method**} & \multicolumn{5}{c}{**Training time (seconds) (↓)**} \\ \cline{2-5}  & \# Layers=1 & \# Layers=2 & \# Layers=3 & \# Layers=4 \\ \hline Backpropagation-GCN & 2.33\(\pm\)0.3 & 11.29\(\pm\)0.3 & 2.24\(\pm\)0.3 & 29.11\(\pm\)0.3 \\ SymBs-GCN & 2.59\(\pm\)0.3 & 4.98\(\pm\)0.3 & 7.29\(\pm\)0.3 & 9.64\(\pm\)0.3 \\ FPPTA-GCN & 3.01\(\pm\)0.3 & 19.01\(\pm\)0.3 & 35.02\(\pm\)0.3 & 51.04\(\pm\)0.3 \\ FE-LA-GCN (Sec 3.1) & 2.16\(\pm\)0.3 & 3.84\(\pm\)0.3 & 5.46\(\pm\)0.4 & 7.30\(\pm\)0.5 \\ FF-VN-GCN (Sec 3.1) & 2.73\(\pm\)0.3 & 5.05\(\pm\)0.3 & 7.38\(\pm\)0.3 & 9.73\(\pm\)0.3 \\ SF-GCN (Sec 3.2) & **1.81\(\pm\)**0.3 & **3.18\(\pm\)**0.3 & **4.62\(\pm\)**0.3 & **5.84\(\pm\)**0.4 \\ SF-Top-To-Loss-GCN (Sec 3.3) & 12.16\(\pm\)0.3 & 23.87\(\pm\)0.3 & 35.56\(\pm\)0.3 & 47.28\(\pm\)0.3 \\ SF-Top-To-Input-GCN (Sec 3.3) & 12.13\(\pm\)0.3 & 23.81\(\pm\)0.3 & 35.52\(\pm\)0.3 & 47.19\(\pm\)0.3 \\ \hline Backpropagation-SAGE & 8.11\(\pm\)0.3 & 16.34\(\pm\)0.3 & 24.71\(\pm\)0.3 & 32.98\(\pm\)0.3 \\ SymBs-SAGE & 1.22\(\pm\)0.3 & **1.62\(\pm\)**0.4 & 2.83\(\pm\)0.3 & 3.57\(\pm\)0.3 \\ FPPTA-SAGE & 15.45\(\pm\)0.3 & 30.30\(\pm\)0.3 & 45.41\(\pm\)0.3 & 5.99\(\pm\)0.3 \\ FFL-A-SAGE (Sec 3.1) & 1.25\(\pm\)0.3 & 1.98\(\pm\)0.4 & 2.70\(\pm\)0.4 & 3.70\(\pm\)0.3 \\ FF-VN-SAGE (Sec 3.1) & 1.07\(\pm\)0.4 & 2.07\(\pm\)0.3 & 2.94\(\pm\)0.3 & 3.77\(\pm\)0.3 \\ SF-SAGE (Sec 3.2) & **1.03\(\pm\)**0.3 & 1.67\(\pm\)0.3 & **2.55\(\pm\)**0.3 & **3.07\(\pm\)**0.4 \\ SF-Top-To-Task-SAGE (Sec 3.3) & 10.28\(\pm\)0.3 & 2.07\(\pm\)0.3 & 29.87\(\pm\)0.4 & 39.74\(\pm\)0.3 \\ SF-Top-To-Input-SAGE (Sec 3.3) & 10.07\(\pm\)0.3 & 27.42\(\pm\)0.4 & 44.73\(\pm\)0.4 & 62.08\(\pm\)0.5 \\ \hline Backpropagation-GAT & 1.15\(\pm\)0.3 & 1.95\(\pm\)0.3 & 2.99\(\pm\)0.3 & 4.02\(\pm\)0.3 \\ SymBs-GAT & 3.10\(\pm\)0.3 & 5.76\(\pm\)0.3 & 8.41\(\pm\)0.3 & 11.09\(\pm\)0.3 \\ FPPTA-GAT & **0.81\(\pm\)**0.3 & **1.68\(\pm\)**0.3 & **2.56\(\pm\)**0.3 & **3.45\(\pm\)**0.3 \\ FF-LA-GAT (Sec 3.1) & 2.89\(\pm\)0.3 & 5.35\(\pm\)0.3 & 7.81\(\pm\)0.3 & 10.27\(\pm\)0.3 \\ FF-VN-GAT (Sec 3.1) & 3.14\(\pm\)0.3 & 5.82\(\pm\)0.3 & 8.51\(\pm\)0.3 & 11.25\(\pm\)0.3 \\ SF-GAT (Sec 3.2) & 1.98\(\pm\)0.3 & 3.54\(\pm\)0.3 & 5.10\(\pm\)0.3 & 6.67\(\pm\)0.3 \\ SF-Top-To-Loss-GAT (Sec 3.3) & 2.00\(\pm\)0.3 & 3.53\(\pm\)0.3 & 4.92\(\pm\)0.4 & 6.63\(\pm\)0.3 \\ SF-Top-To-Input-GAT (Sec 3.3) & 1.76\(\pm\)0.3 & 3.31\(\pm\)0.3 & 4.84\(\pm\)0.3 & 6.37\(\pm\)0.3 \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Training time (in seconds) for node classification. The best results are in **bold** font, and the best results among the forward learning methods are in red.
+
+### Node Classification Results with Limited Training Data
+
+In this section, we evaluate how well the proposed forward learning approach performs in comparison to BP when given a small amount of training data. To that end, we use three citation networks, namely, Planetoid-Cora, Planetoid-PubMed, and Planetoid-CiteSeer listed in Table 7, which provide much less amount of training data than the graphs used in the main text (Table 1).
+
+Figure 8 shows the classification accuracy (y-axis) versus memory usage increase (x-axis) obtained with the single forward (SF) and backpropagation (BP) algorithms on the three graphs with limited training data. From Figure 8, we make the following observations.
+
+* In these datasets with sparse training data, the proposed SF (empty symbols) perform similarly to BP (filled symbols), or outperforms BP in a few cases, when four GNN layers are used. These results are similar to the results obtained in the setup with rich training data (Figure 2a).
+* With two layers (Figure 8(1)), BP mostly outperforms SF, which is different from the results in the counterpart in Figure 2a(1), where BP and SF performed similarly. The contrastive single forward learning mechanism tends to require more training data than BP to arrive at a similar level of predictive accuracy, but the gap closes as more layers are used.
+* SF shows a near-constant memory usage, while the memory usage of BP keeps increasing (up to around 18\(\times\)), as the number of layers increases.
+
+\begin{table}
+\begin{tabular}{l r r r r r r r} \hline \hline
+**Dataset** & **\# Nodes** & **\# Edges** & **\# Training Nodes** & **\# Validation Nodes** & **\# Testing Nodes** & **\# Features** & **\# Classes** \\ \hline Planetoid-Cora & 2,708 & 10,556 & 140 & 500 & 1,000 & 1,433 & 7 \\ Planetoid-CiteSeer & 3,327 & 9,104 & 120 & 500 & 1,000 & 3,703 & 6 \\ Planetoid-PubMed & 19,717 & 88,648 & 60 & 500 & 1,000 & 500 & 3 \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: Summary statistics of the graph datasets with limited training data.
+
+Figure 8: The single-forward approach (SF, empty symbols) vs. backpropagation (BP, filled symbols) on node classification in terms of classification accuracy (y-axis) vs. memory usage increase (x-axis). Lines towards the lower right corner (SF outperforms BP), and upper right corner (BP outperforms SF); horizontal lines (both perform the same).
+
+### Impact of the Directionality of Edges Between Real and Virtual Nodes
+
+In the main text, the results of the proposed approaches that employ virtual nodes were obtained using the augmented graph where real nodes and virtual nodes are connected via bidirectional edges (_i.e._, in both ways between the real and virtual nodes). Since virtual nodes are processed in the same way as the real nodes, they aggregate information from a large number of real nodes, and then propagate aggregated information back to those real nodes, which can potentially adversely impact the classification performance. Here we evaluate a different approach to utilize virtual nodes in the same problem setup, which is to connect the real and virtual nodes via unidirectional edges (_i.e._, in one way from the real to the virtual nodes), such that virtual nodes only receive information from the real nodes, without sending the aggregated message back to them. In Figure 9, we report the node classification performance when the edges between the real and virtual nodes are bidirectional or unidirectional, obtained with (a) the single forward (SF) approach (Section 3.2), and (b) the SF method with the top-down signal path (Section 3.3). Results show that in many cases, using unidirectional edges perform better than using bidirectional edges for both learning approaches, and the improvement is especially notable with the SF approach on PubMed and CorAML.
+
+Figure 9: Node classification accuracy as the edges between the real and virtual nodes are bidirectional (_i.e._, in both ways between the real and virtual nodes), and unidirectional (_i.e._, in one way from the real to the virtual nodes), obtained with (a) the single forward (SF) approach (Section 3.2), and (b) the SF method with the top-down signal path (Section 3.3).

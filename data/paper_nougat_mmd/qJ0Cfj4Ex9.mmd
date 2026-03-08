@@ -1,0 +1,1413 @@
+# Learning Grounded Action Abstractions From Language
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Long-horizon planning is dauntingly hard - it requires modeling relevant aspects of the environment and searching over large, complex action spaces. _Hierarchical planning_ approaches make complex problems more tractable using temporal _action abstractions_, decomposing hard tasks into smaller abstract subproblems that can be solved modularly. However, actually learning useful action abstractions has long posed significant challenges without human expert knowledge. Here, we introduce a system that leverages background information in language to learn a _library of symbolic action abstractions and accompanying low-level policies_ that can be composed to solve increasingly complex tasks. Our approach queries large language models (LLMs) as a prior for proposing useful symbolic action definitions, but integrates these proposals into a formal hierarchical planning system to ground and verify proposed actions. On two language-guided interactive planning domains (_Mini Minecraft_ and the _ALFRED Household Tasks_ benchmark), our approach far outperforms other baseline approaches that use LLMs in planning, enabling far more accurate planning and enable better generalization to more complex tasks.
+
+## 1 Introduction
+
+People make plans over incredibly long and complex timescales, which govern how we act in granular ways. To satisfy our vague hunger in the morning, we might ultimately execute tens of fine-grained actions to open a fridge, locate and crack an egg, flip a pan, and then plate and fork up an omelet; to satisfy our boss, we might plan a routine over days or even weeks that simply _begins_ with navigating a car to work. The general problem of forming and executing long, extended, and complex plans is one of the unifying challenges of AI. It requires knowing what is relevant to represent in the world, representing goals and utilities, and searching over actions in complex and uncertain environments. While decades of research have developed many approaches for solving more restricted and shorter term planning problems, general and extended long-horizon planning remains a core, outstanding challenge for essentially all AI paradigms, including classical symbolic planning (Erol et al., 1994), reinforcement learning (Sutton et al., 1999), and modern generative AI (Wang et al., 2023).
+
+How do people solve this computational problem? One powerful idea developed across many AI literatures is that of _hierarchical planning_ using _temporal action abstractions_ -- that is, decomposing complex tasks into smaller pieces that can be solved by progressively refining abstract subproblems into sequences of lower-level actions. An extensive body of research has explored how to learn and plan using these hierarchical action spaces, including a large body of robotic task-and-motion planning (TAMP) systems (Garrett et al., 2021) and hierarchical RL frameworks (Sutton et al., 1999).
+
+While the right abstractions can be immensely powerful for long-horizon planning and generalization to new tasks, actually obtaining useful action abstractions poses one of the central bottlenecks in general hierarchical planning. "Good" action abstractions must satisfy many different criteria: among other factors, high-level actions should be composable to produce long-horizon plans, planning with them should be time-efficient, and their corresponding sub-goals should be reliably achievable based on the motion-level action space. Despite efforts to learn these abstractions automatically in both classical planning (Nejati et al., 2006) and RL formulations (Dietterich, 2000), the problem of finding useful action abstractions remains extremely challenging over longer time horizons without human prior knowledge about the world and the problems a future agent might wish to solve.
+
+In this paper, we frame the abstraction learning problem within a multitask-reinforcement-learning objective. We consider settings in which an agent can interact with an environment and wishes to solve a dataset of tasks of varying complexity. Each task is described using a high-level natural language specification. The agent can explore the environment, attempting different tasks over time, and will receive reward feedback upon successfully completing a task. Additionally, we assume access to a set of symbolic predicates that describe general aspects of the environment state, such as object categories and spatial relationships between objects. Our learning objective is to build a _library of planning-compatible and grounded actions_. Specifically, we aim to learn actions with two components: a _high-level action abstraction_ represented as a symbolic planning _operator_(Fikes & Nilsson, 1971) that specifies preconditions and action effects as sets of symbolic predicates; and a _low-level local policy_ that can achieve the action's effects by predicting a sequence of low-level actions. By leveraging the growing library of abstract actions, the agent ideally learns actions that can be composed to efficiently make long-horizon plans for new tasks under new environment conditions.
+
+Our core contribution is to show how we can use large language models (LLMs) to solve a key part of the abstraction learning problem - as a powerful prior for proposing good symbolic operator definitions on everyday planning domains. This allows our system to leverage the vast range of useful, abstract world knowledge relevant to planning that is available in language, including commonsense priors for decomposing tasks (e.g., that a cooking task might decompose into tasks for _finding ingredients_, _picking them up_, and _heating them_) and for the abstract preconditions and effects of these actions (e.g. that _heating_ ingredients might be accomplished by putting them in a _microwave_, and will result in the ingredients being _hot_). Equally importantly, however, our approach integrates LLMs into a formal hierarchical planning framework, allowing us to leverage a powerful toolkit of efficient planning methods to compose high-level actions, learn low-level policies, and verify learned actions.
+
+Taken together, our system leverages language to learn a library of symbolic action abstractions and accompanying local low-level policies that can be composed to solve increasingly complex tasks. We evaluate our framework (Fig. 1) on two benchmarks, _Mini Minecraft_ and _ALFRED_(Shridhar et al., 2020). We compare our approach against three baselines that incorporate language models into planning in other ways: to parse linguistic goals into formal specifications that are solved directly by a planner (as in Liu et al. (2023)), to directly predict sequences of high-level subgoals (as in Ahn et al. (2022)), and to predict libraries of actions defined in general imperative code (as in Wang et al. (2023)). In both domains, we show that our approach learns action abstractions that allow it to solve dramatically more tasks on each benchmark than these baselines, and that these abstractions compose to permit much more efficient and accurate planning on more complex, unseen tasks.
+
+## 2 Problem Formulation
+
+We assume access to an environment \(\langle\mathcal{X},\mathcal{U},\mathcal{T}\rangle\), where \(\mathcal{X}\) is the (raw) state space, \(\mathcal{U}\) is the (low-level) action space (e.g., robot commands), and \(\mathcal{T}\) is a deterministic transition \(\mathcal{T}:\mathcal{X}\times\mathcal{U}\rightarrow\mathcal{X}\). We also have a vocabulary of predicates \(\mathcal{P}\) that defines an abstract state space \(\mathcal{S}\): each abstract state \(s\in\mathcal{S}\) is composed of a set of objects in the scene and the grounding value of the predicates in \(\mathcal{P}\) over the objects. For example, a simple scene that contains a red box on the table could be represented by a symbolic state containing two objects \(A\) and \(B\), and a set of atoms \(\{\mathit{red}(\mathrm{A}),\mathit{box}(\mathrm{A}),\mathit{table}(\mathrm{B}), \mathit{on}(\mathrm{A},\mathrm{B})\}\). We assume the mapping from environmental states to abstract states \(\Phi:\mathcal{X}\rightarrow\mathcal{S}\) is given and fixed.
+
+Figure 1: Our approach solves complex planning tasks specified in language and grounded in interactive environments by jointly learning a _library of symbolic action abstractions and low-level modular policies_. Our system leverages background information in language as a prior to _propose useful action abstractions_, then uses a _hierarchical planning framework_ to verify and ground them.
+
+In addition to the environment, we have a collection of tasks \(t\). Each \(t\) is described by a natural language instruction \(\ell_{t}\), corresponding to an (unknown) goal predicate over the abstract state space \(q_{t}:\mathcal{S}\rightarrow\{T,F\}\) (therefore, \(g_{t}\) can be viewed as a logical formula defined over the abstract state space. Our goal is to build a capable agent, given the initial state \(x_{0}\in\mathcal{X}\) and the natural language instruction \(\ell_{t}\), to generate a sequence of low-level actions \(\{u_{1},u_{2},\cdots,u_{H}\}\in\mathcal{U}^{H}\) such that \(g_{t}(\Phi(x_{H}))\) is true, where \(x_{H}\) is the terminal state of sequentially applying \(\{u_{i}\}\) on \(x_{0}\). The agent receives reward signal only upon achieving the goal specified by \(\ell_{t}\).
+
+Given a sufficient amount of data or reinforcement learning budget, a general algorithm could, in principle, learn a policy that maps from low-level states to low-level actions conditioned on the language instruction \(\pi(u|x;\ell_{t})\). However, for very long horizons \(H\) and when the state space is large (e.g., composed of many objects and compositional goals), such algorithms can be highly inefficient or effectively infeasible. Therefore, our idea is to leverage the natural language descriptions to build an abstract action space \(\mathcal{A}\) over the abstract state space \(\mathcal{S}\) to accelerate learning and planning.
+
+Formally, our goal is to learn a library of high-level abstract actions (also called _operators_ in classical planning) \(\mathcal{A}\). As illustrated in Fig. 1(b), each \(a\in\mathcal{A}\) is a tuple of \(\langle\textit{name},\textit{args},\textit{pre},\textit{eff},\textit{controller}\rangle\). _name_ is the name of the action, _args_ is a list of variables, usually denoted by \(?x,?y,etc.\), _pre_ is a precondition formula, written in first-order logic, based on the variables _args_ and the predicate set \(\mathcal{P}\), and _eff_ is the effect, which is typically also written as a conjunction of first-order logic formulas based on _args_ and \(\mathcal{P}\). Finally, _controller_ : \(\mathcal{X}\rightarrow\mathcal{U}\) is a low-level policy associated with the action. The semantics of the preconditions and effects is: for any state \(x\) such that \(\textit{pre}(\Phi(x))\), executing _controller_ based on \(x\) (for an indefinite number of steps) will yield a state \(x^{\prime}\) such that \(\textit{eff}(\Phi(x^{\prime}))\) (Lifschitz, 1986). Shown in Fig. 1(b), given the set of abstract actions and a parse of the instruction \(\ell_{t}\) into a first-order logic formula, we can leverage symbolic planners such as Fast-Downward (Helmert, 2006) to first compute an abstract plan \(\{a_{1},\cdots,a_{K}\}\in\mathcal{A}^{K}\) that achieves the goal \(\ell_{t}\) symbolically, and then refine the high-level plan into a low-level plan leveraging the controllers associated with each action. Effectively, such a bi-level learning and planning algorithm would decompose the long-horizon planning problem into several short-horizon problems. Furthermore, it can also leverage the compositionality of the high-level actions \(\mathcal{A}\) to generalize to longer plans.
+
+## 3 Action Abstractions from Language
+
+As illustrated in Fig. 3, at our high level, our framework learns action abstractions iteratively as it attempts to solve tasks. Our algorithm is given a dataset of tasks and their corresponding language descriptions, the predicate set \(\mathcal{P}\), and optionally an initial set of abstract operators \(\mathcal{A}_{0}\). At each iteration \(i\), we first use a large language model (LLM) to propose a set of novel abstract action definitions \(\mathcal{A}^{\prime}_{i}\) based on the predicates \(\mathcal{P}\) and the language goals \(\{\ell_{t}\}\) (Section 3.1). Next, we use a LLM to also translate each language instruction \(\ell_{t}\) into a symbolic goal description \(F_{t}\), and use a bi-level planner to compute a low-level plan to accomplish \(\ell_{t}\) (Section 3.2). Then, based on the planning and execution results, we score each operator in \(\mathcal{A}_{i}\) and add ones to the verified library if they have yielded successful execution results (Section 3.4). To accelerate low-level planning, we simultaneously learn local subgoal-conditioned policies (i.e., the controllers for each operator) to accelerate search (Section 3.3). Algorithm 1 summarizes the overall algorithm.
+
+A core goal of our approach is to adapt the initial action abstractions proposed from an LLM prior into a set of _useful_ operators \(\mathcal{A}*\) that permit efficient and accurate planning on a dataset of tasks and ideally, that generalize to future tasks. While language provides a key initial prior, our formulation refines and verifies the operator library to adapt to a given planning procedure and environment
+
+Figure 2: Representation for our (a) task input, (b) the bi-level planning and execution pipeline for inference time, and (c) the abstract state and action representation.
+
+(similar to other action-learning formulations like Silver et al. (2021)). Our formulation ensures not only that the learned operators should be accurate with respect to the environment, but also should fit their grain of abstraction according to the bi-level planner, trading off between fast high-level planning and efficient low-level control conditioned on each abstraction.
+
+### Hierarchical Prompting to Propose Operator Definitions
+
+At each iteration \(i\), we use a pretrained LLM to extend the previous operator library \(\mathcal{A}_{i-1}\) with a large set of candidate operator definitions proposed by the LLM based on the task language descriptions and environment predicates \(\mathcal{P}\). This yields an extended candidate library \(\mathcal{A}^{\prime}_{i}\) where each \(a\in\mathcal{A}^{\prime}_{i}=\langle\textit{name},\textit{args},\textit{pre}, \textit{eff}\rangle\) where _name_ is a human-readable action name and \(\textit{args},\textit{pre},\textit{eff}\) are a PDDL operator definition. Specifically, as illustrated in Fig. 4, we employ a two-stage prompting strategy: symbolic task decomposition followed by symbolic operator definition.
+
+**Symbolic task decomposition.** For a given task \(\ell_{t}\) and a initial state \(x_{0}\), we first translate the raw state \(x_{0}\) into a symbolic description \(\Phi(x_{0})\). To constrain the length of the state description, we only include unary predicates in the abstract state (i.e., only object categories and properties). Subsequently, we present a few-shot prompt to the LLM and query it to generate a proposed task decomposition conditioned on the language description \(\ell_{t}\). It generates a sequence of named high-level actions and their arguments, which explicitly can include abstract actions that are not yet defined in the current action library. We then extract all the operator names proposed across tasks as the candidate abstract operators. Note that while in principle we might use the LLM-proposed task decomposition itself as a high-level plan, we find empirically that this is less accurate and efficient than a formal planner.
+
+**Symbolic operator definition.** With the proposed operator names and their usage examples (i.e., the actions and their arguments in the proposed plans), we then few-shot prompt the LLM to generate candidate operator _definitions_ in the PDDL format (argument types, and pre/postconditions defined based on predicates in \(\mathcal{P}\)). We also post-process the generated operator definitions to remove predicate names not present in \(\mathcal{P}\) and correct syntactic errors. We describe implementation details for our syntax correction strategy in the appendix.
+
+**Example.** Fig. 4 shows a concrete example. Given a task instruction (_Bring a hot egg to the table_) and the abstract state description, we first prompt the LLM to generate an abstract task decomposition, which may contain operator names that are undefined in the current operator library. Next, we extract the names of those undefined operators and prompt LLMs to generate the actual symbolic operator descriptions, in this case, the new _heat-object_ operator.
+
+Figure 3: The overall framework. Given task environment states and descriptions, at each iteration, we first propose candidate abstract actions (operators) \(\mathcal{A}^{\prime}_{i}\), then uses bi-level planning and execution to solve tasks. We add operators to the operator library based on the execution result.
+
+### Goal Proposal and Bi-Level Planning
+
+At each iteration \(i\), we then attempt to _BiLevelPlan_ (Alg. 1) for unsolved tasks in the dataset, which attempts to find and execute a low-level action sequence \(\{u_{1},u_{2},\cdots,u_{H}\}\in\mathcal{U}^{H}\) for each task using the proposed operators in \(\mathcal{A}^{\prime}_{t}\) that satstises the unknown goal predicate \(g_{t}\) for each task. This provides the environment reward signal for action learning. Our _BiLevelPlan_ implementation uses standard hierarchical planning tools as follows:
+
+**Symbolic goal proposal:** As defined in Sec. 2, each task is associated with a queryable but unknown goal predicate \(g_{t}\) that can be represented as a first-order logic formula \(f_{t}\) over symbolic predicates in \(\mathcal{P}\). Our agent only has access to a linguistic task description \(\ell_{t}\), so we use a few-shot prompted LLM to predict candidate goal formulas \(F^{\prime}_{t}\) conditioned on \(\ell_{t}\) and possible predicates \(\mathcal{P}\).
+
+**High-level planning**: Given each candidate goal formula \(f^{\prime}_{t}\in F^{\prime}_{t}\), the initial abstract problem state \(s_{0}\), and the current candidate operator library \(\mathcal{A}^{\prime}\), we search for a _high-level plan_\(P_{A}=\{(a_{1},o_{1},...),\cdots,(a_{K},o_{K_{i}},...)\}\) as a sequence of high-level actions from \(\mathcal{A}^{\prime}\) concretized with object arguments \(o\), such that executing the action sequence would satisfy \(f^{\prime}_{t}\) according to the operator definitions. This is a standard symbolic PDDL planning formulation; we use an off-the-shelf symbolic planner, FastDownward (Helmert, 2006) to find high-level plans.
+
+**Low-level planning and environment:** Recall: We then search for a low-level plan as a sequence of low-level actions \(\{u_{1},u_{2},\cdots,u_{H}\}\in\mathcal{U}^{H}\), conditioned on the high-level plan structure. Each concretized action tuple \((a_{i},o_{1},...)\in P_{A}\) defines a local subgoal \(sg_{i}\), as the operator postcondition parameterized by the object arguments \(o\). For each \((a_{i},o_{1},...)\in P_{A}\), we therefore search for a sequence of low-level actions \(u_{i},u_{i2}...\) that satisfies the local subgoal \(sg_{i}\). We search with a fixed budget per subgoal, and fail early if we are unable to satisfy the local subgoal \(sg_{i}\). If we successfully find a complete sequence of low-level actions satisfying all local subgoals \(sg_{i}\) in \(P_{A}\), we execute all low-level actions and query the hidden goal predicate \(g_{t}\) to determine environment reward. We implement a basic learning procedure to simultaneously learn subgoal-conditioned controllers over time (described in Section 3.3), but our formulation is general and supports many hierarchical planning schemes (such as sampling-based low-level planners (LaValle, 1998) or RL algorithms).
+
+### Policy Learning and Guided Low-Level Search
+
+The sequence of subgoals \(sg_{i}\) corresponding to high-level plans \(P_{A}\) already restricts the local low-level planning horizon. However, we further learn subgoal-conditioned low-level policies \(\pi(u|x;sg)\) from environment feedback during training to accelerate low-level planning. To exploit shared structure across subgoals, we learn a shared controller for all operators from \(x\in\mathcal{X}\) and conjunctions of predicates in \(sg\). To maximize learning during training, we use a hindsight goal relabeling scheme (Andrychowicz et al., 2017), supervising on all conjunctions of predicates in the state as we roll out low-level search. While the shared controller could be learned as a supervised neural policy, we find that our learned operators sufficiently restrict the search to permit learning an even simpler count-based n-gram model from \(X,sg\to u\in\mathcal{U}\). We provide additional details in the Appendix.
+
+Figure 4: Our two-stage prompting method for generating candidate operator definitions. (a) Given a task instruction, we first prompt an LLM to generate a candidate symbolic task decomposition. (b) We then extract undefined operator names that appear in these action sequences and prompt an LLM to generate symbolic definitions.
+
+### Scoring LLM Operator Proposals
+
+Finally, we update the learned operator library \(\mathcal{A}_{i}\) to retain candidate operators that were useful and successful in bi-level planning. Concretely, we estimate operator candidate \(a^{\prime}_{i}\in\mathcal{A}^{\prime}_{i}\) accuracy across the bi-level plan executions as \(s/b\) where \(b\) counts the total times \(a^{\prime}_{i}\) appeared in a high-level plan and \(s\) counts successful execution of the corresponding low-level action sequence to achieve the subgoal associated with \(a^{\prime}_{i}\). We retain operators if \(b>\tau_{b}\) and \(a/b>\tau_{r}\), where \(\tau_{b},\tau_{r}\) are hyperparameters. Note that this scoring procedure learns whether operators are accurate and support low-level planning independently of whether the LLM-predicted goals \(f^{\prime}_{t}\) matched the true unknown goal predicates \(g_{t}\).
+
+## 4 Experiments
+
+**Domains.** We evaluate our approach on two-language specified planning-benchmarks: _Mini Minecraft_ and _ALFRED_(Shridhar et al., 2020).
+
+_Mini Minecraft_ (Fig. 5, _top_) is a procedurally-generated Minecraft-like benchmark (Chen et al., 2021; Luo et al., 2023) that requires complex, extended planning. The environment places an agent on a 2D map containing various resources, tools, and crafting stations. The agent can use appropriate tools to mine new items from raw resources (e.g. use an _axe_ to obtain _wood_ from _trees_), or collect resources into an inventory to craft new objects (e.g. combining _sticks_ and _iron ingots_ to craft a _sword_, which itself can be used to obtain _feathers_ from a _chicken_). The ability to create new objects that themselves permit new actions yields an enormous action space at each time step (\(>\)2000 actions, considering different combinations of items to use) and very long-horizon tasks (26 steps for the most complex task, even without path-planning.) The provided environment predicates allow querying object types and inventory contents. Low-level actions allow the agent to move and apply tools to specific resources. To focus on complex crafting, we provide a low-level _move-to_ action to move directly to specified locations. Linguistic goal specifications are synthetically generated from a simple grammar over craftsule objects and resources (e.g. _Craft a sword_, _Mine iron ore_).
+
+_ALFRED_ (Fig. 5, _bottom_) is a household planning benchmark of human-annotated but formally verifiable tasks defined over a simulated Unity environment (Shridhar et al., 2020). The interactive environment places an agent in varying 3D layouts, each containing appliances and dozens of household objects. The provided environment includes predicates for querying object types, object and agent locations, and classifiers over object states (eg. whether an object is _hot_ or _on_). Low-level actions enable the agent to pick up and place objects, apply tools to other objects, and open, close, and turn on appliances. As with Minecraft, we provide a low-level method to move the agent directly to specified locations. While ALFRED is typically used to evaluate detailed instruction following, we focus on a _goal-only_ setting that only uses the goal specifications. The human-annotated goals introduce ambiguity, underspecification, and errors with respect to the ground-truth verifiable tasks (eg. people refer to _tables_ without specifying if they mean the _side table_, _dining table_, or _desk_; a _light_ when there are multiple distinct lamps; or a _cabbage_ when they want _lettuce_).
+
+**Experimental setup.** We evaluate in an iterative continual learning setting; except on the compositional evaluations, we learn from _n_=2 iterations through all (randomly ordered) tasks and report final accuracy on those tasks. All experiments and baselines use GPT-3.5. For each task, at each iteration, we sample _n_=4 initial goal proposals and _n_=4 initial task decompositions, and _n_=_3_ operator definition proposals for each operator name. We report _best-of_ accuracy, scoring a task as solved if verification passes on at least one of the proposed goals. For Minecraft, we set the motion planning budget for each subgoal to \(\leq\)1000 nodes. For ALFRED, which requires a slow Unity simulation, we set it to 50 nodes. Additional temperature and sampling details are in the Appendix.
+
+We evaluate on three _Mini Minecraft_ benchmark variations to test how our approach generalizes to complex, compositional goals. In the simplest **Mining** benchmark, all goals involve mining a target item from an appropriate initial resource with an appropriate tool (e.g., Mining _iron_ from _iron_\(\_\)_ore_ with an _axe_), and require learning which tools can be used to obtain which items. In the harder **Crafting** benchmark, goals involve crafting a target artifact (e.g., a _bed_), which may require mining a few target resources. The most challenging **Compositional** benchmark combines mining and crafting tasks, in environments that only begin with raw resources and two starting tools (axe and pickaxe). Agents may need to compose multiple skills to obtain other downstream resources (see Fig. 5 for an example) To test action generalization, we report evaluation on the _Compositional_ using _only_ actions learned previously in the **Mining** and **Crafting** benchmarks.
+
+We similarly evaluate on an _ALFRED_ benchmark of **Simple and Compositional** tasks drawn from the original task distribution in Shridhar et al. (2020). This distribution contains simple tasks that require picking up an object and placing it in a new location, picking up objects, applying a single household skill to an object and moving them to a new location (e.g., _Put a clean apple on the dining table_), and compositional tasks that require multiple skills (e.g., _Place a hot sliced potato on the counter_). We use a random subset of n=223 tasks that we filter to remove completely misspecified goals (which omit any mention of the target object or skill).
+
+**Baselines.** We compare our method to three baselines, each related to language-guided planning systems in recent work. **Low-level Planning Only** uses an LLM to predict only the symbolic goal specification conditioned on the high-level predicates and linguistic goal, then uses the low-level planner to search directly for actions that satisfy that goal. **Subgoal Prediction** uses an LLM to predict a sequence of high-level subgoals (as PDDL pre/postconditions with object arguments), conditioned on the high-level predicates, and task goal and initial environment state. Both of these baselines are related to approaches that use LLMs to directly predict goal and subgoal representations in a formal representation, then apply low-level planning over these formal subgoals (e.g., Song et al. (2023) and Ahn et al. (2022)). **Code Policy Prediction** adapts key aspects of Voyager (Wang et al., 2023) to our learning setting. Instead of PDDL operators, we few-shot prompt the LLM to predict imperative code policies in Python (with cases and control flow) over an imperative API that can query state and execute low level actions. As FastDownward abstract planning is no longer applicable, we also use the LLM to predict the function call sequences with arguments for each task.
+
+### Results
+
+**What action libraries do we learn?** Fig. 5 shows example operators learned on each domain. In _Mini Minecraft_, we learn operators that correctly specify the appropriate tools, resources, and outputs for all intermediate mining actions (on **Mining**) and crafting actions (on **Crafting**), allowing perfect direct generalization to the **Compositional** tasks without any additional training on these complex tasks. In _ALFRED_, we learn operators that correctly specify valid appliances and effects for all necessary intermediate household skills. We also successfully _reject_ many proposed operators that are redundant (which would make high-level planning inefficient), inaccurate (including apriori reasonable proposals that do not fit the environment specifications, such as proposing to _clean_ objects
+
+Figure 5: _Top_: (a) Visualization of the Mini Minecraft environment, showing an intermediate step towards _crafting a bed_. (b) Operator proposed by an LLM and verified by our algorithm through planning and execution. (c) Visualization of the low-level crafting tools involved in crafting the bed. _Bottom_: (a) Visualization of the ALFRED household environment. (b) Example operators proposed by LLM and verified by our algorithm, which are composed to solve the _cold potato slice_ task.
+
+with just a _towel_, when our goal verifiers require washing them with water in a _sink_), or underspecified (such as those that omit key preconditions, yielding under-decomposed high-level task plans that make low-level planning difficult). The appendix contains additional examples of learned operators on both domains.
+
+**Do these actions support complex planning and generalization?** Table 1 shows quantitative results. On Minecraft, where goal specification is completely clear due to the synthetic language, we solve all tasks in each evaluation variation, including the challenging _Compositional_ setting -- the action libraries learned from simpler mining/crafting tasks generalize completely to complex tasks that require crafting all intermediate resources and tools from scratch. On ALFRED, we vastly outperform all other baselines, demonstrating that the learned operators are effective and compose generalizably to more complex tasks. We qualitatively find that failures on ALFRED occur for several reasons. The most common is _goal misspecification_, when the LLM does not successfully recover the formal goal predicate (often due to ambiguity in human language); followed by _policy inaccuracy_, when the learned policies fail to account for low-level, often geometric details of the environment. More rarely, we notice failures caused by _operator overspecification_ -- for instance, the learned _SliceObject_ specifies a specific type of _Knife_, causing planning failures if that knife type is not available. Both operator and goal specification errors could be addressed with more diverse initial proposals.
+
+**How does our approach compare to using the LLM to predict just goals, or predict task sequences?** As shown in Table 1, our approach vastly outperforms the **Low-level Planning Only** baseline on both domains, demonstrating the value of the action library for longer horizon planning. We also find substantial improvement over the **Subgoal Prediction** baseline. While the LLM frequently predicts important high-level aspects of the task subgoal structure (as it does to propose operator definitions), it frequently struggles to robustly sequence these subgoals and predict appropriate concrete object groundings that correctly obey the initial problem conditions or changing environment state. These errors accumulate over the planning horizon, reflected in decreasing accuracy on the compositional Minecraft tasks (on ALFRED, this baseline struggles to solve any more than the basic pick-and-place tasks, as the LLM struggles to predict subgoals that accurately track whether objects are in appliances or whether the agent's single gripper is full with an existing tool.)
+
+**How does our approach compare to using the LLM to learn and predict plans using imperative code libraries?** Somewhat surprisingly, we find that the _Code Policy_ prediction baseline performs unevenly and often very poorly on our benchmarks. As with _Subgoal Prediction_, we find that while the LLM predicts many aspects of the task decomposition, it often struggles to predict an accurate sequence of function calls parameterized with appropriate arguments, conditioned on the initial problem state. In _ALFRED_, we generally find that relative to a low-level search, imperative code is not well-suited to account for the finer-grained geometric detail of the 3D environment (e.g., checking if various appliances are opened or closed, or figuring out whether large objects can fit in smaller spaces.) The full implementation in Wang et al. (2023) includes additional features that would likely improve performance for our baseline _and_ our own model, including code correction given environmental feedback, and finds that more powerful LLMs (GPT-4) significantly improve performance. However, the challenges revealed in our baseline implementation highlight the relative strengths of learning action representations better designed for hierarchical planning.
+
+\begin{table}
+\begin{tabular}{l l c c c c} \hline \hline _Mini Minecraft_ & **LLM Predicts?** & **Library?** & **Mining** & **Crafting** & **Compositional** \\ \hline Low-level Planning Only & Goal & ✗ & 31\% & 9\% & 9\% \\ Subgoal Prediction & Sub-goals & ✗ & 33\% & 31\% & 5\% \\ Code Policy Prediction & Sub-policies & ✓ & 15\% & 42\% & 11\% \\ Ours & Goal+Operators & ✓ & 100\% & 100\% & 100\% \\ \hline _ALFRED_ & **LLM Predicts?** & **Library?** & **Original (Simple + Compositional Tasks)** \\ \hline Low-level Planning Only & Goal & ✗ & & 19\% & \\ Subgoal Prediction & Sub-goal & ✗ & & 2\% \\ Code Policy Prediction & Sub-policies & ✓ & & 2\% \\ Ours & Goal+Operators & ✓ & & 80\% \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: (_Top_) Results on _Mini Minecraft_. Our algorithm successfully recovers all intermediate operators for mining and crafting, which enable generalization to more compositional tasks (which use up to 26 operators) without any additional learning. (_Bottom_) Results on ALFRED. Our algorithm recovers all required household operators, which generalize to more complex compositional tasks.
+
+## 5 Related Work
+
+**Planning for language goals.** A large body of recent work attempts to use LLMs to solve planning tasks specified in language. One approach is to directly predict action sequences (Huang et al., 2022; Valmecekam et al., 2022; Silver et al., 2022), but this has yielded mixed results as LLMs can struggle to generalize or produce correct plans as problems grow more complex. To combat this, one line of work has explored structured and iterative prompting regimes (e.g., 'chain-of-thought' and feedback) (Mu et al., 2023; Silver et al., 2023). Increasingly, other neuro-symbolic work uses LLMs to predict formal goal or action representations that can be verified or solved with symbolic planners (Song et al., 2023; Ahn et al., 2022; Xie et al., 2023; Arora and Kambhampati, 2023). These approaches leverage the benefits of a known planning domain model. Our goal in this paper is to leverage language models to _learn_ this domain model. Another line of research aims at using LLMs to generate formal planning domain models (Liu et al., 2023) and subsequently uses classical planners to solve the task. However, they are not considering generating grounded actions in an environment and not learning a library of operators that can be reused across different tasks. We share the broad goal of building agents that can understand language and execute actions to achieve goals (Kaelbling, 1993; Tellex et al., 2011; Misra et al., 2017; Nair et al., 2022). See also Luketina et al. (2019) and Tellex et al. (2020).
+
+**Learning action representations from language.** Another group of work has been focusing on learning latent action representations from language (Corona et al., 2021; Andreas et al., 2017; Jiang et al., 2019; Sharma et al., 2022; Luo et al., 2023). Our work differs from them in that we are learning a planning-compatible action abstraction from LLMs, instead of relying on human demonstrations and annotated step-by-step instructions. The more recent Wang et al. (2023) adopts a similar overall problem specification to ours, and learns libraries of actions defined as imperative code-based policies. We show that learning planning abstractions enables better integration with hierarchical planning, and, as a result, better performance and generalization to more complex problems.
+
+**Language and code.** In addition to Wang et al. (2023), a growing body of work in program synthesis, both by learning lifted program abstractions that compress longer existing or synthesized programs (Bowers et al., 2023; Ellis et al., 2023; Wong et al., 2021; Cao et al., 2023). These approaches (including Wang et al. (2023)) generally learn libraries defined over imperative and functional programming languages, such as LISP and Python. Our work is closely inspired by these and seeks to learn representations suited specifically to solving long-range planning problems.
+
+**Hierarchical planning abstractions.** The hierarchical planning knowledge that we learn from LLMs and interactions in the environments are related to Hierarchical Task Networks (Eroi et al., 1994; Nejati et al., 2006), Hierarchical Goal Networks (Alford et al., 2016), abstract PDDL domains (Konidaris et al., 2018; Bonet and Geffner, 2020; Chitnis et al., 2021; Asai and Muise, 2020), and Domain Control Knowledge (de la Rosa and McIlraith, 2011). Most of these approaches require manually specified hierarchical planning abstractions; others learn them from demonstrations or interactions. By contrast, we leverage human language to guide the learning of such abstractions.
+
+## 6 Discussion and Future Work
+
+Our evaluations suggest a powerful role for language within AI systems that form complex, long-horizon plans -- as a deep source of background knowledge about the right _action abstractions_ for everyday planning domains, which contains broad human priors about how the world works, how to decompose tasks, and what tasks an agent may want to solve in the future. A core goal of this paper was to demonstrate how we might integrate knowledge in language alongside the powerful search, grounding, and verification toolkits developed in hierarchical planning.
+
+We leave open many possible extensions towards future work. Current **limitations** include core problems in general hierarchical planning not addressed here: we assume access to symbolic predicates that represent the environment state; do not yet tackle finer-grained motor planning; and only consider one representative pre-trained LLM (but not GPT-4, or an LLM finetuned for extended planning.)
+
+**Future work** might generally tackle these problems by asking how else linguistic knowledge and increasingly powerful or multimodal LLMs could be further integrated here: to _propose_ useful named predicates over initial perceptual inputs (e.g., images); or to speed planning by bootstrapping hierarchical planning abstractions using the approach here, but then to progressively transfer planning to another model, including an LLM, to later compose and use the learned representations.
+
+## References
+
+* Ahn et al. (2022) Michael Ahn, Anthony Brohan, Noah Brown, Yevgen Chebotar, Omar Cortes, Byron David, Chelsea Finn, Chuyuan Fu, Keerthana Gopalakrishnan, Karol Hausman, et al. Do as I Can, Not as I Say: Grounding Language in Robotic Affordances. _arXiv:2204.01691_, 2022.
+* Alford et al. (2016) Ron Alford, Vikas Shivashankar, Mark Roberts, Jeremy Frank, and David W Aha. Hierarchical Planning: Relating Task and Goal Decomposition with Task Sharing. In _IJCAI_, 2016.
+* Andreas et al. (2017) Jacob Andreas, Dan Klein, and Sergey Levine. Modular Multitask Reinforcement Learning with Policy Sketches. In _ICML_, 2017.
+* Andrychowicz et al. (2017) Marcin Andrychowicz, Filip Wolski, Alex Ray, Jonas Schneider, Rachel Fong, Peter Welinder, Bob McGrew, Josh Tobin, OpenAI Pieter Abbeel, and Wojciech Zaremba. Hindsight experience replay. _Advances in neural information processing systems_, 30, 2017.
+* Arora and Kambhampati (2023) Daman Arora and Subbarao Kambhampati. Learning and Leveraging Verifiers to Improve Planning Capabilities of Pre-trained Language Models. _arXiv:2305.17077_, 2023.
+* Asai and Muise (2020) Masataro Asai and Christian Muise. Learning Neural-Symbolic Descriptive Planning Models via Cube-Space Priors: The Voyage Home (To Strips). In _IJCAI_, 2020.
+* Bonet and Geffner (2020) Blai Bonet and Hector Geffner. Learning First-Order Symbolic Representations for Planning from the Structure of the State Space. In _ECAI_, 2020.
+* Bowers et al. (2023) Matthew Bowers, Theo X Olausson, Lionel Wong, Gabriel Grand, Joshua B Tenenbaum, Kevin Ellis, and Armando Solar-Lezama. Top-Down Synthesis for Library Learning. _PACMPL_, 7(POPL):1182-1213, 2023.
+* Cao et al. (2023) David Cao, Rose Kunkel, Chandrakana Nandi, Max Willsey, Zachary Tatlock, and Nadia Polikarpova. Babble: Learning Better Abstractions with E-graphs and Anti-unification. _PACMPL_, 7(POPL):396-424, 2023.
+* Chen et al. (2021) Valerie Chen, Abhinav Gupta, and Kenneth Marino. Ask Your Humans: Using Human Instructions to Improve Generalization in Reinforcement Learning. In _ICLR_, 2021.
+* Chitnis et al. (2021) Rohan Chitnis, Tom Silver, Joshua B Tenenbaum, Leslie Pack Kaelbling, and Tomas Lozano-Perez. GLiB: Efficient Exploration for Relational Model-Based Reinforcement Learning via Goal-Literal Babbling. In _AAAI_, 2021.
+* Corona et al. (2021) Rodolfo Corona, Daniel Fried, Coline Devin, Dan Klein, and Trevor Darrell. Modular Networks for Compositional Instruction Following. In _NAACL-HLT_, 2021.
+* de la Rosa and McIlraith (2011) Tomas de la Rosa and Sheila McIlraith. Learning Domain Control Knowledge for TLPlan and Beyond. In _ICAPS 2011 Workshop on Planning and Learning_, 2011.
+* Dietterich (2000) Thomas G Dietterich. Hierarchical Reinforcement Learning with the MAXQ Value Function Decomposition. _JAIR_, 13:227-303, 2000.
+* Ellis et al. (2023) Kevin Ellis, Lionel Wong, Maxwell Nye, Mathias Sable-Meyer, Luc Cary, Lore Anaya Pozo, Luke Hewitt, Armando Solar-Lezama, and Joshua B Tenenbaum. DreamCoder: Growing Generalizable, Interpretable Knowledge with Wake-Sleep Bayesian Program Learning. _Philosophical Transactions of the Royal Society_, 381(2251):20220050, 2023.
+* Erol et al. (1994) Kutluhan Erol, James Hendler, and Dana S Nau. HTN Planning: Complexity and Expressivity. In _AAAI_, 1994.
+* Fikes and Nilsson (1971) Richard E Fikes and Nils J Nilsson. STRIPS: A New Approach to the Application of Theorem Proving to Problem Solving. _Artif. Intell._, 2(3-4):189-208, 1971.
+* Garrett et al. (2021) Caelan Reed Garrett, Rohan Chitnis, Rachel Holladay, Beomjoon Kim, Leslie Pack Kaelbling, and Tomas Lozano-Perez. Integrated Task and Motion Planning. _Ann. Rev. Control Robot. Auton. Syst._, 4:265-293, 2021.
+* Gopalakrishnan et al. (2020)* Helmert (2006) Malte Helmert. The Fast Downward Planning System. _JAIR_, 26:191-246, 2006.
+* Huang et al. (2022) Wenlong Huang, Pieter Abbeel, Deepak Pathak, and Igor Mordatch. Language Models as Zero-Shot Planners: Extracting Actionable Knowledge for Embodied Agents. In _ICML_, 2022.
+* Jiang et al. (2019) Yiding Jiang, Shixiang Shane Gu, Kevin P Murphy, and Chelsea Finn. Language as an Abstraction for Hierarchical Deep Reinforcement Learning. In _NeurIPS_, 2019.
+* Kaelbling (1993) Leslie Pack Kaelbling. Learning to Achieve Goals. In _IJCAI_, 1993.
+* Konidaris et al. (2018) George Konidaris, Leslie Pack Kaelbling, and Tomas Lozano-Perez. From Skills to Symbols: Learning Symbolic Representations for Abstract High-Level Planning. _JAIR_, 61:215-289, 2018.
+* LaValle (1998) Steven LaValle. Rapidly-Exploring Random Trees: A New Tool for Path Planning. _Research Report 9811_, 1998.
+* Lifschitz (1986) Vladimir Lifschitz. On the Semantics of STRIPS. In _Workshop on Reasoning about Actions and Plans_, 1986.
+* Liu et al. (2023) Bo Liu, Yuqian Jiang, Xiaohan Zhang, Qiang Liu, Shiqi Zhang, Joydeep Biswas, and Peter Stone. LLM+ P: Empowering Large Language Models with Optimal Planning Proficiency. _arXiv:2304.11477_, 2023.
+* Luketina et al. (2019) Jelena Luketina, Nantas Nardelli, Gregory Farquhar, Jakob Foerster, Jacob Andreas, Edward Grefenstette, Shimon Whiteson, and Tim Rocktaschel. A Survey of Reinforcement Learning Informed by Natural Language. In _IJCAI_, 2019.
+* Luo et al. (2023) Zhezheng Luo, Jiayuan Mao, Jiajun Wu, Tomas Lozano-Perez, Joshua B Tenenbaum, and Leslie Pack Kaelbling. Learning Rational Subgoals from Demonstrations and Instructions. In _AAAI_, 2023.
+* Misra et al. (2017) Dipendra Misra, John Langford, and Yoav Artzi. Mapping Instructions and Visual Observations to Actions with Reinforcement Learning. In _EMNLP_, 2017.
+* Mu et al. (2023) Yao Mu, Qinglong Zhang, Mengkang Hu, Wenhai Wang, Mingyu Ding, Jun Jin, Bin Wang, Jifeng Dai, Yu Qiao, and Ping Luo. EmbodiedGPT: Vision-Language Pre-training via Embodied Chain of Thought. _arXiv:2305.15021_, 2023.
+* Nair et al. (2022) Suraj Nair, Eric Mitchell, Kevin Chen, Silvio Savarese, and Chelsea Finn. Learning Language-Conditioned Robot Behavior from Offline Data and Crowd-Sourced Annotation. In _CoRL_, 2022.
+* Nejati et al. (2006) Negin Nejati, Pat Langley, and Tolga Konik. Learning Hierarchical Task Networks by Observation. In _ICML_, 2006.
+* Sharma et al. (2022) Pratyusha Sharma, Antonio Torralba, and Jacob Andreas. Skill Induction and Planning with Latent Language. In _ACL_, 2022.
+* Shridhar et al. (2020) Mohit Shridhar, Jesse Thomason, Daniel Gordon, Yonatan Bisk, Winson Han, Roozbeh Mottaghi, Luke Zettlemoyer, and Dieter Fox. ALFRED: A Benchmark for Interpreting Grounded Instructions for Everyday Tasks. In _CVPR_, 2020.
+* Silver et al. (2021) Tom Silver, Rohan Chitnis, Joshua Tenenbaum, Leslie Pack Kaelbling, and Tomas Lozano-Perez. Learning symbolic operators for task and motion planning. In _2021 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)_, pp. 3182-3189. IEEE, 2021.
+* Silver et al. (2022) Tom Silver, Varun Hariprasad, Reece S Shuttleworth, Nishanth Kumar, Tomas Lozano-Perez, and Leslie Pack Kaelbling. PDDL Planning with Pretrained Large Language Models. In _NeurIPS Foundation Models for Decision Making Workshop_, 2022.
+* Silver et al. (2023) Tom Silver, Soham Dan, Kavitha Srinivas, Joshua B Tenenbaum, Leslie Pack Kaelbling, and Michael Katz. Generalized Planning in PDDL Domains with Pretrained Large Language Models. _arXiv:2305.11014_, 2023.
+* Silver et al. (2021)* Song et al. (2023) Chan Hee Song, Jiaman Wu, Clayton Washington, Brian M Sadler, Wei-Lun Chao, and Yu Su. LLM-Planner: Few-Shot Grounded Planning for Embodied Agents with Large Language Models. In _ICCV_, 2023.
+* Sutton et al. (1999) Richard S Sutton, Doina Precup, and Satinder Singh. Between MDPs and Semi-MDPs: A Framework for Temporal Abstraction in Reinforcement Learning. _Artif. Intell._, 112(1-2):181-211, 1999.
+* Tellex et al. (2011) Stefanie Tellex, Thomas Kollar, Steven Dickerson, Matthew Walter, Ashis Banerjee, Seth Teller, and Nicholas Roy. Understanding Natural Language Commands for Robotic Navigation and Mobile Manipulation. In _AAAI_, 2011.
+* Tellex et al. (2020) Stefanie Tellex, Nakul Gopalan, Hadas Kress-Gazit, and Cynthia Matuszek. Robots That Use Language. _Annual Review of Control, Robotics, & Autonomous Systems_, 3:25-55, 2020.
+* Valmeekam et al. (2022) Karthik Valmeekam, Alberto Olmo, Sarath Sreedharan, and Subbarao Kambhampati. Large Language Models Still Can't Plan (A Benchmark for LLMs on Planning and Reasoning about Change). In _NeurIPS Foundation Models for Decision Making Workshop_, 2022.
+* Wang et al. (2023) Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Mandlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan, and Anima Anandkumar. Voyager: An Open-Ended Embodied Agent with Large Language Models. _arXiv:2305.16291_, 2023.
+* Wong et al. (2021) Catherine Wong, Kevin M Ellis, Joshua Tenenbaum, and Jacob Andreas. Leveraging Language to Learn Program Abstractions and Search Heuristics. In _ICML_, 2021.
+* Xie et al. (2023) Yaqi Xie, Chen Yu, Tongyao Zhu, Jinbin Bai, Ze Gong, and Harold Soh. Translating Natural Language to Planning Goals with Large-Language Models. _arXiv:2302.05128_, 2023.
+
+## Appendix A Appendix
+
+We will release a complete code repository containing our full algorithm implementation, all baselines, and benchmark tasks. Here, we provide additional details on our implementational choices.
+
+### Additional Methods Implementation Details
+
+#### a.1.1 LLM Prompting
+
+We use gpt-3.5-turbo-16k for all experiments and baselines. Here, we describe the contents of the LLM few-shot prompts used in our method in more detail. **Symbolic Task Decomposition** For all unsolved tasks, at each iteration, we sample a set of symbolic task descriptions as a sequence of named high-level actions and their arguments. We construct a few-shot prompt consisting of the following components:
+
+1. A brief natural language header (_;;;; Given natural language goals, predict a sequence of PDDL actions_);
+2. A sequence of example (\(l_{t}\), \(P_{A}\)) tuples containing linguistic goals and example task decompositions. To avoid biasing the language model in advance, we provide example task decompositions for similar, constructed tasks that do not use any of the skills that need to be learned in our two domains. For example, on ALFRED, these example task decompositions are for example tasks (_bake a potato and put it in the fridge_, _place a baked, grated apple on top of the dining table_, _place a plate in a full sink_., and _pick up a laptop and then carry it over to the desk lamp_, _then restart the desk lamp_.), and our example task decompositions suggest named operators _BakeObject_, _GrateObject_, _FillObject_, and _RestartObject_, none of which appear in the actual training set.
+3. At iterations \(>0\), we also provide a sequence of sampled (\(l_{t}\), \(P_{A}\)) tuples randomly sampled from any solved tasks and their discovered high-level plans. This means that few-shot prompting better represents the true task distribution over successive iterations.
+
+In our experiments, we prompt with temperature=1.0 and draw n=4 task decomposition samples per unsolved task.
+
+**Symbolic Operator Definition** For all unsolved tasks, at each iteration, we sample proposed operator definitions consisting of \(args\), \(pre\), \(eff\) conditioned on all undefined operator names that appear in the proposed task decompositions.
+
+For each operator name, we construct a few-shot prompt consisting of the following components:
+
+1. A brief natural language header (_You are a software engineer who will be writing planning operators in the PDDL planning language. These operators are based on the following PDDL domain definition._
+2. The full set of environment predicates vocabulary of high-level environment predicates \(\mathcal{P}\), as well as valid named argument values (eg. object types).
+3. A sequence of example \(name,args,pre,eff\) operator definitions demonstrating the PDDL definition format. As with task decomposition, of course, we do not provide any example operator definitions that we wish to learn from our dataset.
+4. At iterations \(>0\), we include as many possible validated \(name,args,pre,eff\) operators defined in the current library (including new learned operators). If there are shared patterns between operators, this means that few-shot prompting also better represents the true operator structure over successive iterations.
+
+In our experiments, we prompt with temperature=1.0 and draw n=3 task decomposition samples per unsolved task. However, in our pilot experiments, we actually find that sampling directly from the token probabilities defined by this few-shot prompt does not produce sufficiently diverse definitions for each operator name. We instead directly prompt the LLM to produce up to N distinct operator definitions sequentially.
+
+We find that GPT 3.5 frequently produces syntactically invalid operator proposals - proposed operators often include invent predicates and object types that are not defined in the environment vocabulary, do not obey the predicate typing rules, or do not have the correct number and types of arguments. While this might improve with finetuned or larger LLMs, we instead implement a simple post-processing heuristic to correct operators with syntactic errors, or reject operators altogether: as operator pre and postconditions are represented as conjunctions of predicates, we remove any invalid predicates (predicates that are invented or that specify invalid arguments); we collect all arguments named across the predicates and use the ground truth typing to produce the final \(args\), and we reject any operators that have 0 valid postcondition predicates. This post-processing procedure frequently leaves operators underspecified (e.g., the resulting operators now are missing necessary preconditions, which were partially generated but syntactically incorrect in the proposal); we allow our full operator learning algorithm to verify and reject these operators.
+
+**Symbolic Goal Proposal** Finally, as described in 3.2, we also use an LLM to propose a set of candidate goal definitions as FOL formulas \(F^{\prime}_{t}\) defined over the environment predicates \(\mathcal{P}\) for each task. Our prompting technique is very similar to that used in the rest of our algorithm. For each task, we we construct a few-shot prompt consisting of the following components:
+
+1. A brief natural language header (_You are a software engineer who will be writing goal definitions for a robot in the PDDL planning language._
+2. The full set of environment predicates vocabulary of high-level environment predicates \(\mathcal{P}\), as well as valid named argument values (eg. object types).
+3. A sequence of example \(l_{t},f_{t}\) language and FOL goal formulas. In our experiments, during training, unlike in the previous prompts (where including ground truth operators would solve the learning problem), we _do_ sample an initial set of goal definitions from the training distribution as our initial example supervision. We set supervision to a randomly sampled fraction (0.1) of the training distribution.
+4. At iterations \(>0\), we also include \(l_{t},f_{t}\) examples from successfully solved tasks.
+
+In our experiments, we prompt with temperature=1.0 and draw n=4 task decomposition samples per unsolved task. As with the operator proposal, we also find that sampling directly from the token probabilities defined by this few-shot prompt does not produce sufficiently diverse definitions for each linguistic goal to correct for ambiguity in the human language (eg. to define the multiple concrete _Table_ types that a person might mean when referring to a _table_). We therefore again instead directly prompt the LLM to produce up to N distinct operator definitions sequentially.
+
+We also post-process proposed goals using the same syntactic criterion to remove invalid predicates in the FOL formula, and reject any empty goals.
+
+#### a.1.2 Policy Learning and Guided Low-level Search
+
+Concretely, we implement our policy-guided low-level action search as the following. We maintain a dictionary \(D\) that maps subgoals (a conjunction of atoms) to a set of candidate low-level action trajectories. When planning for a new subgoal \(sg\), if \(D\) contains the trajectory, we prioritize trying candidate low-level trajectories in \(D\). Otherwise, we fall back to a brute-force breadth-first search over all possible action trajectories. To populate \(D\), during the BFS, we compute the difference in the environment state before and after the agent executes any sampled trajectory and the corresponding trajectory \(t\) that caused the state change. Here the state difference can be viewed as a subgoal \(sg\) achieved by executing \(t\). Rather than directly adding the \((sg,t)\) as a key-value pair to \(D\), we _lift_ the trajectory and environment state change by replacing concrete objects in _sg_ and \(t\) by variables. Note that we update \(D\) with each sampled trajectory in the BFS even if it doesn't achieve the subgoal specified in the BFS search.
+
+When the low-level search receives a subgoal \(sg\), we again lift it by replacing objects with variables, and try to match it with entries in \(D\). If \(D\) contains multiple trajectories \(t\) for a given subgoal \(sg\), we track how often a given trajectory succeeds for a subgoal and prioritize trajectories with the most successes.
+
+### Experiments
+
+**Learned Operator Libraries on Minecraft** The following shows the full PDDL domain definition including the initial provided vocabulary of symbolic environment constants and predicates, initial pick and place operators and example operator, and all ensuing learned operators combined from the **Mining** and **Crafting** benchmarks.
+
+```
+1(define(domaincrafting-world-v20230404-teleport)
+2(:requirements:strips)
+3(:types
+4tile
+5object
+6inventory
+7object-type
+8)
+9(:constants
+10Key-object-type
+11WorkStation-object-type
+12Pickaxe-object-type
+13IronOreVein-object-type
+14IronOre-object-type
+15IronIngot-object-type
+16CoalOreVein-object-type
+17Coal-object-type
+18GoldOreVein-object-type
+19GoldOre-object-type
+20Goldingot-object-type
+21Cobblestone-object-type
+22Ace-object-type
+23Tree-object-type
+24Wood-object-type
+25WoodPlank-object-type
+26Stick-object-type
+27Sword-object-type
+28Chicken-object-type
+
+* [29](:predicates
+* [30](tile-up?1!-tile?12-tile)
+* [31](tile-down?1!-tile?12-tile)
+* [32](tile-left?1!-tile?12-tile)
+* [33](eight-right?1!-tile?12-tile)
+* [34](agent-at?1-tile)
+* [35](object-at?x-object?1-tile)
+* [36](inventory-holding?i-inventory?x-object)
+* [37](object-of-type?x-object?ot-object-type)
+* [38](:actionmove-to
+* [39]:parameters(?1!-tile?12-tile)
+* [40]:precondition(and(agent-at?1!))
+* [41]effect(and(agent-at?12)(not(agent-at?1!)))
+* [42](:actionpick-up
+* [43]:parameters(?i-inventory?x-object?1-tile)
+* [44]:precondition(and(agent-at?1)(object-at?x?1)(inventory-empty?i))
+* [45](:effect(and(inventory-holding?i?x)(not(object-at?x?1))(not(inventory-empty?i)))
+* [46](:actionplace-down
+* [47]:parameters(?i-inventory?x-object?1-tile)
+* [48]:precondition(and(agent-at?1)(inventory-holding?i?x))
+* [49]:effect(and(object-at?x?1)(not(inventory-holding?i?x))(inventory-empty?i))
+* [50](:actionmine-iron-ore
+* [51]:parameters(?toolinv-inventory?targetinv-inventory?x-object?tool-object?target-object?t-tile)
+* [52]:precondition(and
+* [53](agent-at?1)
+* [54](object-at?x?1)
+* [55](object-of-type?xIronCreVein)
+* [56](inventory-holding?toolinv?tool)
+* [57](object-of-type?toolPickaxe)
+* [58](inventory-empty?targetinv)
+* [59](object-of-type?targetHypothetical)*effect(and (not(inventory-empty?targetinv)) (inventory-holding?targetinv?target) (not(object-of-type?targetHypothetical)) (object-of-type?targetIronOre) ) )
+*actionmine-wood2 :parameters(?1-tile?x-object?toolinv-inventory?tool-object?targetinv-inventory?target-object)
+*precondition(and (agent-at?1) (object-at?x?1) (object-of-type?xTree) (inventory-holding?toolinv?tool) (object-of-type?toolAxe) (inventory-empty?targetinv) (object-of-type?targetHypothetical)
+*effect(and (not(inventory-empty?targetinv)) (inventory-holding?targetinv?target) (not(object-of-type?targetHypothetical)) (object-of-type?targetWood)
+*)
+*actionmine-wood1.0 :parameters(?1-tile?x-object?toolinv-inventory?tool-object?targetinv-inventory?target-object)
+*precondition(and (agent-at?1) (object-at?x?1) (object-of-type?xSheep) (inventory-holding?toolinv?tool) (object-of-type?toolShears) (inventory-empty?targetinv) (object-of-type?targetHypothetical) )
+*effect(and (not(inventory-empty?targetinv)) (inventory-holding?targetinv?target) (not(object-of-type?targetHypothetical)) (object-of-type?targetWool)
+*)
+*actionmine-potato_0 :parameters(?1-tile?x-object?targetinv-inventory?target-object)
+*precondition(and (agent-at?1) (object-at?x?1) (object-of-type?xPotatoPlant) (inventory-empty?targetinv) (object-of-type?targetHypothetical)
+*effect(and (not(inventory-empty?targetinv)) (inventory-holding?targetinv?target) (not(object-of-type?targetHypothetical)) (object-of-type?targetPotato)* [153](:action mine-sugar-cane_2
+
+- object? targetinv
+* [155]:precondition (and
+* [157](agent-at?1)
+* [158](object-at?x?1)
+* [159](object-of-type?x SugarCanePlant)
+* [160](inventory-holding?toolinv?tool)
+* [161](object-of-type?tool Axe)
+* [162](inventory-empty?targetinv)
+* [163](object-of-type?target Hypothetical)
+* [164])
+* [165]:effect (and
+* [166](not (inventory-empty?targetinv))
+* [167](inventory-holding?target Hypothetical))
+* [168](object-of-type?target SugarCane)
+* [169](object-of-type?target SugarCane)
+* [170]())
+* [171](:action mine-beetroot_1
+
+- object? targetinv
+* [173](?1 -?recondition (and
+* [174](agent-at?1)
+* [175](object-at?x?1)
+* [176](object-of-type?target Hypothetical))
+* [177](object-of-type?target Beetroot)
+* [178](object-of-type?target Hypothetical)
+* [179](:action mine-feather_1
+
+- object? targetinv
+* [181](object-at?x?1)
+* [182](object-of-type?x Chicken)
+* [183](object-of-type?tool Sword)
+* [184](inventory-empty?targetinv)
+* [185](object-of-type?target Hypothetical)
+* [186](object-of-type?target Hypothetical)
+* [187](object-of-type?target Hypothetical)
+* [188](object-of-type?target Feather)
+* [189](:action mine-cobblestone_2
+
+- object? targetinv
+
+[MISSING_PAGE_POST]
+
+* [314](object-at?x?t)
+* [315](object-of-type?xCobblestoneStash)
+* [316](inventory-holding?toolinv?tool)
+* [317](object-of-type?toolPickaxe)
+* [318](inventory-empty?targetinv)
+* [319](object-of-type?targetHypothetical)
+* [320](object-of-type?targetOo)
+* [321]:effect(and
+* [322](not(inventory-empty?target))
+* [323](inventory-holding?targetOo)
+* [324](object-of-type?targetHypothetical))
+* [325](object-of-type?targetCobblestone)
+* [326]())
+* [327](:actionmine-gold-ore1_2
+* [328](:actionmine-gold-ore1_2
+
+*effect(and (not(inventory-empty?targetinv))
+*(inventory-holding?targetinv?target)
+*(not(object-of-type?targetHypothetical))
+*(object-of-type?targetBeetroot)
+*)
+*(actioncraft-wood-plank :parameters(?ingredientinv1-inventory?targetinv-inventory?station-object?ingredient1-object?target-object?t-tile)
+*precondition(and (agent-at?1)
+*(object-at?station?1)
+*(object-of-type?stationWorkStation)
+*(inventory-holding?ingredientinv1?ingredient1)
+*(object-of-type?ingredient1Wood)
+*(inventory-empty?targetinv)
+*(object-of-type?targetHypothetical)
+*)
+*effect(and (not(inventory-empty?targetinv))
+*(inventory-holding?targetinv?target)
+*(not(object-of-type?targetHypothetical))
+*(object-of-type?targetWoodPlank)
+*(not(inventory-holding?ingredientinv1?ingredient1))
+*(inventory-empty?ingredientinv1?ingredient1)
+*(not(object-of-type?ingredient1Wood))
+*(object-of-type?ingredient1Hypothetical)
+*)
+*(actioncraft-arrow
+*parameters(?ingredientinv1-inventory?ingredientinv2-inventory?targetinv-inventory?station-object?ingredient1-object?ingredient2-object?target-object?t-tile)
+*precondition(and (agent-at?1)
+*(object-at?station?1)
+*(object-of-type?stationWorkStation)
+*(inventory-holding?ingredientinv1?ingredient1)
+*(object-of-type?ingredient1Stick)
+*(inventory-holding?ingredientinv2?ingredient2)
+*(object-of-type?ingredient2Feather)
+*(inventory-empty?targetinv)
+*(object-of-type?targetHypothetical)
+*)
+*effect(and (not(inventory-empty?targetinv))
+*(inventory-holding?targetinv?target)
+*(not(object-of-type?targetHypothetical))
+*(object-of-type?targetArrow)
+*(not(inventory-holding?ingredientinv1?ingredient1))
+*(inventory-empty?ingredientinv1)
+*(not(object-of-type?ingredient1Stick))
+*(object-of-type?ingredient1Hypothetical)
+*(object-of-type?ingredient1Hypothetical)
+*(not(inventory-holding?ingredientinv2?ingredient2))
+*(inventory-empty?ingredientinv2?ingredientinv2)
+*(not(object-of-type?ingredient2Feather))
+*(object-of-type?ingredient2Hypothetical)
+*(object-of-type?ingredient2Hypothetical)
+*(object-of-type?ingredient2Hypothetical)
+*()
+*(actioncraft-beetroot-soup_0
+*:parameters(?t-tile?station-object?ingredientinv1-inventory?ingredient1-object?ingredientinv2-inventory?ingredient2-inventory?target-object)* [336]:precondition(and (agent-at?1) (object-at?station?1) (object-of-type?stationWorkStation) (inventory-holding?ingredientinv1?ingredient1) (object-of-type?ingredient1Beetroot) (inventory-holding?ingredientinv2?ingredient2) (object-of-type?ingredient2Bow) (inventory-empty?targetinv) (object-of-type?targetHypothetical) (object-of-type?target?target) (inventory-holding?targetinv2?target) (not(object-of-type?targetHypothetical)) (object-of-type?ingredient2Bow)) (object-of-type?ingredient2Hypothetical) (inventory-holding?ingredientinv1?ingredient1) (not(object-of-type?ingredient1Beetroot)) (object-of-type?ingredient1Hypothetical) (not(inventory-holding?ingredientinv2?ingredient2)) (inventory-empty?ingredientinv2) (not(object-of-type?ingredient2Bow)) (object-of-type?ingredient2Hypothetical) (object-of-type?ingredient2Hypothetical) (object-of-type?ingredient2Bow)) (object-of-type?ingredient2Hypothetical) (object-of-type?ingredient2Hypothetical) (object-of-type?ingredient1?ingredient1) (inventory-empty?targetinv) (object-of-type?targetIhypothetical) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow) (object-of-type?ingredient1Bow)) (object-of-type?ingredient1Bow) (object-of-type?* 399 (inventory-holding?targetinv?target)
+* 400 (not(object-of-type?targetHypothetical))
+* 401 (object-of-type?targetShears)
+* 402 (not(inventory-holding?ingredientinv1?ingredient1))
+* 403 (inventory-empty?ingredientinv1)
+* 404 (not(object-of-type?ingredient1Goldingot))
+* 405 (object-of-type?ingredient1Hypothetical)
+* 406 )
+* 407 )
+* (:action craft-bowl_1
+
+* 410 (:precondition(and
+* 412 (agent-at?1)
+* 413 (object-at?station?1)
+* 414 (object-of-type?stationWorkStation)
+* 415 (inventory-holding?ingredientinv1?ingredient1)
+* 416 (object-of-type?ingredientWoedPlank)
+* 417 (inventory-holding?ingredientinv2?ingredient2)
+* 418 (object-of-type?ingredient2WoodPlank)
+* 419 (inventory-empty?targetinv)
+* 420 (object-of-type?targetHypothetical)
+* 421 )
+* effect (and
+* 423 (not(inventory-empty?targetinv))
+* 424 (inventory-holding?targetinv2target)
+* 425 (not(object-of-type?targetHypothetical))
+* 426 (object-of-type?targetBow)
+* 427 (not(inventory-holding?ingredientinv1?ingredient1))
+* 428 (inventory-empty?ingredientinv1)
+* 429 (not(object-of-type?ingredient1WoodPlank))
+* 430 (object-of-type?ingredient1Hypothetical)
+* 431 (not(inventory-holding?ingredientinv2?ingredient2))
+* 432 (inventory-empty?ingredientinv2)
+* 433 (not(object-of-type?ingredient2WoodPlank))
+* 434 (object-of-type?ingredient2Hypothetical)
+* 435 )
+* 436 )
+* 437 (:action craft-boat_0
+
+* 439 (endotion(and
+* 441 (agent-at?1)
+* 442 (object-at?station?1)
+* 443 (object-of-type?stationWorkStation)
+* 444 (inventory-holding?ingredientinv?ingredient)
+* 445 (object-of-type?ingredientWoodPlank)
+* 446 (inventory-empty?ingredientinv)
+* 447 (object-of-type?targetHypothetical)
+* 448 )
+*effect(and
+* 449 (not(inventory-empty?targetinv))
+* 451 (inventory-holding?targetinv?target)
+* 452 (not(object-of-type?targetHypothetical))
+* 453 (object-of-type?targetBow)
+* 454 (not(inventory-holding?ingredientinv?ingredientinv)
+* 455 (inventory-empty?ingredientinv)
+* 456 (not(object-of-type?ingredientWoodPlank))
+* 457 (object-of-type?ingredientHypothetical)
+* 458 )
+* 459 )
+* 460 (:action craft-cooked-potato_1
+* [462] :precondition (and
+* [463] (agent-at?1)
+* [464] (object-at?station?1)
+* [465] (object-of-type?station WorkStation)
+* [466] (inventory-holding?ingredientinv1?ingredient1)
+* [467] (inventory-holding?ingredientinv2?ingredient2)
+* [468] (object-of-type?ingredient2 Coal)
+* [469] (inventory-empty?largetinv)
+* [470] (object-of-type?ingredient2 (object-of-type?target Hypothetical)
+* [471] (inventory-empty?largetinv)
+* [472] (object-of-type?target Hypothetical)
+* [473] )
+* [474] :effect (and
+* [475] (not (inventory-empty?largetinv))
+* [476] (inventory-holding?ingredientinv1?ingredient1))
+* [477] (inventory-empty?ingredientinv1)
+* [478] (not (object-of-type?ingredient1 Potato))
+* [479] (object-of-type?ingredient1 Hypothetical)
+
+* [481] (inventory-empty?ingredientinv2)
+* [482] (not (object-of-type?ingredient2 Coal))
+* [483] (object-of-type?ingredient2 Hypothetical)
+* [484] (object-of-type?ingredient2 Hypothetical)
+* [485] (action craft-gold-ingot_1
+
+* [487] :precondition (and
+* [488] (agent-at?1)
+* [489] (object-at?Station?1)
+* [490] (inventory-holding?ingredientinv1?ingredient1)
+* [491] (object-of-type?ingredient1 GoldOrre)
+* [492] (inventory-holding?ingredientinv2?ingredient2)
+* [493] (object-of-type?ingredient2 Coal)
+* [494] (inventory-empty?largetinv)
+* [501] (inventory-empty?target Hypothetical)
+* [502] (inventory-holding?largetinv2?ingredient2)
+* [503] (inventory-empty?largetinv)
+* [504] (inventory-holding?largetinv2?ingredient2)
+* [505] (inventory-holding?largetinv2?ingredient2 (object-of-type?target Hypothetical))
+* [506] (inventory-holding?ingredientinv1?ingredient1))
+* [507] (inventory-empty?ingredientinv1?ingredient1)
+* [508] (inventory-holding?ingredientinv1?ingredient1)
+* [509] (inventory-empty?ingredientinv1?ingredient1)
+* [510] (inventory-holding?ingredientinv2?ingredient2)
+* [511] (inventory-empty?ingredientinv2?ingredient2)
+* [512] (inventory-empty?ingredientinv2?ingredient2)
+* [513] (inventory-empty?ingredientinv2?ingredientinv2)
+* [514] (not (object-of-type?ingredient2 Coal))
+* [515] (object-of-type?ingredient2 Hypothetical)
+* [516] ()
+* [517] )
+* [518] (:action craft-stick_0
+
+[MISSING_PAGE_POST]
+
+olding?target - object?target* [321]:precondition(and
+* [322](agent-at?1)
+* [323](object-of-type?stationWorkStation)
+* [324](inventory-holding?ingredientinv1?ingredient1)
+* [325](object-of-type?ingredient1WoodPlank)
+* [327](inventory-empty?targetinv)
+* [328](object-of-type?targetHypothetical)
+* [329](effect(and
+* [331](not(inventory-empty?targetinv))
+* [332](inventory-holding?targetinv2target)
+* [333](not(object-of-type?targetHypothetical))
+* [334](object-of-type?targetStick)
+* [335](not(inventory-holding?ingredientinv1?ingredient1))
+* [336](inventory-empty?ingredient1WoodPlank))
+* [337](not(object-of-type?ingredient1Hypothetical)
+* [338](object-of-type?ingredient1Hypothetical)
+* [339]()
+* [340](:actioncraft-sword_0
+* [342]:parameters(?1-tile?station-object?ingredientinv1-inventory?ingredient1-object?ingredientinv2-inventory?ingredient2-object?targetinv-inventory?target-object)
+* [343](:precondition(and
+* [344](agent-at?1)
+* [345](object-at?station?1)
+* [346](object-of-type?stationWorkStation)
+* [347](inventory-holding?ingredientinv1?ingredient1)
+* [348](object-of-type?ingredient1Stick)
+* [349](inventory-holding?ingredientinv2?ingredient2)
+* [350](object-of-type?ingredient2Ironingot)
+* [351](object-of-type?ingredient2Ironingot)
+* [352](inventory-empty?targetinv)
+* [353](object-of-type?targetHypothetical)
+* [354]()
+* [355]:effect(and
+* [356](not(inventory-empty?targetinv))
+* [357](inventory-holding?targetinv?target)
+* [358](not(object-of-type?targetHypothetical))
+* [359](object-of-type?targetSword)
+* [360](not(inventory-holding?ingredientinv1?ingredient1))
+* [361](inventory-empty?ingredientinv1)
+* [362](not(object-of-type?ingredient1Stick))
+* [363](object-of-type?ingredient1Hypothetical)
+* [364](not(inventory-holding?ingredientinv2?ingredient2))
+* [365](inventory-empty?ingredient2Ironingot))
+* [366](not(object-of-type?ingredient2Ironingot))
+* [367](object-of-type?ingredient2Hypothetical)
+* [368]()
+* [369](:actioncraft-bed_1
+* [371]:parameters(?1-tile?station-object?ingredientinv1-inventory?ingredient1-object?ingredientinv2-inventory?ingredient2-object?targetinv-inventory?target-object)
+* [372](:precondition(and
+* [373](agent-at?1)
+* [374](object-at?station?1)
+* [375](object-of-type?stationWorkStation)
+* [377](inventory-holding?ingredientinv1?ingredient1)
+* [378](object-of-type?ingredient1WoodPlank)
+* [379](inventory-holding?ingredientinv2?ingredient2)
+* [380](object-of-type?ingredient2Wool)
+* [381](inventory-empty?targetinv)* [382] (object-of-type?targetHypothetical)
+* [383] ):effect(and
+* [385] (not(inventory-empty?targetinv))
+* [386] (inventory-holding?targetinv?target)
+* [387] (not(object-of-type?targetHypothetical))
+* [388] (object-of-type?targetBed)
+* [389] (not(inventory-holding?ingredientinv1?ingredient1))
+* [390] (inventory-empty?ingredientinv1WoodPlank))
+* [391] (not(object-of-type?ingredient1Hypothetical)
+* [393] (not(inventory-holding?ingredientinv2?ingredient2))
+* [394] (inventory-empty?ingredientinv2)
+* [395] (not(object-of-type?ingredient2Wool))
+* [396] (object-of-type?ingredient2Hypothetical)
+* [397] )
+* [398] )
+* [399] (:actioncraft-iron-ingot_2
+* [400] :parameters(?1-tile?station-object?ingredientinv1-inventory?ingredient1-object?ingredientinv2-inventory?ingredient2-object?targetinv-inventory?target-object)
+* [401] :precondition(and
+* [403] (agent-at?1)
+* [404] (object-at?Station?1)
+* [405] (object-of-type?stationWorkStation)
+* [406] (inventory-holding?ingredientinv1?ingredient1)
+* [407] (object-of-type?ingredient1IronOre)
+* [408] (inventory-holding?ingredientinv2?ingredient2)
+* [409] (object-of-type?ingredient2Coal)
+* [410] (inventory-empty?targetinv)
+* [411] (object-of-type?targetHypothetical)
+* [412] (413):effect(and
+* [414] (not(inventory-empty?targetinv))
+* [415] (inventory-holding?targetinv?target)
+* [416] (not(object-of-type?targetHypothetical))
+* [417] (object-of-type?targetIroningot)
+* [418] (not(inventory-holding?ingredientinv1?ingredient1))
+* [419] (inventory-empty?ingredientinv1)
+* [420] (not(object-of-type?ingredient1IronOre))
+* [421] (object-of-type?ingredient1Hypothetical)
+* [422] (not(inventory-holding?ingredientinv2?ingredient2))
+* [423] (inventory-empty?ingredientinv2)
+* [424] (not(object-of-type?ingredient2Coal))
+* [425] (object-of-type?ingredient2Hypothetical)
+* [426] )
+
+**Learned Operator Libraries on ALFRED** The following shows the full PDDL domain definition including the initial provided vocabulary of symbolic environment constants and predicates, initial pick and place operators, and all ensuing learned operators.
+
+```
+1(define(domainalfred)
+2(:requirements:adl
+3){:types
+5agentlocationreceptacleobjectrtypeotype
+6}
+7(:constants
+8CandleType-otype
+9ShowerGlassType-otype
+10CDType-otype- otype MirrorType
+
+* [59] LaunduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduuHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduHarduuHarduHarduHarduHarduHarduHarduuHarduHarduHarduHarduHarduHarduuHarduHarduHarduHarduuHarduHarduHarduHarduHarduHarduHarduuHarduHarduHarduHarduHarduHarduuHarduHarduHarduuHarduHarduuHarduHarduuHarduHarduHarduuHarduHarduHarduHarduuHarduHarduHarduHarduuHarduHarduuHarduHarduHarduuHarduHarduuHarduHarduHarduHarduuHarduuHarduHarduuHarduHarduHarduuHarduHarduHarduHarduHarduHarduHarduuHarduHarduuHarduuHarduHarduuHarduHarduuHarduHarduuHarduHarduHarduHarduuHarduuHarduHarduuHarduHarduuHarduuHarduHarduuHarduHarduuHarduuHarduuHarduuHarduHarduuHarduHarduuHarduuHarduHarduuHarduuHarduuHarduHarduHarduuHarduuHarduHarduuHarduHarduuHarduuHarduHarduuHarduuHarduuHarduuHarduHarduuHarduuHarduHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduHarduuuHarduHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuuHarduuHarduuuHarduuHarduuHarduuuHarduuHarduuHarduuHarduuHarduuHarduuuHarduuuHarduuHarduuuHarduuHarduuuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuHarduuuHarduuHarduuHarduuHarduuuHarduuHarduuHarduuuHarduuHarduuuHarduuuHarduuuHarduuHarduuuHarduuuHarduuuHarduuuHarduuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuHarduuuuHarduuuHarduuuHarduuHarduuuuHarduuuHarduuuuHarduuHarduuuHarduuuHarduuuHarduuuHarduuHarduuuHarduuuHarduuuHarduuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuuHarduuHarduuuHarduuuHarduuuuHarduuHarduuuHarduuuHarduuuHarduuuuHarduuuHarduuuHarduuuHarduuuuHarduuuHarduuuHarduuuHarduuHarduuuHarduuuuHarduuuHarduuuuHarduuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuHarduuuuHarduuuuHarduuuHarduuuuHarduuuuHarduuuHarduuuHarduuuHarduuuHarduuuuHarduuuHarduuuHarduuuuHarduuuHarduuuHarduuuuHarduuuuHarduuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuHarduuuuHarduuHarduuuuHarduuuuHarduuuuHarduuuHarduuuuHarduuuuHarduuuuHarduuuHarduuuuHarduuuuuHarduuuHarduuuuHarduuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuHarduuuuuHarduuuuHarduuuuHarduuuuHarduuuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuuHarduuuuuHarduuuuHarduuuuHarduuuuHarduuuuuuHarduuuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuuHarduuuuHarduuuuHarduuuuHarduuuuuHarduuuuuHarduuuuHarduuuuHarduuuuuHarduuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuHarduuuuHarduuuuHarduuuuuHarduuuuHarduuuuuHarduuuuHarduuuuHarduuuuuHarduuuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuuHarduuuuHarduuuuuHarduuuuHarduuuuuHarduuuuHarduuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuHarduuuuuHarduuuuuuHarduuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuHarduuuuuHarduuuuuuHarduuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuHarduuuuuuHarduuuuuuHarduuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuHarduuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuHarduuuuuHarduuuuHarduuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuuHarduuuuuHarduuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuuHarduuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuuHarduuuuuuuHarduuuuuuHarduuuuHarduuuuuHarduuuuuuuHarduuuuuuuHarduuuuuuHarduuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuHarduuuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuHarduuuuuuHarduuuuHarduuuuHarduuuuuuuHarduuuuuuHarduuuuuHarduuuuuHarduuuuuuuHarduuuuuHarduuuuuHarduuuuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuuuHarduuuuuuuHarduuuuuuHarduuuuuuHarduuuuuuHarduuuuHarduuuuuuHarduuuuuHarduuuuuuHarduuuuHarduuuuuuHarduuuuuuuHarduuuuuHarduuuuuuHarduuuuuHarduuuuHarduuuHarduuuuHarduuuuNewspaperType - type
+
+* 16
+* 17
+* 18
+* 19
+* 20
+* 21
+* 22
+* 23
+* 24
+* 25
+* 26
+* 27
+* 28
+* 29
+* 30
+* 31
+* 32
+* 33
+* 34
+* 35
+* 36
+* 37
+* 38
+* 39
+* 30
+* 31
+* 33
+* 34
+* 35
+* 36
+* 37
+* 38
+* 39
+* 31
+* 30
+* 32
+* 33
+* 34
+* 35
+* 36
+* 37
+* 38
+* 39
+* 31
+* 32
+* 33
+* 34
+* 35
+* 36
+* 37
+* 38
+* 39
+* 30
+* 31
+* 33
+* 34
+* 35
+* 36
+* 37
+* 38
+* 39
+* 310
+* 311
+* 312
+* 313
+* 314
+* 315
+* 316
+* 317
+* 318
+* 319
+* 320
+* 321
+* 322
+* 323
+* 324
+* 325
+* 326
+* 327
+* 328
+* 329
+* 330
+* 331
+* 332
+* 333
+* 334
+* 335
+* 336
+* 337
+* 338
+* 339
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 347
+* 348
+* 349
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 344
+* 349
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 348
+* 349
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 349
+* 340
+* 341
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 349
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 349
+* 341
+* 340
+* 343
+* 341
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 349
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 344
+* 349
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 343
+* 340
+* 341
+* 342
+* 343
+* 344
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 343
+* 341
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 349
+* 341
+* 343
+* 344
+* 349
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 344
+* 349
+* 341
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 349
+* 341
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 349
+* 340
+* 341
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 340
+* 341
+* 343
+* 344
+* 349
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 348
+* 349
+* 340
+* 341
+* 343
+* 344
+* 349
+* 341
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 343
+* 341
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 3400
+* 341
+* 349
+* 340
+* 341
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 340
+* 341
+* 342
+* 343
+* 344
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 343
+* 344
+* 345
+* 349
+* 341
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 340
+* 341
+* 343
+* 344
+* 348
+* 349
+* 349
+* 340
+* 341
+* 340
+* 342
+* 341
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 341
+* 343
+* 344
+* 349
+* 340
+* 341
+* 344
+* 345
+* 341
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 349
+* 340
+* 341
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 341
+* 349
+* 340
+* 341
+* 349
+* 340
+* 341
+* 341
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 350
+* 349
+* 349
+* 341
+* 349
+* 340
+* 341
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 340
+* 341
+* 340
+* 341
+* 343
+* 351
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 349
+* 340
+* 341
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 341
+* 349
+* 340
+* 341
+* 343
+* 352
+* 341
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 349
+* 353
+* 349
+* 340
+* 341
+* 340
+* 341
+* 342
+* 343
+* 344
+* 345
+* 344
+* 346
+* 347
+* 348
+* 349
+* 349
+* 349
+* 341
+* 349
+* 340
+* 341
+* 343
+* 344
+* 345
+* 349
+* 341
+* 3452
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 348
+* 349
+* 349
+* 354
+* 349
+* 355
+* 356
+* 349
+* 340
+* 341
+* 340
+* 341
+* 341
+* 343
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 341
+* 349
+* 341
+* 340
+* 341
+* 342
+* 343
+* 341
+* 344
+* 349
+* 341
+* 344
+* 345
+* 346
+* 347
+* 348
+* 349
+* 341
+* 343
+* 341
+* 344
+* 345
+* 349
+* 341
+* 345
+* 341
+* 343
+* 346
+* 347
+* 348
+* 355
+* 349
+* 354
+* 349
+* 341
+* 341
+* 348
+* 349
+* 355
+* 341
+* 341
+* 341
+* 344
+* 349
+* 341
+* 341
+* 3434)
+140 (sliceable?o-object)
+141 (isSliced?o-object)
+142 )
+143 (:actionPickupObjectNotInReceptacle
+144 :parameters(?a-agent?1-location?o-object)
+145 :precondition(and
+146 (allocation?a?1)
+147 (objectAtLocation?o?1)
+148 (not(holdsAny?a))
+149 (forall
+150 (?re-receptacle)
+151 (not(inReceptacle?o?re))
+152 )
+153 )
+154 :effect(and
+155 (not(objectAtLocation?o?1))
+156 (holds?a?o)
+157 (holdsAny?a)
+158 )
+159 )
+160
+161 (:actionPutObjectInReceptacle
+162 :parameters(?a-agent?1-location?ot-otype?o-object?r-receptacle)
+163 :precondition(and
+164 (atLocation?a?1)
+165 (receptacleAtLocation?r?1)
+166 (objectType?o?ot)
+167 (holds?a?o)
+168 (not(holdsAnyReceptacleObject?a))
+169 )
+170 :effect(and
+171 (inReceptacle?o?r)
+172 (not(holds?a?o))
+173 (not(holdsAny?a))
+174 (objectAtLocation?o?1)
+175 )
+176 )
+177 (:actionPickupObjectInReceptacle
+179 :parameters(?a-agent?1-location?o-object?r-receptacle)
+180 :precondition(and
+181 (atLocation?a?1)
+182 (objectAtLocation?o?1)
+183 (inReceptacle?o?r)
+184 (not(holdsAny?a))
+185 )
+186 :effect(and
+187 (not(objectAtLocation?o?1))
+188 (not(inReceptacle?o?r))
+189 (holds?a?o)
+190 (holdsAny?a)
+191 )
+192 )
+193 (:actionRinseObject_2
+195 :parameters(?toolreceptacle-receptacle?a-agent?1-location?o-object)
+196 :precondition(and
+198 (receptacleType?toolreceptacleSinkBasinType)
+199 (atLocation?a?1)
+200 (receptacleAtLocation?toolreceptacle?1)
+201 (objectAtLocation?o?1))
+302 (cleanable?o)
+303 )
+304 :effect(and
+305 (isClean?o)
+306 )
+307 )
+308 (:actionTurnOnObject_2
+309 :parameters(?a-agent?1-location?o-object)
+310 :precondition(and
+311 (atLocation?a?1)
+312 (objectAtLocation?o?1)
+313 (toggleable?o)
+314 )
+315 )
+316 )
+317 :effect(and
+318 (isToggled?o)
+319 )
+320 )
+321 (:actionCoolObject_0
+322 :parameters(?toolreceptacle-receptacle?a-agent?1-location?o-object)
+323 :precondition(and
+324 )
+325 :precondition(and
+326 (receptacleType?toolreceptacleFridgeType)
+327 (atLocation?a?1)
+328 (receptacleAtLocation?toolreceptacle?1)
+329 (holds?a?o)
+320 )
+321 :effect(and
+322 (isCool?o)
+323 )
+324 )
+325 (:actionSliceObject_1
+326 :parameters(?toolobject-object?a-agent?1-location?o-object)
+327 )
+328 :precondition(and
+329 (objectType?toolobjectButterKnifeType)
+320 (atLocation?a?1)
+321 (objectAtLocation?o?1)
+322 (sliceable?o)
+323 (holds?a?toolobject)
+324 )
+325 :effect(and
+326 (isSliced?o)
+327 )
+328 )
+329 (:actionSliceObject_0
+320 :parameters(?toolobject-object?a-agent?1-location?o-object)
+321 :precondition(and
+323 (objectType?toolobjectKnifeType)
+324 (atLocation?a?1)
+325 (sliceable?o)
+326 (slodes?a?toolobject)
+327 )
+328 )
+329 :effect(and
+320 (isSliced?o)
+321 )
+322 :precondition(and
+323 (objectType?toolobjectKnifeType)
+325 (atLocation?o?1)
+326 (sliceable?o)
+327 (holds?a?toolobject)
+328 )
+329 :effect(and
+329 :effect(and
+320 (isSliced?o)
+321 )
+323 (:actionMicrowaveObject_0
+* [265] :precondition (and
+* [266] (receptacleType?toolreceptacle MicrowaveType)
+* [268] (atLocation?a?1)
+* [269] (receptacleAtLocation?toolreceptacle?1)
+* [270] (holds?a?o)
+* [271] )
+* [272] :effect (and
+* [273] (isHot?o)
+* [274] )
+* [275] )

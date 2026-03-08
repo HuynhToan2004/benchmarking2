@@ -1,0 +1,494 @@
+# \(\mathcal{B}\)-Coder: Value-Based Deep Reinforcement Learning for Program Synthesis
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Program synthesis aims to create accurate, executable code from natural language descriptions. This field has leveraged the power of reinforcement learning (RL) in conjunction with large language models (LLMs), significantly enhancing code generation capabilities. This integration focuses on directly optimizing functional correctness, transcending conventional supervised losses. While current literature predominantly favors policy-based algorithms, attributes of program synthesis suggest a natural compatibility with value-based methods. This stems from rich collection of off-policy programs developed by human programmers, and the straightforward verification of generated programs through automated unit testing (i.e. easily obtainable rewards in RL language). Diverging from the predominant use of policy-based algorithms, our work explores the applicability of value-based approaches, leading to the development of our \(\mathcal{B}\)-Coder (pronounced Bellman coder). Yet, training value-based methods presents challenges due to the enormous search space inherent to program synthesis. To this end, we propose an initialization protocol for RL agents utilizing pre-trained LMs and a conservative Bellman operator to reduce training complexities. Moreover, we demonstrate how to leverage the learned value functions as a dual strategy to post-process generated programs. Our empirical evaluations demonstrated \(\mathcal{B}\)-Coder's capability in achieving state-of-the-art performance compared with policy-based methods. Remarkably, this achievement is reached with minimal reward engineering effort, highlighting the effectiveness of value-based RL, independent of reward designs.
+
+## 1 Introduction
+
+Program synthesis (or code generation) aims to create functionally accurate executable programs from problem specifications, such as input-output (IO) examples (Summers, 1977; Gulwani et al., 2012), constraint-based (Osera & Zdancewic, 2015; Frankle et al., 2016) or natural language descriptions (Hendrycks et al., 2021; Austin et al., 2021), among others. The increasing attention towards this field can be attributed to its potential in transforming the software development paradigm. Notably, AI-powered tools have shown evidence of boosting efficiency within the software industry.
+
+Large language models (LLMs) (Brown et al., 2020; OpenAI, 2023; Anil et al., 2023; Chowdhery et al., 2022; Rae et al., 2021; Hoffmann et al., 2022; Touvron et al., 2023) have garnered substantial interest and shown remarkable achievements. The scheme of pre-training on vast amounts of data has yielded notable successes in natural language generation. This trend extends its influence to program synthesis, where numerous specialized code LLMs (Li et al., 2023; Li et al., 2022; Nijkamp et al., 2022; Zheng et al., 2023; Fried et al., 2022; Chen et al., 2021; Wang et al., 2021, 2023; Xu et al., 2023; Roziere et al., 2023) have been introduced to address challenges in program synthesis.
+
+Unlike many free-form natural language generation tasks, where the quality of model's output is hard to assess, the correctness of synthesized programs can be verified through automated execution with predefined unit tests. This allows for directly optimizing execution outcomes through reinforcement learning (RL), by formulating test outcomes as reward signals. Our discussion focuses on recent RL-based works (Le et al., 2022; Shojaee et al., 2023; Liu et al., 2023) that have achieved remarkable advancements in Python text-to-code generation, evaluated on the challenging benchmarks sourced from Codeforces programming contests (Hendrycks et al., 2021; Li et al., 2022) Notably, these works predominantly favor _on-policy_ policy-based algorithms.
+
+While (on-policy) policy-based methods are favored in existing program synthesis works, they are known to be sample inefficient (Nachum et al., 2017; Gu et al., 2016) due to their inability to use "off-policy samples". In contrast, value-based methods, using temporal difference learning, are known to be much more sample-efficient (Gu et al., 2016; Nachum et al., 2017; Liu et al., 2020), as they don't explicitly require a specific data distribution, hence can better use off-policy data. We defer the technical explanations on "on/off-policy data" and reasons for the different efficiency to Section 3.2, where we have all notations and definitions ready.
+
+In program synthesis, the primary sources of off-policy data include: (a) human programs, (b) previously synthesized programs. Both (a) and (b) are categorized as off-policy data because they do not follow the trajectory distribution induced by the _current_ model. Current program synthesis works often use off-policy data with on-policy algorithms. However, Shojaee et al. (2023) notes that in this scheme, an increase in off-policy synthetic programs can reduce performance. In general, an ideal objective should be to improve or maintain performance with increased data, not to decrease it.
+
+To summarize, the reasons that suggest a natural fit for value-based methods in program synthesis are twofold: the availability of (inexpensive) rewards, similar to classical RL tasks like GO and Atari; and the principle compatibility with off-policy data for effectively leveraging human and historical data. However, value-based RL faces challenges such as difficulty in converging in large state-action spaces. To this end, we introduce \(\mathcal{B}\)-Coder (Bellman coder), with our contributions being threefold:
+
+* We stabilize value-based RL for program synthesis by proposing an initialization protocol for \(Q\)-functions and a conservative Bellman operator to mitigate the training complexities.
+* We demonstrate how to leverage value functions as a dual strategy to improve generation.
+* \(\mathcal{B}\)-Coder achieves strong empirical performance with minimal reward engineering, providing further insights of RL algorithm design independent of reward function designs.
+
+**Paper structure.** We introduce related works and necessary notations in Sections 2 and 3, respectively. Section 4 details our proposed method and the rationale behind our design choices. Specifically, Sections 4.1, 4.2, and 4.3 address the challenges of value function training in large state-action spaces by leveraging task structure, providing effective \(Q\)-function initialization, and a conservative operator for stable, yet less ambitious updates, respectively. Section 4.5 demonstrates an additional benefit of value functions. Lastly, Section 5 presents our empirical evaluation results.
+
+## 2 Related works
+
+**Execution guided program synthesis.** The availability of test case outcomes has led to the line of execution-guided works (Chen et al., 2018; Zohar and Wolf, 2018; Chen et al., 2021b). While these efforts leverage execution feedback, they do not directly optimize towards higher execution success rate due to the inherent non-differentiability of execution outcomes.
+
+**RL for general sequence modeling.** Supervised LM training scheme using masked language modeling (Kenton and Toutanova, 2019) or next token predictions (NTP), has recognized limitations. One prominent issue is the exposure bias: given that the training is done in a "teacher-forcing" manner (Bengio et al., 2015; Ranzato et al., 2015), errors tend to accumulate during the testing phase due to auto-regressive generation. Prior works (Ranzato et al., 2015; Rennie et al., 2017) have demonstrated the efficacy of RL in optimizing non-differentiable metrics, e.g. BLEU (Papineni et al., 2002) and ROUGE (Lin, 2004), by leveraging automatic scoring as reward function.
+
+**RL for program synthesis.** Supervised losses also fall short when assessing the functional accuracy of synthesized programs (Hendrycks et al., 2021; Chen et al., 2021a). As such, relying solely on supervised learning for program synthesis is not ideal. As RL provides a pathway to directly optimize non-differentiable objectives, plentiful work (Zhong et al., 2017; Simmons-Edler et al., 2018; Ellis et al., 2019; Wang et al., 2022) have studied enhancing code generation through RL.
+
+For the works most related to ours: CodeRL (Le et al., 2022) adapted REINFORCE (Williams, 1992), a classic policy gradient (PG) algorithm, along with the baseline trick for variance reduction and a supervise-trained reward model to alleviate the sparse execution signals. They also proposed a critic sampling strategy to refine and repair program based on the example unit tests feedback. PPOCoder (Shojaee et al., 2023) applied proximal policy gradient (Schulman et al., 2017, PPO) to fine-tune pre-trained LMs. In addition, they leverage the syntactic and semantic structure of code, such as syntax trees (Rabinovich et al., 2017) and data-flow graphs (Yasunaga and Liang, 2020), to improve reward function designs. RLTF (Liu et al., 2023) proposed an online training framework for program synthesis using policy gradient with heuristically-designed fine-grained rewards.
+
+**Additional discussions on RL paradigms.** In Appendix G, we categorize successful RL applications, showing the similarities of program synthesis to tasks that benefit from value-based methods. In Appendix C, we discuss works on extending policy-based methods to an off-policy setting, i.e., using off-policy data. Such attempts often require integrating a value function. This further highlights our motivation for starting with value-based methods, i.e., learning value functions.
+
+## 3 Preliminaries
+
+One could formulate the program synthesis task as a sequence-to-sequence generation task, where a model takes a problem description \(D\) as input and outputs a program \(\hat{W}\) which aims to achieve the functionality specified by \(D\). A generated program \(\hat{W}=(\hat{w}_{0},\dots,\hat{w}_{T})\) is composed by a sequence of tokens \(\hat{w}_{t}\in\mathcal{V}\). For brevity, we use _constant_\(T\) to denote the sequence length although it could be a variable in practice, and \(W\) to denote a program in general (both generated and ground truth). Let lm be an instance of LM, \(\ell((w_{<t},D),\cdot)\) be the logits layer (language modelling head) output, and \(p(\cdot|w_{<t},D)\) be the probabilistic distribution over the vocabulary \(\mathcal{V}\) (computed by passing \(\ell(\cdot,\cdot)\) through softmax), conditioned on a sequence \(w_{<t}\) and \(D\). Suppose \(W^{*}\) is a ground truth program and \(\mathcal{D}_{\text{train}}\) is the train set, conventionally lm could be trained by minimizing the cross-entropy loss
+
+\[\mathcal{L}_{\text{co}}(p)=-\mathbb{E}_{W^{*}\sim\mathcal{D}_{\text{train}}} \log p(W^{*}|D)=-\mathbb{E}_{W^{*}\sim\mathcal{D}_{\text{train}}}\sum_{t}\log p (w^{*}_{t}|w^{*}_{<t},D) \tag{1}\]
+
+### RL Notations
+
+To make notations easier to interpret, we bridge program synthesis notations to standard RL ones. RL problems are typically formulated as Markov Decision Processes (MDPs) and an MDP \(\mathcal{M}\) is often composed by a 5-tuple \(\mathcal{M}\)=\((\mathcal{S},\mathcal{A},\mathbb{P},r,\gamma)\) which are state space, action space, transition function, reward function and discount factor, respectively. The discount factor \(\gamma\) discounts future values to emphasize the near futures, and we use \(\gamma\)=0.999 (which slightly prefers more concise solution). A (stochastic) transition function \(\mathbb{P}:\mathcal{S}\times\mathcal{A}\rightarrow\Delta(\mathcal{S})\) is a distribution over \(\mathcal{S}\) conditioned on a state-action pair \((s,a)\). In program synthesis, \(\mathbb{P}\) is trivial as \(s_{t+1}\equiv s_{t}\circ a_{t}\), where \(\circ\) denotes concatenation.
+
+**State and action.** In code generation contexts, an action \(a_{t}\) is a token \(\hat{w}_{t}\). Hence the action space \(\mathcal{A}\) is the vocabulary \(\mathcal{V}\). As the information used to generate token \(\hat{w}_{t}\) is \((\hat{w}_{<t},D)\), the state is hence defined as \(s_{t}:=(\hat{w}_{<t},D)\). For a given \(D\), the state space \(\mathcal{S}=\mathcal{V}^{T}\). For brevity, we will mainly use \(s_{t},a_{t}\) rather than the \(w_{t}\) notations, and sometimes omit the time index \(t\) if it leads to no confusion. We will also use \(s^{\prime},a^{\prime}\) to denote \(s_{t+1},a_{t+1}\) whenever only the relative temporal position matters.
+
+**Policy.** A policy \(\pi:\mathcal{S}\rightarrow\Delta(\mathcal{A})\) assigns an action distribution \(\Delta(\mathcal{A})\) to any state \(s\in\mathcal{S}\), meaning predicting a token \(\hat{w}_{t}\) based on current sequence \(\hat{w}_{<t}\) and the problem specification \(D\). Prior works often define \(\pi_{\theta}\equiv p_{\theta}\) and directly optimize LM parameters \(\theta\) with PG methods. We however define \(\pi:=f(\theta,\square)\) to be a function of \(\theta\) and other components \(\square\), see details in Section 4.
+
+**Reward function.** A reward function \(r:\mathcal{S}\times\mathcal{A}\rightarrow\mathbb{R}\) determines reward of taking action \(a_{t}\) at state \(s_{t}\). We follow the reward design of Le et al. (2022) in equation 2. We may also use shorthand notation \(r_{t}:=r(s_{t},a_{t})\). Note that the reward is determined when the program \(W\) is completed at \(T\). Thus \(r_{t}=0\) if \(t\neq T\) otherwise defined as equation 2.
+
+**Value functions.** RL maximizes \(J(\pi)=\mathbb{E}[\sum_{t}\gamma^{t}r_{t}|\pi,\mathcal{M}]\), i.e. discounted cumulative rewards. Value functions, including state-action value function \(Q^{\pi}:\mathcal{S}\times\mathcal{A}\rightarrow\mathbb{R}\) and state value function \(V^{\pi}:\mathcal{S}\rightarrow\mathbb{R}\), are defined recursively as follow:
+
+\[V^{\pi}(s) :=\mathbb{E}\left[\sum_{t=0}^{\infty}\gamma^{t}r_{t}|\pi,\mathcal{ M},S_{0}=s\right]=\mathbb{E}_{a\sim\pi(\cdot|s),s^{\prime}\sim\mathbb{P}(\cdot|s,a)} \left[r(s,a)+\gamma V^{\pi}(s^{\prime})\right] \tag{3}\] \[Q^{\pi}(s,a) :=\mathbb{E}\left[\sum_{t=0}^{\infty}\gamma^{t}r_{t}|\pi,\mathcal{ M},S_{0}=s,A_{0}=a\right]=\mathbb{E}_{s^{\prime}\sim\mathbb{P}(\cdot|s,a)}\left[r(s,a)+ \gamma Q^{\pi}(s^{\prime},\pi)\right] \tag{4}\]
+
+where \(Q(s,\pi):=\mathbb{E}_{a\sim\pi}Q(s,a)\). Also, the advantage function is \(A^{\pi}(s,a):=Q^{\pi}(s,a)-V^{\pi}(s)\).
+
+### Value-based RL and Dueling DQN
+
+Value-based algorithms especially the \(Q\)-learning family (Watkins and Dayan, 1992; Mnih et al., 2013; Van Hasselt et al., 2016; Bellemare et al., 2017) have achieved remarkable successes. A canonical framework of the \(Q\)-learning family iterates between policy evaluation and policy improvement:
+
+\[\text{policy evaluation (PE):}\quad Q_{k}=\arg\min_{Q}\mathbb{E}_{ \mathcal{D}}[Q_{k-1}(s,a)-(r+\gamma Q_{k-1}(s^{\prime},\pi_{k-1}))]^{2} \tag{5}\] \[\text{policy improvement (PI):}\quad\pi_{k}=\arg\max_{\pi}Q_{k}(s,\pi(s)) \tag{6}\]
+
+where \(\mathcal{D}\) is an arbitrary dataset, the PE step estimates the previous policy \(\pi_{k-1}\) using the Bellman equation (Bellman, 1966), and the PI step finds an improved \(\pi_{k}\) by maximizing \(Q_{k}\) estimates.
+
+In particular, we build our framework on top of Dueling DQN (Wang et al., 2016, DDQN). In a nutshell, DDQN approximates \(V(s)\) and \(A(s,a)\) with separate heads, and run evaluation and improvement steps with \(Q:=V+A\). This bifurcation enables a robust estimation of \(V(s)\) without conflating it with the actions, which subsequently ensures a more stable learning of \(A(s,a)\) given that it focuses solely on the relative values. As a consequence, DDQN often exhibits enhanced stability in learning dynamics and improved generalization. In addition to the prior mentioned advantages, DDQN enables us to leverage a task structure that ground truth programs should attain highest advantages, therefore reducing the searching space, which we will elaborate on in Section 4.1.
+
+**Remarks on sample efficiency.** We illustrate the inefficiency of policy-based methods using vanilla PG as an example. PG maximizes \(J(\mu):=\mathbb{E}[\sum_{t}\gamma^{t}r_{t}|\pi_{\mu},\mathcal{M}]\equiv\mathbb{ E}_{W\sim\pi_{\mu}}[\sum_{t}\gamma^{t}r_{t}]\), with gradient \(\nabla_{\mu}J(\mu)\) computed via the policy gradient theorem. This method requires training data \(W\) drawn from the distribution induced by _current policy_\(\pi_{\mu}\), hence called _on-policy_. Therefore, one should in principle generate new data and discard historical data _at every update_, leading to undesired sample inefficiency. In contrast, policy evaluation as in equation 5 works with arbitrary dataset \(\mathcal{D}\).
+
+## 4 Algorithmic Designs - Accelerating Value-Based Training
+
+While value-based RL offers exciting potential, its training process presents challenges due to the large action space \(\mathcal{A}=\mathcal{V}\) and the high-dimensional state space \(\mathcal{S}=\mathcal{V}^{T}\) with dimensions up to \(T\). This leads to a notably large \(Q\)-table of size \(\mathcal{O}(|\mathcal{V}|^{T})\). And the policy search space has a cardinality of \(|\mathcal{A}|^{|\mathcal{S}|}=\mathcal{O}(|\mathcal{V}|^{|\mathcal{V}|^{T}})\) that grows doubly exponentially. Both challenges from large action spaces and high-dimensional state spaces are pivotal research topics in RL. The action space challenges are discussed by e.g. Dulac-Arnold et al. (2015); Tavakoli et al. (2018); Kalashnikov et al. (2018), while He et al. (2016); Nair et al. (2018), among others, considered the state spaces complexities. In particular, Silver (2015); Duan et al. (2016) commented on that the potentially better training stability of policy-based methods in these scenarios.
+
+To address the challenges inherent in training value-based RL for LMs, at a high level, we developed \(\mathcal{B}\)-Coder considering three key aspects: incorporation of task structure, initialization of \(Q\)-function, and backup using a conservative Bellman operator. Figure 1 previews the effectiveness of our algorithmic designs, which shows the training curve of different value-based RL algorithms on the APPS dataset. Due to aforementioned challenges, the performance of the vanilla DDQN continuously decreases even evaluated on the training set. In contrast, both the \(Q\)-function initialization and the conservative Bellman operator show benefits in stabilizing and accelerating the training dynamics.
+
+For notational convenience in subsequent sections, we begin with an overview of our notations and parameterizations, summarized in Figure 2. Figure 2(a) denotes a pre-trained encoder-decoder LM parameterized by \(\theta_{\text{alpr}}\) (where subscript ckpt denotes the fact it's a checkpoint/constant). Figure 2(b) and (c) show the forward graphs of our two different training stages: (b) corresponds to a pre-training stage on \(\phi\) to provide good initialization for (c) the subsequent fine-tuning of \(\theta\). Details and motivations are deferred to Section 4.2 and 4.3, respectively. As we proceed to the rationale behind our designs, maintaining an impression to \(\theta_{\text{alpr}}\), \(\phi\), \(\theta\) and their corresponding products, especially forward path to \(Q_{\phi}\) and \(Q_{\theta}\), might help to clear confusions.
+
+Figure 1: Training curves on APPS train set. \(\blacksquare\) represents \(\mathcal{B}\)-Coder, \(\ast\) is \(\mathcal{B}\)-Coder without our conservative operator, and \(\blacktriangledown\) is \(\mathcal{B}\)-Coder without both our operator and initialization (i.e. vanilla DDQN).
+
+### Leveraging Task Structures
+
+As noted earlier, a key attribute of program synthesis task is the provision of human solutions, which are guaranteed to be correct. As a result, these solutions should attain the highest \(Q\)-values, even if the correct solutions might not be unique. As such, for a ground truth program \(W^{*}=(s_{0}^{*},a_{0}^{*},\ldots,s_{T}^{*},a_{T}^{*}),Q(s_{t}^{*},a_{t}^{*}) \geq Q(s_{t}^{*},a)\) holds for all \(a\in\mathcal{V}\), thereby \(A(s_{t}^{*},a_{t}^{*})\geq A(s_{t}^{*},a)\).
+
+To enforce this structure, one could ensure \(A(W)\leq 0\) and \(A(W^{*})\approx 0\), where we slightly abuse the notation and let \(A(W):=\sum_{t=0}^{T}A(s_{t},a_{t})\). It ensures that \(W^{*}\) has advantages that are roughly the highest. To this end, suppose \(g(\cdot)\) is a general neural network, we decompose \(Q\) as follows,
+
+\[Q(s,a)=\underbrace{g(s,a)-\max_{a}g(s,a)}_{\text{non-positive advantage}}+V(s)=A(s,a)+V(s). \tag{7}\]
+
+It enforces our first condition that \(A(W)\leq 0\). For the second condition \(A(W^{*})\approx 0\), we optimize an advantage function \(A\) by minimizing an auxiliary advantage loss function, namely \(\mathcal{L}_{\text{adv}}\),
+
+\[\mathcal{L}_{\text{adv}}(A)=\mathbb{E}_{(s_{0}^{*},a_{0}^{*},\ldots,s_{T}^{*}, a_{T}^{*})\sim\mathcal{D}_{\text{true}}\sum_{t=0}^{T}}|A(s_{t}^{*},a_{t}^{*})|. \tag{8}\]
+
+We also set upper bound of \(Q\)-function with \(R_{\text{max}}\)=1, max total rewards. See Appendix F for details.
+
+### \(Q\)-function Initialization
+
+Despite the task structures introduced, training the \(Q\)-function from scratch remains extremely challenging. While this is not a problem for policy-based learning (given that directly fine-tune pre-trained LMs without requiring a \(Q\)-function at all), it presents significant challenges in value-based approaches because one often does NOT have a _pre-trained \(Q\)-function_. To this end, we show that one could initialize a \(Q\)-function from the logits (generator) function \(\ell(\cdot,\cdot)\) of a pre-trained LmM.
+
+**Initialization of \(Q\) via pre-trained models.** Yu & Zhang (2023) considered the fine-tuning of RL agents after offline RL pre-training. Their main idea is to reconstruct a fine-tuning \(Q\)-function from the pre-trained policy. Drawing inspiration from this approach, it's feasible to similarly reconstruct/initialize a \(Q\)-function for fine-tuning using a pre-trained LM, akin to using a pre-trained policy.
+
+This initialization was motivated by the energy-based policy line of works (Haarnoja et al., 2017; 2018), where a policy \(\pi\) is the product of passing a \(Q\)-function through a softmax transfer function. Analogously, in LMs, \(p\) - the distribution over \(\mathcal{V}\) - is produced by passing logits \(\ell\) through softmax.
+
+\[\text{language modeling:}\quad p(a|s)=\exp\big{(}\ell(s,a)\big{)} \big{/}\!\sum_{a\in\mathcal{A}}\exp\big{(}\ell(s,a)\big{)} \tag{9}\] \[\text{energy-based $\pi$:}\quad\pi(a|s)=\exp\big{(}\frac{1}{ \alpha}Q(s,a)\big{)}\big{/}\!\sum_{a\in\mathcal{A}}\exp\big{(}\frac{1}{\alpha }Q(s,a)\big{)}, \tag{10}\]
+
+where \(\alpha\) is a temperature hyper-parameter. One could naturally set \(Q(s,a)=\alpha\ell(s,a)\) for initialization. Hence, with aforementioned dueling structure in equation 7 and our pre-defined parameterization, one could set the advantage function as \(A_{\theta_{\text{clqr}}}(s,a):=\alpha[\ell_{\theta_{\text{clqr}}}(s,a)-\max_{a }\ell_{\theta_{\text{clqr}}}(s,a)]\), leading to \(Q_{\phi}(s,a):=A_{\theta_{\text{clqr}}}(s,a)+V_{\phi}(s)\). See also our forward pass graph defined in Figure 1(b). In a nutshell, this \(Q_{\phi}\)-function produces a policy \(\pi_{\phi}\) identical to the output distribution \(p_{\theta_{\text{clqr}}}\) of LM\({}_{\text{clqr}}\),
+
+\[\pi_{\phi}(a|s)\!\!=\!\!\operatorname{softmax}[\frac{1}{\alpha}Q_{\phi}(s,a)] [a]\!\!=\!\!\operatorname{softmax}[\ell_{\theta_{\text{clqr}}}(s,a)-\max_{a} \ell_{\theta_{\text{clqr}}}(s,a)+\frac{1}{\alpha}V_{\phi}(s)][a]\!\!=\!\!p_{ \theta_{\text{clqr}}}(a|s). \tag{11}\]
+
+Recalling equation 5 - 6, the \(Q\)-learning family can be viewed as iterations between policy evaluation and improvement. We now elaborate on how this \(Q_{\phi}\)-function initialization affects both steps.
+
+Figure 2: (a) A forward graph of conventional enc-dec LMs, with a checkpoint \(\theta_{\text{clqr}}\), where \(\ell\) denotes logits and \(p\) denotes a distribution over \(\mathcal{A}\) ; (b) Our forward graph for pre-training \(\phi\); (c) Our forward graph for fine-tuning \(\theta\). A snowflake indicates a component remaining frozen/constant during that stage.
+
+**Policy improvement.** One could consider the operation of taking softmax with respect to \(\frac{1}{\alpha}Q_{\phi}(s,a)\) as _soft policy improvement_(Haarnoja et al., 2018) step with temperature \(\alpha\). Therefore, equation 11 can be interpreted as: running soft policy improvement alone with this initialized \(Q_{\phi}\) preserved the performance of pre-trained \(\textsc{lm}_{\theta_{\text{clap}}}\), offering a good starting point of online fine-tuning.
+
+**Policy evaluation.** Yet, this \(Q_{\phi}\)-function only captures relative values, since we initialized only the advantages \(A_{\theta_{\text{clap}}}\) - the relative information - as shown in equation 11. \(V_{\phi}\) can thereby have arbitrary values. This would not affect the policy improvement step due to the translation invariance of the softmax function. However, during the policy evaluation step, see e.g. equation 5, the Bellman error can be heavily influenced by the \(V\)-values. When the \(V\)-values is the dominant source of error, the policy evaluation optimization be largely driven by the _state-only_\(V\)-values. This can lead to a loss of the _relative action values_ we intended to preserve in the previous step.
+
+**Pre-training of \(V_{\phi}\).** This can be addressed by adding a pre-training phase of \(V_{\phi}(s)\), during which we _freeze_ the advantage function \(A_{\theta_{\text{clap}}}\) and train \(V_{\phi}\) by minimizing Bellman error (or equivalently doing policy evaluation). In this pre-training phase, we optimize the following loss until convergence
+
+\[\mathcal{L}_{V}(V_{\phi};\ell_{\theta_{\text{clap}}})=\frac{1}{T}\mathbb{E}_{( s_{t},a_{t},r_{t},s_{t+1})\sim\mathcal{D}_{\text{train}}}\sum_{t=0}^{T}\left[r_{t}+ \gamma\textsc{sg}\left(Q_{\phi}(s_{t+1},\hat{a}_{t+1})\right)-Q_{\phi}(s_{t}, a_{t})\right]^{2} \tag{12}\]
+
+where sg is a stop gradient operator, \(\textsc{sg}(Q_{\phi}(s^{\prime},\hat{a}^{\prime}))\) follows standard semi-gradient optimization, \(\hat{a}_{t+1}\) is a target action (details deferred to section 4.3), and \(Q_{\phi}(s,a)=A_{\theta_{\text{clap}}}(s,a)+V_{\phi}(s)\).
+
+In summary, our initialization steps ensures that, prior to fine-tuning \(\theta\), our \(Q_{\phi}\) meets two important conditions: it starts with the output distribution \(p_{\theta_{\text{clap}}}\) of a pre-trained \(\textsc{lm}_{\theta_{\text{clap}}}\), it begins with low Bellman error (because the pre-training of \(V_{\phi}\) directly minimizes Bellman error).
+
+### A Conservative Bellman Operator
+
+With a pre-trained state value function \(V_{\phi}\), we are now ready to learn a good state-action value function via fine-tuning. We parameterize \(Q_{\theta}(s,a):=A_{\theta}(s,a)+V_{\theta}(s)=\alpha[\ell_{\theta}(s,a)-\max_ {a}\ell_{\theta}(s,a)]+V_{\theta}^{r}+V_{\phi}\), where we define \(V_{\theta}=V_{\theta}^{r}+V_{\phi}\), and we initialize \(\theta\) in a way such that \(\ell_{\theta}=\ell_{\theta_{\text{clap}}}\) and \(V_{\theta}^{r}=0\). It ensures that \(Q_{\theta}=Q_{\phi}\) on initialization, a good starting point for subsequent fine-tuning on \(\theta\). Technically speaking, setting \(V_{\theta}=V_{\theta}^{r}+V_{\phi}\) is not required, as one could finetune both \(\theta\) and \(\phi\). We however observed that finetuning a residual head, with \(\phi\) frozen, leads to better stability.
+
+Although we avoid training \(Q_{\theta}\) from scratch, optimizing \(Q_{\theta}\) by \(Q\)-learning family algorithms can still be challenging. We attribute this to the characteristics of the Bellman optimality operator \(\mathcal{B}^{*}\) that seeks to learn the optimal value function \(Q^{*}\) and optimal policy \(\pi^{*}\), which requires a good data coverage of the state-action space \(\mathcal{S}\times\mathcal{A}\)(e.g. Jiang and Huang, 2020; Xie et al., 2021; Zhan et al., 2022). In program synthesis, however, such assumption can hardly be met due to the large state-action space and the high computational costs of Transformer inference. While conventional \(Q\)-learning family relies on \(\mathcal{B}^{*}\), recent works in RL, especially those considering limited data regime (e.g. Agarwal et al., 2020; Levine et al., 2020), often design "conservative" operators (e.g. Achiam et al., 2017; Kumar et al., 2020; Brandfonbrener et al., 2021) to address difficulties led by \(\mathcal{B}^{*}\).
+
+**Conservative Bellman Operators.** The concept behind conservative Bellman operators is to "aim low". Instead of learning the optimal \(Q^{*}\) and \(\pi^{*}\), these operators typically seeks to learn a policy \(\pi\) that either surpasses a behavior policy (which is used to collect a RL dataset in offline RL literature, see e.g. Achiam et al., 2017; Brandfonbrener et al., 2021) or fine-tune a pre-existing policy (e.g. Xie et al., 2021; Yu and Zhang, 2023). This is often achieved by introducing a regularizer that penalizes deviations from the behavior/pre-existing policy. In particular, as shown in equation 14, we define our conservative Bellman operator \(\mathcal{B}^{q}\), which depends on a _fixed, pre-defined_ policy \(q\), as follows:
+
+\[\text{optimality }\mathcal{B}: (\mathcal{B}^{*}Q)(s,a)=r(s,a)+\gamma\mathbb{E}_{\sigma^{\prime}} [Q(s^{\prime},\hat{a}^{\prime})],\text{where }\hat{a}^{\prime}=\arg\max_{a}Q(s^{ \prime},a) \tag{13}\] \[\text{conservative }\mathcal{B}: (\mathcal{B}^{q}Q)(s,a)=r(s,a)+\gamma\mathbb{E}_{\sigma^{\prime}} [Q(s^{\prime},\hat{a}^{\prime})],\text{where }\hat{a}^{\prime}=\arg\max_{a}q(a|s^{ \prime}). \tag{14}\]
+
+The intuition behind our operator \(\mathcal{B}^{q}\) is that we evaluate the action-value function \(Q^{q^{\dagger}}\) of a greed-ified policy \(q^{\dagger}(a|s):=\mathds{1}\{a=\arg\max_{a}q(a|s)\}\), where \(\mathds{1}\) is the indicator function. The rationale behind greedification is that \(q^{\dagger}\) can be seen as \(q\) in a greedy-decoding mode, which usually has better (one-shot) capability than sampling mode (although the latter has better generation diversity). Considering setting \(q=p_{\theta_{\text{clap}}}\), the operator \(\mathcal{B}^{p_{\theta_{\text{clap}}}}\) seeks to learn a policy \(\pi\) that outperforms \(p_{\theta_{\text{clap}}}\).
+
+We further comment on some properties of \(\mathcal{B}^{q}\): proposition 4.1 shows \(\mathcal{B}^{q}\) is a contraction, meaning there is an unique fixed point. It leads to proposition 4.2, motivating our development of Section 4.5.
+
+**Proposition 4.1**.: \(\mathcal{B}^{q}\) _is \(\gamma\)-contraction in \(\ell_{\infty}\) norm._
+
+Given our conservative Bellman operator, we could define our conservative Bellman error loss
+
+\[\mathcal{L}_{Q}(Q_{\theta};q)=\tfrac{1}{T}\mathbb{E}_{(s_{t},a_{t},r_{t},s_{t+ 1})\sim\mathcal{D}_{\text{min}}\sum_{t=0}^{T}\left[r_{t}+\gamma\;\text{sG}\left( Q_{\theta}(s_{t+1},\hat{a}_{t+1})\right)-Q_{\theta}(s_{t},a_{t})\right]^{2}, \tag{15}\]
+
+where \(\hat{a}_{t+1}=\arg\max_{a}q(a|s_{t+1})\), and \(Q_{\theta}(s,a)=\alpha\left[\ell_{\theta}(s,a)-\max_{a}\ell_{\theta}(s,a) \right]+V_{\theta}^{r}(s)+V_{\phi}(s)\).
+
+### Implementation and Optimization
+
+**Architecture and parameterization recap.** Following (Le et al., 2022; Shojaee et al., 2023; Liu et al., 2023), we choose T5 (Raffel et al., 2020) as our base architecture for \(\theta_{\text{dyn}}\), \(\phi\) and \(\theta\); and \(\theta_{\text{dyn}}\) is initialized with CodeRL checkpoint that is publicly available. Specifically, \(\theta_{\text{dyn}}\), \(\phi\) and \(\theta\) share a same encoder, and the encoder is frozen throughout, to reduce the amount of frozen parameters.
+
+**Two-stage training.** As noted earlier, our training are composed with two stages: a pre-training stage of \(\phi\), namely \(\phi\)-stage, and a fine-tuning stage of \(\theta\), namely \(\theta\)-stage. A pseudo-algorithm could be found in Appendix A. In addition, further implementation details are deferred to Appendix H.
+
+\(\phi\)-stage: Given our development of Section 4.2, we pre-train \(V_{\phi}\) function using stochastic gradient descent with \(\nabla_{\phi}\mathcal{L}_{V}(V_{\phi};\ell_{\theta_{\text{dyn}}})\), as defined in equation 12.
+
+\(\theta\)-stage (fine-tuning): In this stage, we seek to optimize \(Q_{\theta}\) to minimize our previously developed losses: \(\mathcal{L}_{\text{adv}}\) and \(\mathcal{L}_{Q}\), as defined in equation 8 and 15, respectively. In addition, it is a common practice to include a cross-entropy loss during fine-tuning. Therefore, we conclude our final loss function as equation 17, and \(\theta\) is updated using stochastic gradient descent with \(\nabla_{\theta}\mathcal{L}_{\text{fl}}(Q_{\theta};\eta_{\theta_{\text{dyn}}})\).
+
+Recall: \[Q_{\theta}(s,a)=A_{\theta}(s,a)+V_{\theta}(s)=\alpha\left(\ell_{ \theta}(s,a)-\max_{a}\ell_{\theta}(s,a)\right)+V_{\theta}^{r}(s)+V_{\phi}(s)\] (16) \[\mathcal{L}_{\text{fl}}(Q_{\theta};p_{\theta_{\text{dyn}}})= \mathcal{L}_{Q}(Q_{\theta};p_{\theta_{\text{dyn}}})+\beta_{\text{adv}} \mathcal{L}_{\text{adv}}(A_{\theta})+\beta_{\text{ce}}\mathcal{L}_{\text{ce}} (\pi_{\theta}),\text{ where }\pi_{\theta}{=}\text{softmax}\left(\tfrac{1}{\alpha}Q_{ \theta}\right).\] (17)
+
+### A Free Reward Model
+
+Reward modeling is crucial in language modeling and inverse RL (detailed discussions could be found in Appendix C). An intriguing finding from IRL, applicable to our framework, is that a trained \(Q\)-function recovers a reward function without additional training. Analogously to Garg et al. (2021), an one-to-one correspondence between \(Q\) and reward holds with our conservative Bellman operator \(\mathcal{B}^{q}\). We define the inverse conservative Bellman operator \(\mathcal{T}^{q}:\mathbb{R}^{S\times\mathcal{A}}\rightarrow\mathbb{R}^{S \times\mathcal{A}}\),
+
+\[(\mathcal{T}^{q}Q)(s,a)=Q(s,a)-\gamma\mathbb{E}_{s^{\prime}}Q\left(s^{\prime}, \arg\max_{a}q(a|s^{\prime})\right). \tag{18}\]
+
+**Proposition 4.2**.: _The inverse conservative Bellman operator \(\mathcal{T}^{q}\) is a bijection._
+
+Proposition 4.2 shows that a \(Q_{\theta}\) is uniquely corresponding to a reward function \(\tilde{r}_{\theta}:=\mathcal{T}^{q}Q_{\theta}\).1 Given the definition of \(\mathcal{T}^{q}\) we could recover the reward model \(\tilde{r}_{\theta}\) with \(Q_{\theta}\)_without additional training_:
+
+Footnote 1: We use \(\tilde{r}\) and \(r\) to name our recovered reward model and real reward signals, respectively.
+
+\[\tilde{r}_{\theta}(s,a)=Q_{\theta}(s,a)-\gamma\mathbb{E}_{s^{\prime}}Q_{ \theta}\left(s^{\prime},\arg\max_{a}p_{\theta_{\text{dyn}}}(a|s^{\prime}) \right)\approx Q_{\theta}(s,a)-\gamma V_{\theta}(s^{\prime}). \tag{19}\]
+
+We use the approximated \(\tilde{r}_{\theta}(s,a)\approx Q_{\theta}(s,a)-\gamma V_{\theta}(s^{\prime})\), with reasons deferred to Appendix E.
+
+**Candidates selection with \(\tilde{r}_{\theta}\).** We leverage our reward model \(\tilde{r}_{\theta}\) to do candidate programs selection, as an example to highlight the additional benefits of value-based RL. We rank generated programs by cumulative rewards, predicted by our reward model, \(\tilde{R}_{\theta}(W)=\sum_{t=0}^{T}\tilde{r}_{\theta}(s_{t},a_{t})\) to select the programs that are most likely to be correct. Specifically, for pass@\(k\) metrics, we follow the evaluation protocol used in CodeT (Chen et al., 2022), a work that considered program selection via automatic generated tests. This protocol computes pass@\(k\) by first generating \(m\) programs and select a subset of \(k\) programs to evaluate pass@\(k\). In our case, we select the \(k\)-sized subset with top-\(k\) highest \(\tilde{R}_{\theta}(\cdot)\) from total \(m\) candidates. Our results in Section 5 will follow this evaluation protocol.
+
+**Remarks on \(\tilde{r}_{\theta}\).** To further explain the applicability of ranking with \(\tilde{r}_{\theta}\), consider a realistic deployment setting where a fine-tuned model is deployed for end-user applications. Users often provide a language description of their needs but may not include test cases (which can also be challenging for beginners or casual users). Additionally, the model is usually required to offer a single best response instead of a range of options. Therefore, the ability to rank programs without true rewards is a desirable advantage.
+
+To preview the effectiveness of \(\tilde{r}_{\theta}\), we show the correlation between environmental reward \(r\) and our cumulative reward \(\tilde{R}_{\theta}\). As shown in Figure 3, green region corresponds to correct programs, and has the highest \(\tilde{R}_{\theta}\) on average. For incorrect programs, those with compile and runtime error have the lowest and second lowest \(\tilde{R}_{\theta}\), respectively. Programs can be executed but fail some tests, have second highest \(\tilde{R}_{\theta}\). Hence, it concludes that \(\tilde{R}_{\theta}\) has an evident positive correlation to the true reward \(r\).
+
+## 5 Empirical Evaluation
+
+**Nucleus sampling with \(Q_{\theta}\).** Nucleus sampling (top-\(p\) sampling) (Holtzman et al., 2019) with sampling temperature2(Ackley et al., 1985) has been one of the most important sampling techniques. It can also be easily implemented in our framework. One could simply consider \(Q_{\theta}/\alpha\) as logits and the sampling procedure would remain identical to standard LMs, see Appendix B for details.
+
+Footnote 2: Sampling temperature is different from temperature \(\alpha\) in equation 10. They can be different values.
+
+**APPS benchmark and baselines.** In line with prior RL-based works (Le et al., 2022; Shojaee et al., 2023; Liu et al., 2023), we evaluate \(\mathcal{B}\)-Coder on the challenging code contexts benchmark APPS (Hendrycks et al., 2021). It contains 5,000 training and 5,000 testing problems, with three difficulty levels: introductory, interview and competition. We compare our \(\mathcal{B}\)-Coder with pretrained or supervise fine-tuned LLM baselines - GPT2 (Radford et al., 2019), GPT3 (Brown et al., 2020), GPT-Neo (Black et al., 2021), GPT-J (Wang and Komatsuzaki, 2021), Codex (Chen et al., 2021) and AlphaCode (Li et al., 2022) - and RL fine-tuned baselines - CodeRL (Le et al., 2022), PPOcoder (Shojaee et al., 2023) and concurrent RLTF (Liu et al., 2023).
+
+**APPS: without example test outcomes.** In the APPS dataset, each problem has several example unit tests (different from the hidden unit tests used for evaluation). These example tests are usually leveraged to refine generated samples. For example, CodeRL and RL
+
+\begin{table}
+\begin{tabular}{c c|c c c c|c c c c|c c c c} \hline \multirow{2}{*}{Model} & \multirow{2}{*}{\# trainable} & \multicolumn{3}{c|}{Pass@1} & \multicolumn{3}{c|}{Pass@5} & \multicolumn{3}{c}{Pass@1000} \\ \cline{3-14}  & & \multicolumn{1}{c|}{parameters} & \multicolumn{1}{c|}{Intro} & \multicolumn{1}{c|}{Inter} & \multicolumn{1}{c|}{Comp} & \multicolumn{1}{c|}{All} & \multicolumn{1}{c|}{Intro} & \multicolumn{1}{c|}{Inter} & \multicolumn{1}{c|}{Comp} & \multicolumn{1}{c|}{All} & \multicolumn{1}{c|}{Intro} & \multicolumn{1}{c|}{Inter} & \multicolumn{1}{c|}{Comp} & \multicolumn{1}{c}{All} \\ \hline \hline Codex1  & 12B & 4.14 & 0.14 & 0.02 & 0.92 & 9.65 & 0.51 & 0.09 & 2.25 & 25.02 & 3.70 & 3.23 & 7.87 \\ AlphaCode†  & 1B & - & - & - & - & - & - & - & 17.67 & 5.24 & 7.06 & 8.09 \\ GPT3†  & 175B & 0.20 & 0.03 & 0.00 & 0.06 & - & - & - & - & - & - & - & - \\ GPT2†  & 0.1B & 1.00 & 0.33 & 0.00 & 0.40 & - & 2.70 & 0.73 & 0.00 & 1.02 & - & - & - & - \\ GPT2†  & 1.5B & 1.30 & 0.70 & 0.00 & 0.68 & 3.60 & 1.03 & 0.00 & 1.34 & 25.00 & 9.27 & 8.80 & 12.32 \\ GPT-Neo†  & 2.7B & 3.90 & 0.57 & 0.00 & 1.12 & 5.50 & 0.80 & 0.00 & 1.58 & 27.90 & 9.83 & 11.40 & 13.76 \\ GPT-J†  & 6B & 5.60 & 1.00 & 0.50 & 1.82 & 9.20 & 1.73 & 1.00 & 3.08 & 35.20 & 13.15 & 13.51 & 17.63 \\ \hline \hline \multicolumn{14}{c}{RL based methods - without using example unit tests} \\ \hline CodRL†  & 770M & 6.20 & **1.50** & 0.30 & 2.20 & 9.39 & 1.90 & 0.42 & 3.10 & 35.30 & 13.33 & 13.60 & 17.78 \\ PPOcoder†  & 770M & 5.20 & 1.00 & **0.50** & 1.74 & 9.10 & 2.50 & **1.20** & 3.56 & 35.20 & 13.35 & 13.90 & 17.77 \\ RLTFl�  & 770M & 4.16 & 0.97 & 0.20 & 1.45 & 10.12 & **2.65** & 0.82 & 3.78 & **38.30** & **15.13** & **15.90** & **19.92** \\ B-Coder & \(\leq\)770Mstage†  & **6.70** & **1.50** & 0.30 & **2.30** & **10.40** & **2.63** & 0.70 & **3.80** & 37.00 & 13.67 & 12.60 & 18.12 \\ \hline \end{tabular}
+\end{table}
+Table 1: Empirical evaluation on APPS test set. (CS) strategy that refines and repairs generated programs based on the execution results of example tests. We start with experiments results in which example test outcomes are not used (hence CodeRL and RLTF results in Table 1 are without CS). Table 1 shows that our \(\mathcal{B}\)-Coder has overall the best pass@\(k\) for \(k\)=\(\{1,5\}\) and achieves second best place for \(k\)=\(1000\) (best result reported by concurrent work RLTF). For Table 1 results, we use nucleus sampling with sampling temperature=\(0.6\), \(m\)=\(256\) for \(k\)=\(\{1,5\}\), and temperature=\(0.6\), \(m\)=\(2500\) for \(k\)=\(1000\), where \(m\) is a hyper-parameter of our ranking protocol introduced in Section 4.5 (see Appendix I for an ablation study on \(m\)).
+
+**APPS: using example test outcomes.** We then report results of using example test outcomes, in Table 2. In addition to the CS strategy that uses example tests to refine and repair programs, Chen et al. (2021a) and Li et al. (2022) also consider a _filtered setting_ in which they filtered out those programs fail example tests and compute pass@\(k\) with (a subset of) those programs which pass example tests. We also evaluate our \(\mathcal{B}\)-Coder with this filtered setting. Similarly, we start by filtering out programs that cannot pass example tests. Suppose \(n\) programs out of \(m\) pass, we follow our previous ranking protocol and select top-\(k\) programs for evaluation. (In the case \(n<k\), we additionally select top-\((k-n)\) programs from the rest \(m-n\) programs, those fail example tests.) \(\mathcal{B}\)-Coder outperforms all baselines with either CS or filtered setting for \(k=\{1,5\}\). The baseline, CodeRL+CS+filtered, incorporated both strategies achieved only a small advantage over \(\mathcal{B}\)-Coder for pass@\(5\) while being surpassed by \(\mathcal{B}\)-Coder for pass@\(1\). We remark that CS is a plug-and-play strategy, it can be also combined with \(\mathcal{B}\)-Coder, to further improve pass rate. For the results in Table 2, we use the same temperature and \(m\), as those used in the setting without example test outcomes.
+
+**Generalization ability.** In addition, we test the generalization ability of our dual strategy, i.e. our reward model \(\tilde{r}_{\theta}\). In particular, we consider - generalization to other models and generalization to other domains - and designed the subsequent experiments, which confirmed its generalizability in positive.
+
+For the former, we generate (off-policy) programs using CodeRL (with \(m\)=\(256\)), and rank those programs by \(\tilde{R}_{\theta}\). Table 3 shows our ranking strategy leads to improvements in most cases, even though the programs to be ranked are not generated by \(\mathcal{B}\)-Coder.
+
+For the latter, we test our dual strategy with another dataset MBPP (Austin et al., 2021) (with \(m\)=\(512\)). Table 4 shows consistent improvements for all temperatures and \(k\).
+
+## 6 Conclusion
+
+In this work, we explore applicability of value-based RL algorithms in program synthesis task. We show how to stabilize and accelerate training through \(Q\)-function initialization and conservative backups. Moreover, our work is conducted under minimal reward engineering effort, focusing on pure algorithmic perspective. Appendix D presents a further comparison with baselines regarding reward engineering. While policy-based algorithms being mainstream in current code generation literature, it is recognized being sample-inefficient (see e.g. Nachum et al., 2017), meaning poorly using off-policy data, even data previously generated. We believe, value-based RL is a key direction to scale RL for code generation at large by (re)-using the extensive collection of off-policy programs. Our work could serves as an important initial step towards this direction.
+
+\begin{table}
+\begin{tabular}{l|c|c|c|c|c|c} \hline \multirow{2}{*}{k} & \multirow{2}{*}{Temp.} & \multicolumn{6}{c}{Pass@\(k\)} \\ \cline{3-7}  & & Intro & Inter & Comp & All \\ \hline
+1 & 0.4 & 6.30 & 1.91 & 1.27 & 0.37 & 0.50 & 0.32 & 2.12 & 0.68 \\  & 0.6 & 6.00 & 2.13 & 1.23 & 0.42 & 0.50 & 0.36 & 2.04 & 0.75 \\ \hline
+5 & 0.4 & 9.30 & -0.2 & 2.10 & 0.01 & 0.70 & 0.15 & 3.26 & 0.00 \\
+0.6 & 10.20 & 0.98 & 2.57 & 0.41 & 0.80 & 0.16 & 3.74 & 0.39 \\ \hline \end{tabular}
+\end{table}
+Table 4: Zero-shot pass@\(k\) on MBPP.
+
+\begin{table}
+\begin{tabular}{l|c c c c|c c c c} \hline \multirow{2}{*}{Model} & \multicolumn{6}{c|}{Pass@1} & \multicolumn{6}{c}{Pass@5} \\ \cline{2-10}  & Intro & Inter & Comp & All & Intro & Inter & Comp & All \\ \hline \begin{tabular}{l} CodeRL\({}^{\dagger}\) filtered \\ AlphaCode\({}^{\dagger}\) filtered \\ \end{tabular} & 22.78 & 2.64 & 3.04 & 6.75 & **24.52** & 3.23 & 3.08 & 7.46 \\ \hline 
+\begin{tabular}{l} CodeRL\({}^{\dagger}\) cs \\ Cell\({}^{\dagger}\) filtered \\ \end{tabular} & - & - & - & - & 14.36 & 5.63 & 4.58 & 7.17 \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: APPS results when using example test outcomes.
+
+## References
+
+* Abbeel and Ng (2004) Pieter Abbeel and Andrew Y Ng. Apprenticeship learning via inverse reinforcement learning. In _Proceedings of the twenty-first international conference on Machine learning_, pp. 1, 2004.
+* Achiam et al. (2017) Joshua Achiam, David Held, Aviv Tamar, and Pieter Abbeel. Constrained policy optimization. In _International conference on machine learning_, pp. 22-31. PMLR, 2017.
+* Ackley et al. (1985) David H Ackley, Geoffrey E Hinton, and Terrence J Sejnowski. A learning algorithm for boltzmann machines. _Cognitive science_, 9(1):147-169, 1985.
+* Agarwal et al. (2020) Rishabh Agarwal, Dale Schuurmans, and Mohammad Norouzi. An optimistic perspective on offline reinforcement learning. In _International Conference on Machine Learning_, pp. 104-114. PMLR, 2020.
+* Anil et al. (2023) Rohan Anil, Andrew M Dai, Orhan Firat, Melvin Johnson, Dmitry Lepikhin, Alexandre Passos, Siamak Shakeri, Emanuel Taropa, Paige Bailey, Zhifeng Chen, et al. Palm 2 technical report. _arXiv preprint arXiv:2305.10403_, 2023.
+* Arulkumaran et al. (2019) Kai Arulkumaran, Antoine Cully, and Julian Togelius. Alphastar: An evolutionary computation perspective. In _Proceedings of the genetic and evolutionary computation conference companion_, pp. 314-315, 2019.
+* Austin et al. (2021) Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, et al. Program synthesis with large language models. _arXiv preprint arXiv:2108.07732_, 2021.
+* Bai et al. (2022a) Yuntao Bai, Andy Jones, Kamal Ndousse, Amanda Askell, Anna Chen, Nova DasSarma, Dawn Drain, Stanislav Fort, Deep Ganguli, Tom Henighan, et al. Training a helpful and harmless assistant with reinforcement learning from human feedback. _arXiv preprint arXiv:2204.05862_, 2022a.
+* Bai et al. (2022b) Yuntao Bai, Saurav Kadavath, Sandipan Kundu, Amanda Askell, Jackson Kernion, Andy Jones, Anna Chen, Anna Goldie, Azalia Mirhoseini, Cameron McKinnon, et al. Constitutional ai: Harmlessness from ai feedback. _arXiv preprint arXiv:2212.08073_, 2022b.
+* Bellemare et al. (2017) Marc G Bellemare, Will Dabney, and Remi Munos. A distributional perspective on reinforcement learning. In _International conference on machine learning_, pp. 449-458. PMLR, 2017.
+* Bellman (1966) Richard Bellman. Dynamic programming. _Science_, 153(3731):34-37, 1966.
+* Bengio et al. (2015) Samy Bengio, Oriol Vinyals, Navdeep Jaitly, and Noam Shazeer. Scheduled sampling for sequence prediction with recurrent neural networks. _Advances in neural information processing systems_, 28, 2015.
+* Black et al. (2021) Sid Black, Leo Gao, Phil Wang, Connor Leahy, and Stella Biderman. GPT-Neo: Large Scale Autoregressive Language Modeling with Mesh-Tensorflow, March 2021. URL [https://doi.org/10.5281/zenodo.5297715](https://doi.org/10.5281/zenodo.5297715). If you use this software, please cite it using these metadata.
+* Brandfonbrener et al. (2021) David Brandfonbrener, Will Whitney, Rajesh Ranganath, and Joan Bruna. Offline rl without off-policy evaluation. _Advances in neural information processing systems_, 34:4933-4946, 2021.
+* Brown & Sandholm (2018) Noam Brown and Tuomas Sandholm. Superhuman ai for heads-up no-limit poker: Libratus beats top professionals. _Science_, 359(6374):418-424, 2018.
+* Brown et al. (2020) Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. _Advances in neural information processing systems_, 33:1877-1901, 2020.
+* Chen et al. (2022) Bei Chen, Fengji Zhang, Anh Nguyen, Daoguang Zan, Zeqi Lin, Jian-Guang Lou, and Weizhu Chen. Coded: Code generation with generated tests. In _The Eleventh International Conference on Learning Representations_, 2022.
+
+* Chen et al. (2021) Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large language models trained on code. _arXiv preprint arXiv:2107.03374_, 2021a.
+* Chen et al. (2018) Xinyun Chen, Chang Liu, and Dawn Song. Execution-guided neural program synthesis. In _International Conference on Learning Representations_, 2018.
+* Chen et al. (2021b) Xinyun Chen, Dawn Song, and Yuandong Tian. Latent execution for neural program synthesis beyond domain-specific languages. _Advances in Neural Information Processing Systems_, 34:22196-22208, 2021b.
+* Chowdhery et al. (2022) Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm: Scaling language modeling with pathways. _arXiv preprint arXiv:2204.02311_, 2022.
+* Christiano et al. (2017) Paul F Christiano, Jan Leike, Tom Brown, Miljan Martic, Shane Legg, and Dario Amodei. Deep reinforcement learning from human preferences. _Advances in neural information processing systems_, 30, 2017.
+* Degris et al. (2012) Thomas Degris, Martha White, and Richard S Sutton. Off-policy actor-critic. _arXiv preprint arXiv:1205.4839_, 2012.
+* Diao et al. (2023) Shizhe Diao, Rui Pan, Hanze Dong, Ka Shun Shum, Jipeng Zhang, Wei Xiong, and Tong Zhang. Lmflow: An extensible toolkit for finetuning and inference of large foundation models. _arXiv preprint arXiv:2306.12420_, 2023.
+* Duan et al. (2016) Yan Duan, Xi Chen, Rein Houthooft, John Schulman, and Pieter Abbeel. Benchmarking deep reinforcement learning for continuous control. In _International conference on machine learning_, pp. 1329-1338. PMLR, 2016.
+* Dulac-Arnold et al. (2015) Gabriel Dulac-Arnold, Richard Evans, Hado van Hasselt, Peter Sunehag, Timothy Lillicrap, Jonathan Hunt, Timothy Mann, Theophane Weber, Thomas Degris, and Ben Coppin. Deep reinforcement learning in large discrete action spaces. _arXiv preprint arXiv:1512.07679_, 2015.
+* Ellis et al. (2019) Kevin Ellis, Maxwell Nye, Yewen Pu, Felix Sosa, Josh Tenenbaum, and Armando Solar-Lezama. Write, execute, assess: Program synthesis with a repl. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Frankle et al. (2016) Jonathan Frankle, Peter-Michael Osera, David Walker, and Steve Zdancewic. Example-directed synthesis: a type-theoretic interpretation. _ACM Sigplan Notices_, 51(1):802-815, 2016.
+* Fried et al. (2022) Daniel Fried, Armen Aghajanyan, Jessy Lin, Sida Wang, Eric Wallace, Freda Shi, Ruiqi Zhong, Scott Yih, Luke Zettlemoyer, and Mike Lewis. Incoder: A generative model for code infilling and synthesis. In _The Eleventh International Conference on Learning Representations_, 2022.
+* Fujimoto et al. (2018) Scott Fujimoto, Herke Hoof, and David Meger. Addressing function approximation error in actor-critic methods. In _International conference on machine learning_, pp. 1587-1596. PMLR, 2018.
+* Garg et al. (2021) Divyansh Garg, Shuvam Chakraborty, Chris Cundy, Jiaming Song, and Stefano Ermon. Iq-learn: Inverse soft-q learning for imitation. _Advances in Neural Information Processing Systems_, 34:4028-4039, 2021.
+* Gu et al. (2016) Shixiang Gu, Timothy Lillicrap, Zoubin Ghahramani, Richard E Turner, and Sergey Levine. Q-prop: Sample-efficient policy gradient with an off-policy critic. _arXiv preprint arXiv:1611.02247_, 2016.
+* Gulcehre et al. (2023) Caglar Gulcehre, Tom Le Paine, Srivatsan Srinivasan, Ksenia Konyushkova, Lotte Weerts, Abhishek Sharma, Aditya Siddhant, Alex Ahern, Miaosen Wang, Chenjie Gu, et al. Reinforced self-training (rest) for language modeling. _arXiv preprint arXiv:2308.08998_, 2023.
+* Gulwani et al. (2012) Sumit Gulwani, William R Harris, and Rishabh Singh. Spreadsheet data manipulation using examples. _Communications of the ACM_, 55(8):97-105, 2012.
+* Haarnoja et al. (2017) Tuomas Haarnoja, Haoran Tang, Pieter Abbeel, and Sergey Levine. Reinforcement learning with deep energy-based policies. In _International conference on machine learning_, pp. 1352-1361. PMLR, 2017.
+
+* Haarnoja et al. (2018) Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine. Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor. In _International conference on machine learning_, pp. 1861-1870. PMLR, 2018.
+* He et al. (2016) Frank S He, Yang Liu, Alexander G Schwing, and Jian Peng. Learning to play in a day: Faster deep reinforcement learning by optimality tightening. In _International Conference on Learning Representations_, 2016.
+* Hendrycks et al. (2021) Dan Hendrycks, Steven Basart, Saurav Kadavath, Mantas Mazeika, Akul Arora, Ethan Guo, Collin Burns, Samir Puranik, Horace He, Dawn Song, et al. Measuring coding challenge competence with apps. _arXiv preprint arXiv:2105.09938_, 2021.
+* Ho and Ermon (2016) Jonathan Ho and Stefano Ermon. Generative adversarial imitation learning. _Advances in neural information processing systems_, 29, 2016.
+* Hoffmann et al. (2022) Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al. Training compute-optimal large language models. _arXiv preprint arXiv:2203.15556_, 2022.
+* Holtzman et al. (2019) Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, and Yejin Choi. The curious case of neural text degeneration. In _International Conference on Learning Representations_, 2019.
+* Imani et al. (2018) Ehsan Imani, Eric Graves, and Martha White. An off-policy policy gradient theorem using emphatic weightings. _Advances in Neural Information Processing Systems_, 31, 2018.
+* Jacq et al. (2019) Alexis Jacq, Matthieu Geist, Ana Paiva, and Olivier Pietquin. Learning from a learner. In _International Conference on Machine Learning_, pp. 2990-2999. PMLR, 2019.
+* Jiang & Huang (2020) Nan Jiang and Jiawei Huang. Minimax value interval for off-policy evaluation and policy optimization. _Advances in Neural Information Processing Systems_, 33:2747-2758, 2020.
+* Kalashnikov et al. (2018) Dmitry Kalashnikov, Alex Irpan, Peter Pastor, Julian Ibarz, Alexander Herzog, Eric Jang, Deirdre Quillen, Ethan Holly, Mrinal Kalakrishnan, Vincent Vanhoucke, et al. Scalable deep reinforcement learning for vision-based robotic manipulation. In _Conference on Robot Learning_, pp. 651-673. PMLR, 2018.
+* Kendall et al. (2019) Alex Kendall, Jeffrey Hawke, David Janz, Przemyslaw Mazur, Daniele Reda, John-Mark Allen, Vinh-Dieu Lam, Alex Bewley, and Amar Shah. Learning to drive in a day. In _2019 International Conference on Robotics and Automation (ICRA)_, pp. 8248-8254. IEEE, 2019.
+* Ling-Wei Chang Kenton & Toutanova (2019) Jacob Devlin Ming-Wei Chang Kenton and Lee Kristina Toutanova. Bert: Pre-training of deep bidirectional transformers for language understanding. In _Proceedings of NAACL-HLT_, pp. 4171-4186, 2019.
+* Konda & Tsitsiklis (1999) Vijay Konda and John Tsitsiklis. Actor-critic algorithms. _Advances in neural information processing systems_, 12, 1999.
+* Kumar et al. (2020) Aviral Kumar, Aurick Zhou, George Tucker, and Sergey Levine. Conservative q-learning for offline reinforcement learning. _Advances in Neural Information Processing Systems_, 33:1179-1191, 2020.
+* Le et al. (2022) Hung Le, Yue Wang, Akhilesh Deepak Gotmare, Silvio Savarese, and Steven Chu Hong Hoi. Coderl: Mastering code generation through pretrained models and deep reinforcement learning. _Advances in Neural Information Processing Systems_, 35:21314-21328, 2022.
+* Levine et al. (2020) Sergey Levine, Aviral Kumar, George Tucker, and Justin Fu. Offline reinforcement learning: Tutorial, review, and perspectives on open problems. _arXiv preprint arXiv:2005.01643_, 2020.
+* Li et al. (2023) Raymond Li, Loubna Ben Allal, Yangtian Zi, Niklas Muennighoff, Denis Koectkov, Chenghao Mou, Marc Marone, Christopher Akiki, Jia Li, Jenny Chim, et al. Starcoder: may the source be with you! _arXiv preprint arXiv:2305.06161_, 2023.
+* Li et al. (2022) Yujia Li, David Choi, Junyoung Chung, Nate Kushman, Julian Schrittwieser, Remi Leblond, Tom Eccles, James Keeling, Felix Gimeno, Agustin Dal Lago, et al. Competition-level code generation with alphacode. _Science_, 378(6624):1092-1097, 2022.
+
+* Lin (2004) Chin-Yew Lin. Rouge: A package for automatic evaluation of summaries. In _Text summarization branches out_, pp. 74-81, 2004.
+* Liu et al. (2023) Jiate Liu, Yiqin Zhu, Kaiwen Xiao, Qiang Fu, Xiao Han, Wei Yang, and Deheng Ye. Rlff: Reinforcement learning from unit test feedback. _arXiv preprint arXiv:2307.04349_, 2023.
+* Liu et al. (2020) Yao Liu, Adith Swaminathan, Alekh Agarwal, and Emma Brunskill. Off-policy policy gradient with stationary distribution correction. In _Uncertainty in artificial intelligence_, pp. 1180-1190. PMLR, 2020.
+* Loshchilov & Hutter (2018) Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In _International Conference on Learning Representations_, 2018.
+* Luo et al. (2023) Ziyang Luo, Can Xu, Pu Zhao, Qingfeng Sun, Xiubo Geng, Wenxiang Hu, Chongyang Tao, Jing Ma, Qingwei Lin, and Daxin Jiang. Wizardcoder: Empowering code large language models with evol-instruct. _arXiv preprint arXiv:2306.08568_, 2023.
+* Mnih et al. (2013) Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Alex Graves, Ioannis Antonoglou, Daan Wierstra, and Martin Riedmiller. Playing atari with deep reinforcement learning. _arXiv preprint arXiv:1312.5602_, 2013.
+* Moravcik et al. (2017) Matej Moravcik, Martin Schmid, Neil Burch, Viliam Lisy, Dustin Morrill, Nolan Bard, Trevor Davis, Kevin Waugh, Michael Johanson, and Michael Bowling. Deepstack: Expert-level artificial intelligence in heads-up no-limit poker. _Science_, 356(6337):508-513, 2017.
+* Nachum et al. (2017) Ofir Nachum, Mohammad Norouzi, Kelvin Xu, and Dale Schuurmans. Bridging the gap between value and policy based reinforcement learning. _Advances in neural information processing systems_, 30, 2017.
+* Nair et al. (2018) Ashvin V Nair, Vitchyr Pong, Murtaza Dalal, Shikhar Bahl, Steven Lin, and Sergey Levine. Visual reinforcement learning with imagined goals. _Advances in neural information processing systems_, 31, 2018.
+* Ng et al. (2000) Andrew Y Ng, Stuart Russell, et al. Algorithms for inverse reinforcement learning. In _Icml_, volume 1, pp. 2, 2000.
+* Nijkamp et al. (2022) Erik Nijkamp, Bo Pang, Hiroaki Hayashi, Lifu Tu, Huan Wang, Yingbo Zhou, Silvio Savarese, and Caiming Xiong. Codegen: An open large language model for code with multi-turn program synthesis. In _The Eleventh International Conference on Learning Representations_, 2022.
+* OpenAI (2023) R OpenAI. Gpt-4 technical report. _arXiv_, pp. 2303-08774, 2023.
+* Osera & Zdancewic (2015) Peter-Michael Osera and Steve Zdancewic. Type-and-example-directed program synthesis. _ACM SIGPLAN Notices_, 50(6):619-630, 2015.
+* Ouyang et al. (2022) Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow instructions with human feedback. _Advances in Neural Information Processing Systems_, 35:27730-27744, 2022.
+* Papineni et al. (2002) Kishore Papineni, Salim Roukos, Todd Ward, and Wei-Jing Zhu. Bleu: a method for automatic evaluation of machine translation. In _Proceedings of the 40th annual meeting of the Association for Computational Linguistics_, pp. 311-318, 2002.
+* Rabinovich et al. (2017) Maxim Rabinovich, Mitchell Stern, and Dan Klein. Abstract syntax networks for code generation and semantic parsing. _arXiv preprint arXiv:1704.07535_, 2017.
+* Radford et al. (2019) Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language models are unsupervised multitask learners. _OpenAI blog_, 1(8):9, 2019.
+* Rae et al. (2021) Jack W Rae, Sebastian Borgeaud, Trevor Cai, Katie Millican, Jordan Hoffmann, Francis Song, John Aslanides, Sarah Henderson, Roman Ring, Susannah Young, et al. Scaling language models: Methods, analysis & insights from training gopher. _arXiv preprint arXiv:2112.11446_, 2021.
+* Raghavan et al. (2018)* Rafailov et al. (2023) Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher D Manning, and Chelsea Finn. Direct preference optimization: Your language model is secretly a reward model. _arXiv preprint arXiv:2305.18290_, 2023.
+* Raffel et al. (2020) Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text transformer. _The Journal of Machine Learning Research_, 21(1):5485-5551, 2020.
+* Ranzato et al. (2015) Marc'Aurelio Ranzato, Sumit Chopra, Michael Auli, and Wojciech Zaremba. Sequence level training with recurrent neural networks. _arXiv preprint arXiv:1511.06732_, 2015.
+* Rennie et al. (2017) Steven J Rennie, Etienne Marcheret, Youssef Mroueh, Jerret Ross, and Vaibhava Goel. Self-critical sequence training for image captioning. In _Proceedings of the IEEE conference on computer vision and pattern recognition_, pp. 7008-7024, 2017.
+* Roziere et al. (2023) Baptiste Roziere, Jonas Gehring, Fabian Gloeckle, Sten Sootla, Itai Gat, Xiaoqing Ellen Tan, Yossi Adi, Jingyu Liu, Tal Remez, Jeremy Rapin, et al. Code llama: Open foundation models for code. _arXiv preprint arXiv:2308.12950_, 2023.
+* Schulman et al. (2017) John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy optimization algorithms. _arXiv preprint arXiv:1707.06347_, 2017.
+* Shojaee et al. (2023) Parshin Shojaee, Aneesh Jain, Sindhu Tipirneni, and Chandan K Reddy. Execution-based code generation using deep reinforcement learning. _arXiv preprint arXiv:2301.13816_, 2023.
+* Silver (2015) David Silver. Lecture 7: Policy gradient. _UCL Course on RL_, 2015.
+* Silver et al. (2016) David Silver, Aja Huang, Chris J Maddison, Arthur Guez, Laurent Sifre, George Van Den Driessche, Julian Schrittwieser, Ioannis Antonoglou, Veda Panneershelvam, Marc Lanctot, et al. Mastering the game of go with deep neural networks and tree search. _nature_, 529(7587):484-489, 2016.
+* Simmons-Edler et al. (2018) Riley Simmons-Edler, Anders Milner, and Sebastian Seung. Program synthesis through reinforcement learning guided tree search. _arXiv preprint arXiv:1806.02932_, 2018.
+* Stiennon et al. (2020) Nisan Stiennon, Long Ouyang, Jeffrey Wu, Daniel Ziegler, Ryan Lowe, Chelsea Voss, Alec Radford, Dario Amodei, and Paul F Christiano. Learning to summarize with human feedback. _Advances in Neural Information Processing Systems_, 33:3008-3021, 2020.
+* Summers (1977) Phillip D Summers. A methodology for lisp program construction from examples. _Journal of the ACM (JACM)_, 24(1):161-175, 1977.
+* Tavakoli et al. (2018) Arash Tavakoli, Fabio Pardo, and Petar Kormushev. Action branching architectures for deep reinforcement learning. In _Proceedings of the aaai conference on artificial intelligence_, volume 32, 2018.
+* Touvron et al. (2023) Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothee Lacroix, Baptiste Roziere, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and efficient foundation language models. _arXiv preprint arXiv:2302.13971_, 2023.
+* Van Hasselt et al. (2016) Hado Van Hasselt, Arthur Guez, and David Silver. Deep reinforcement learning with double q-learning. In _Proceedings of the AAAI conference on artificial intelligence_, volume 30, 2016.
+* Wang & Komatsuzaki (2021) Ben Wang and Aran Komatsuzaki. GPT-J-6B: A 6 Billion Parameter Autoregressive Language Model. [https://github.com/kingoflolz/mesh-transformer-jax](https://github.com/kingoflolz/mesh-transformer-jax), May 2021.
+* Wang et al. (2022) Xin Wang, Yasheng Wang, Yao Wan, Fei Mi, Yitong Li, Pingyi Zhou, Jin Liu, Hao Wu, Xin Jiang, and Qun Liu. Compilable neural code generation with compiler feedback. In _Findings of the Association for Computational Linguistics: ACL 2022_, pp. 9-19, 2022.
+* Wang et al. (2021) Yue Wang, Weishi Wang, Shafiq Joty, and Steven CH Hoi. Coded5: Identifier-aware unified pretrained encoder-decoder models for code understanding and generation. In _Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing_, pp. 8696-8708, 2021.
+
+* Wang et al. (2023) Yue Wang, Hung Le, Akhilesh Deepak Gotmare, Nghi DQ Bui, Junnan Li, and Steven CH Hoi. Codel5+: Open code large language models for code understanding and generation. _arXiv preprint arXiv:2305.07922_, 2023.
+* Wang et al. (2016) Ziyu Wang, Tom Schaul, Matteo Hessel, Hado Hasselt, Marc Lanctot, and Nando Freitas. Dueling network architectures for deep reinforcement learning. In _International conference on machine learning_, pp. 1995-2003. PMLR, 2016.
+* Watkins & Dayan (1992) Christopher JCH Watkins and Peter Dayan. Q-learning. _Machine learning_, 8:279-292, 1992.
+* Williams (1992) Ronald J Williams. Simple statistical gradient-following algorithms for connectionist reinforcement learning. _Machine learning_, 8:229-256, 1992.
+* Xie et al. (2021a) Tengyang Xie, Ching-An Cheng, Nan Jiang, Paul Mineiro, and Alekh Agarwal. Bellman-consistent pessimism for offline reinforcement learning. _Advances in neural information processing systems_, 34:6683-6694, 2021a.
+* Xie et al. (2021b) Tengyang Xie, Nan Jiang, Huan Wang, Caiming Xiong, and Yu Bai. Policy finetuning: Bridging sample-efficient offline and online reinforcement learning. _Advances in neural information processing systems_, 34:27395-27407, 2021b.
+* Xu et al. (2023) Can Xu, Qingfeng Sun, Kai Zheng, Xiubo Geng, Pu Zhao, Jiazhan Feng, Chongyang Tao, and Daxin Jiang. Wizardlm: Empowering large language models to follow complex instructions. _arXiv preprint arXiv:2304.12244_, 2023.
+* Yasunaga & Liang (2020) Michihiro Yasunaga and Percy Liang. Graph-based, self-supervised program repair from diagnostic feedback. In _International Conference on Machine Learning_, pp. 10799-10808. PMLR, 2020.
+* Yu & Zhang (2023) Zishun Yu and Xinhua Zhang. Actor-critic alignment for offline-to-online reinforcement learning. In _Proceedings of the 40th International Conference on Machine Learning_, volume 202, pp. 40452-40474, 2023.
+* Zhan et al. (2022) Wenhao Zhan, Baihe Huang, Audrey Huang, Nan Jiang, and Jason Lee. Offline reinforcement learning with realizability and single-policy concentrability. In _Conference on Learning Theory_, pp. 2730-2775. PMLR, 2022.
+* Zheng et al. (2023) Qinkai Zheng, Xiao Xia, Xu Zou, Yuxiao Dong, Shan Wang, Yufei Xue, Zihan Wang, Lei Shen, Andi Wang, Yang Li, et al. Codegeex: A pre-trained model for code generation with multilingual evaluations on humaneval-x. _arXiv preprint arXiv:2303.17568_, 2023.
+* Zhong et al. (2017) Victor Zhong, Caiming Xiong, and Richard Socher. Seq2sql: Generating structured queries from natural language using reinforcement learning. _arXiv preprint arXiv:1709.00103_, 2017.
+* Ziebart et al. (2008) Brian D Ziebart, Andrew L Maas, J Andrew Bagnell, Anind K Dey, et al. Maximum entropy inverse reinforcement learning. In _Aaai_, volume 8, pp. 1433-1438. Chicago, IL, USA, 2008.
+* Ziegler et al. (2019) Daniel M Ziegler, Nisan Stiennon, Jeffrey Wu, Tom B Brown, Alec Radford, Dario Amodei, Paul Christiano, and Geoffrey Irving. Fine-tuning language models from human preferences. _arXiv preprint arXiv:1909.08593_, 2019.
+* Zinkevich et al. (2007) Martin Zinkevich, Michael Johanson, Michael Bowling, and Carmelo Piccione. Regret minimization in games with incomplete information. _Advances in neural information processing systems_, 20, 2007.
+* Zohar & Wolf (2018) Amit Zohar and Lior Wolf. Automatic program synthesis of long programs with a learned garbage collector. _Advances in neural information processing systems_, 31, 2018.
+
+## Appendix A Pseudo-Code for Training
+
+```
+1:\(\theta_{\text{disp}}\), \(\phi\), and \(\theta\) with a shared frozen encoder
+2:\(\#\) pre-training stage, update \(\phi\) only
+3:procedurePretrain\(V\)Value(\(\phi\))\(\triangleright\)\(\phi\)-stage
+4:for num_iters do
+5: Draw sample \((s,a,r,s^{\prime})\) from dataset
+6: Compute logits \(\ell_{\theta_{\text{disp}}}(s,\cdot)\)
+7: Compute state value \(V_{\phi}(s)\)
+8: Compute loss \(\mathcal{L}_{V}(V_{\phi};\ell_{\text{disp}})\)\(\triangleright\) arguments omitted for brevity
+9: Gradient step with \(\nabla_{\phi}\mathcal{L}_{V}(V_{\phi};\ell_{\theta_{\text{disp}}})\)\(\triangleright\) equation 12
+10:endfor
+11:endprocedure
+12:\(\#\) fine-tuning stage, update \(\theta\) only
+13:procedureFinetune\(Q\)Value(\(\theta\))\(\triangleright\)\(\theta\)-stage
+14:for num_iters do
+15: Draw sample \((s,a,r,s^{\prime})\) from dataset
+16: Compute residual state-value \(V^{\prime}_{\phi}(s)\)
+17: Compute pre-trained state-value \(V_{\phi}(s)\)
+18: Compute state-value \(V_{\theta}(s)=V^{\prime}_{\theta}(s)+V_{\phi}(s)\)
+19: Compute advantage \(A_{\theta}(s,\cdot)=\ell_{\theta}(s,\cdot)-\max_{a}\ell_{\theta}(s,a)\)
+20: Compute \(Q_{\theta}(s,\cdot)=\alpha A_{\theta}(s,\cdot)+V_{\theta}(s)\)\(\triangleright\) equation 16
+21: Compute \(\pi_{\theta}(\cdot|s)=\text{softmax}(Q_{\theta}(s,\cdot)/\alpha)\)\(\triangleright\) equation 14
+22: Compute \(\rho_{\theta_{\text{disp}}}(\cdot|s)\)\(\triangleright\) equation 15
+23: Compute \(\mathcal{L}_{\text{ce}}(\pi_{\theta})\) and \(\mathcal{L}_{\text{adv}}(A_{\theta})\)\(\triangleright\) equation 1 and 8
+24: Compute fine-tune loss \(\mathcal{L}_{\text{ft}}(Q_{\theta};p_{\theta_{\text{disp}}})=\mathcal{L}_{Q}(Q_ {\theta};p_{\theta_{\text{disp}}})+\beta_{\text{ce}}\mathcal{L}_{\text{ce}}( \pi_{\theta})+\beta_{\text{adv}}\mathcal{L}_{\text{adv}}(A_{\theta})\)
+25: Gradient step with \(\nabla_{\theta}\mathcal{L}_{\text{ft}}(Q_{\theta};p_{\theta_{\text{disp}}})\)
+26:endfor
+27:endprocedure
+```
+
+**Algorithm 1** Training Procedure with \(\phi\)- and \(\theta\)-stages
+
+## Appendix B Pseudo-Code for Sampling
+
+**Require:\(\theta\), \(\phi\); \(\text{Sampler}_{p,t}(\cdot):\mathbb{R}^{|\mathcal{V}|\times 1}\rightarrow\mathcal{V}\) that maps a logits vector to a token with hyper-parameters \(p\) (top-\(p\) sampling) and temperature \(t\)**
+
+```
+1:procedureSampleOneToken(\(s\))
+2: Obtain current state \(s\)
+3: Compute logits vector \(\mathbf{\ell}_{\theta}(s)\in\mathbb{R}^{|\mathcal{V}|\times 1}\)
+4: Compute advantage vector \(\mathbf{A}_{\theta}(s)=\mathbf{\ell}_{\theta}(s)-\max_{a}\mathbf{\ell}_{\theta}(s)[a]\)
+5: Compute \(V_{\theta}(s)=V^{\prime}_{\theta}(s)+V_{\phi}(s)\)
+6: Compute \(Q\) vector \(\mathbf{Q}_{\theta}(s)=\alpha\mathbf{A}_{\theta}(s)+V_{\theta}(s)\)
+7: Run \(\text{Sampler}_{p,t}\) (\(\mathbf{Q}_{\theta}(s)/\alpha\))\(\triangleright\) sample with \(\mathbf{Q}_{\theta}(s)/\alpha\)
+8:endprocedure
+```
+
+**Algorithm 2** Sampling Procedure
+Additional Related Works
+
+**Off-policy policy-based methods.** One string of off-policy policy-based methods is based on importance ratio. Suppose the data is collected by a behavior policy \(\beta\), vanilla PG with off-policy data can be corrected by \(\nabla_{\mu}J(\mu)=\mathbb{E}_{\beta}[\frac{\pi_{\mu}(a_{i}|s_{i})}{\beta(a_{i}| s_{i})}(\sum_{i=1}^{T}\gamma^{i}r_{i})\nabla_{\mu}\log\pi_{\mu}(a_{i}|s_{i})]\). This allows unbiased gradient even though the data distribution is off-policy. However, computing the ratio \(\pi_{\mu}(a|s)/\beta(a|s)\) is not always feasible because the density function of off-policy data, such as human data, is often unknown. Additionally, this computation can lead to high variance due to the product of ratios along trajectories.
+
+While vanilla off-policy PG does not require the approximation of a value function (hence impractical), advanced ratio-based methods often incorporate value functions, such as (Imani et al., 2018; Liu et al., 2020). Another viable approach is the direct combination of value-based and policy-based methods, often referred to as the actor-critic framework, e.g. (Konda and Tsitsiklis, 1999; Degris et al., 2012). Although actor-critic methods are often considered as a third category, we and some other works (Fujimoto et al., 2018) lean towards categorizing actor-critic to be more value-based, as the major difficulty lies in value function approximations. Nevertheless, both directions of extending policy-based methods to an off-policy setting, i.e., using off-policy data, largely rely on the use of value functions. This emphasizes the motivation and significance of our work.
+
+**Reward modeling and beyond.** Due to the successes of reinforcement learning from human/AI feedback (Christiano et al., 2017; Bai et al., 2022b). Reward modeling and RL fine-tuning with learned reward model has been a popular choice for post-SFT - supervised fine-tuning - refinement (see e.g. Ziegler et al., 2019; Stiennon et al., 2020; Bai et al., 2022a; Ouyang et al., 2022). In particular, in program synthesis, Le et al. (2022) trains a classifier, that predicts unit test outcomes, as their reward model for RL fine-tuning. However, reward models can sometimes be expensive to train and their quality can heavily impact RL fine-tuning performance. Recent works (e.g. Rafailov et al., 2023; Diao et al., 2023) explore preference learning beyond conventional reward model.
+
+Modeling reward function, on the other hand, has been a long-lasting topic in inverse RL or imitation learning (IRL or IL, see e.g. Ng et al., 2000; Abbeel and Ng, 2004; Ziebart et al., 2008; Ho and Ermon, 2016). While conventional IRL/IL often iterates between reward model fitting and RL training stages, recent IL works (Jacq et al., 2019; Garg et al., 2021) also explore beyond explicitly reward modeling to reduce training instability and optimization difficulty, caused by the iterative optimization scheme. Specifically, Garg et al. (2021) leverages the one-to-one correspondence between \(Q\)-function and reward model, with soft Bellman operator, to _eliminate_ the reward fitting step.
+
+**Candidate selection in program synthesis.** Existing works have shown one could improve program pass rate by filtering out programs that are likely to be incorrect. For instance, Chen et al. (2021) filtered out programs that cannot pass example unit tests given in doc-strings, and Chen et al. (2022) filtered out programs that cannot pass generated unit tests. Furthermore, reward models are also often used to rank and select candidate programs (see e.g. Gulcehre et al., 2023; Touvron et al., 2023).
+
+## Appendix D Reward Engineering Comparison
+
+Table 5 shows that ours has the least reward engineering effort. Note that our reward model \(\tilde{r}_{\theta}\) is directly derived from \(Q_{\theta}\), and is not used for training.
+
+\begin{table}
+\begin{tabular}{l|l l l l l} \hline \hline Reward & Remark & Ours & CodeRL & RLTF & PPOCoder \\ \hline Basic & equation 2 & ✓ & ✓ & ✓ & ✓ \\ Reward Model & learned reward model & & ✓ & & \\ Fine-Grained & fine-grained error type \& location of error & & ✓ & \\ Adaptive & ratio of passed tests & & & ✓ & \\ Syntactic Correctness & compilable & & & ✓ \\ Syntactic Matching & syntactic similarity to ground truth & & & ✓ \\ Semantic Matching & semantic similarity to ground truth & & & ✓ \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Comparison of reward designsTable 6 shows the results when only basic reward function (defined in equation 2) is used, under no example test outcomes setting. CodeRL and RLTF results are duplicated from reports.
+
+## Appendix E Advantage of Approximate Version of \(\tilde{r}\)
+
+Recap that the approximate version of \(\tilde{r}\) is computed by
+
+\[\tilde{r}_{\theta}(s,a)=Q_{\theta}(s,a)-\gamma\mathbb{E}_{s^{\prime}}Q_{\theta }\left(s^{\prime},\arg\max_{a}p_{\theta_{\text{disp}}}(a|s^{\prime})\right) \approx Q_{\theta}(s,a)-\gamma V_{\theta}(s^{\prime}). \tag{20}\]
+
+Imagining a scenario in which we sample/decode using a trained \(Q_{\theta}\), the forward pass will compute \(Q_{\theta}(s,a)\) and \(V_{\theta}(s)\) for each timestep. But \(p_{\theta_{\text{disp}}}\) will not be evaluated during generation, because \(p_{\theta_{\text{disp}}}\) is only used when computing \(\mathcal{L}_{Q}(\ \cdot\ ;p_{\theta_{\text{disp}}})\). Computing the exact version \(Q_{\theta}(s,a)-\gamma\mathbb{E}_{s^{\prime}}Q_{\theta}(s^{\prime},\arg\max_{ a}p_{\theta_{\text{disp}}}(a|s^{\prime}))\) will require additional computation of \(p_{\theta_{\text{disp}}}\) during generation. In contrast, \(Q(s,a)\) and \(V(s)\) are already computed during generation, therefore it requires almost no additional computation to compute \(\tilde{r}_{\theta}(s,a)\).
+
+## Appendix F Upper Bound of \(Q\)-function
+
+Given our reward design in equation 2, the cumulative reward is upper bounded by \(R_{\text{max}}=1\). We enforce \(Q(s,a)\leq R_{\text{max}}\) by transform the state value function as \(V(s)=-\texttt{softabs}\left(V(s)\right)+R_{\text{max}}\leq R_{\text{max}}\), where \(\texttt{softabs}(x):=[\texttt{softplus}(x)+\texttt{softplus}(-x)]/2+\ln 2\) is a soft absolute function. Given \(A(s,a)\leq 0\), enforcing \(V(s)\leq R_{\text{max}}\) leads to \(Q(s,a)\leq R_{\text{max}}\).
+
+## Appendix G A Spectrum of RL Applications
+
+To conceptually demonstrate the differences between these methods and why program synthesis might be well-suited to value-based approaches, Figure 4 presents a spectrum of RL applications. It could be observed that in scenarios where rewards are readily obtainable or there's plenty of off-policy data - data not generated by the current policy/model - value-based methods tend to be preferred. Consider, for instance, InstructGPT (Ouyang et al., 2022) (policy-based) and AlphaGo (Silver et al., 2016) (value-based). The former relies on human annotators (_expensive_) to label model-generated (_on-policy_) responses, while the latter obtains rewards from simulators (_cheap_), and leverages (1) human expert games (_off-policy_) during training and (2) re-using historical games through experience reply.
+
+Table 7 provides explanations our application plot of Figure 4. Applications in games typically find it easy to obtain rewards and make extensive use of off-policy data, e.g human games or historical replays. Conversely, InstructGPT obtains its rewards from preferences labeled by human annotators, with the data predominantly generated by the GPT model itself. The self-driving application notable has high cost of gathering rewards, due to the risks of real-world driving. While existing driving data could be utilized, Kendall et al. (2019) specifically choose not to use pre-collected data, leading to their choice of a policy-based algorithm.
+
+In code generation, despite the availability of cheap rewards and the existing collection of off-policy programs, whether human-written or previously model-generated, current literature still leans to
+
+\begin{table}
+\begin{tabular}{l|c c c c|c c c c} \hline \hline \multirow{2}{*}{Model} & \multicolumn{4}{c|}{Pass@1} & \multicolumn{4}{c}{Pass@5} \\ \cline{2-9}  & Intro & Inter & Comp & All & Intro & Inter & Comp & All \\ \hline CodeRL\({}^{\dagger}\) & 4.60 & 1.10 & 0.20 & 1.62 & 7.10 & 1.57 & 0.40 & 2.44 \\ RLTF\({}^{\ddagger}\) & - & - & - & 1.37 & - & - & - & 3.50 \\ \(\mathcal{B}\)-Coder & **6.70** & **1.50** & **0.30** & **2.30** & **10.40** & **2.63** & **0.70** & **3.80** \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Performance with only basic reward (equation 2). \({}^{\dagger}\)and \({}^{\ddagger\ddagger}\) indicates results duplicated from Le et al. (2022) and Liu et al. (2023), respectively.
+
+wards policy-based methods. We believe that value-based methods could be a promising direction, given their similarity to tasks with simulators.
+
+## Appendix H Training and Evaluation Details
+
+In supplement to implementation details in Section 4.4 and 5, we give more low-level details here.
+
+**APPS dataset.** In addition to the train/test split details described in Section 5, APPS dataset, on average, consists of 2 example unit tests, 21 hidden unit tests, and 23 ground truth programs. We follow the same procedure as Hendrycks et al. (2021); Le et al. (2022) to construct prompts for both training and evaluation. Specifically, see Section 3 of Hendrycks et al. (2021).
+
+**MBPP dataset.** MBPP has 974 instances with a 374/90/500 train/val/test splits and, in addition, 10 problems reserved for few-shot learning. Because we only do zero-shot evaluation on MBPP, only the 500 test problems are used for evaluation. Each problem of MBPP usually comes with three unit
+
+\begin{table}
+\begin{tabular}{l|l|l|l|l} \hline  & References & Type of RL & Costs of Getting Rewards & Available Off-Policy Data \\ \hline \hline Atari & [(Mnih et al., 2013)] & value & cheap: simulator & extensive: history/human games \\ \hline GO & [(Silver et al., 2016)] & value & cheap: simulator & extensive: history/human games \\ \hline Poker & [(Morozuč et al., 2017)] & value4  & cheap: simulator & extensive: history/human games \\ \hline StarCraft II & [(Aucklandman et al., 2019)] & value & cheap: simulator & extensive: history/human games \\ \hline InstanceGPT & [(Oyang et al., 2022)] & policy & expensive: human annotators & limited: mostly model-generated data \\ \hline Image & [(Ranzato et al., 2015)] & policy & cheap: automatic metrics & limited: mostly model-generated data \\ Caption & [(Rennie et al., 2017)] & policy & expensive: driving in real-world & limited: mostly model-generated data \\ \hline Self-driving & [(Le et al., 2022)] & policy & expensive: driving in real-world & limited: mostly model-generated data \\ \hline \hline Code & [(Shojee et al., 2023)] & policy & cheap: unit testing & extensive: collection of human programs \\ Generation & [(Liu et al., 2023)] & policy & cheap: unit testing & extensive: collection of human programs \\ \hline \end{tabular}
+\end{table}
+Table 7: Summary of RL applications.
+
+Figure 4: A collection of RL applications. \(\blacksquare\) and \(\blacksquare\) represents value-based and policy-based RL, respectively. The x-axis shows the difficulty of obtaining rewards, while the y-axis measures the amount of off-policy data. Tasks that face significant hurdles in gathering rewards or have limited off-policy data typically lean towards policy-based algorithms. Tasks where rewards are more readily obtained or that benefit from a substantial collection of off-policy data favors value-based methods. See descriptions of each task in Table 7.
+
+tests. In addition, these tests are usually not hidden. Therefore, prior works Le et al. (2022); Shojaee et al. (2023); Liu et al. (2023) often explicitly incorporate the tests into prompt string. We follow WizardCoder (Luo et al., 2023) to construct our input format. Details could be found in this repo.
+
+**Pre-trained model.** We initialize our model with CodeRL checkpoint publicly available at here, meaning we initialize \(\theta_{\text{clap}}\), \(\phi\), and \(\theta\) from it. Note that we freeze encoder for both \(\phi\)-stage and \(\theta\)-stage, therefore the encoder is shared during both training and generation. For both training and generation, we set the maximum length to 600 and 512 for source and target sequences, respectively.
+
+**Training data preparation.** While we use \(\mathcal{D}_{\text{train}}\) to represent our training dataset, yet we have not elaborated on how it is constructed. In general, we follow the protocol of prior RL-based works that combining all ground truth programs and a set of programs generated by the pre-trained model, for each problem \(D\). Specifically, we generate 256 programs per problem using pre-trained checkpoint. Combined with ground truth programs, there are, on average, 278 programs per problem.
+
+**Mini-batch preparation.** By prior definition, our dataset \(\mathcal{D}_{\text{train}}\) now contains both ground truth programs and generated programs. Notably, the volume of generated programs is significantly larger than that of the ground truth programs. This means that if one were to randomly sample from the dataset, generated programs would dominate the mini-batches. To address this, when preparing a mini-batch, we sample \(\rho_{\text{real}}\times B\) ground truth programs and \((1-\rho_{\text{real}})\times B\) generated programs, where \(B\) is batch size.
+
+\(\phi\)**-stage training.** In the \(\phi\)-stage, we pre-train state-value function \(V_{\phi}(s)\). We conduct our experiment with 4\(\times\)A100-80G GPUs. Specifically, we use batch size of 16 for each GPU and gradient accumulation step of 4, resulting in a total batch size of 256. For optimizer and scheduler, we use AdamW optimizer (Loshchilov and Hutter, 2018) with a constant learning rate of 1e-5 and a weight decay of 0.05. We train \(\phi\) for 18k gradient steps.
+
+\(\theta\)**-stage training.** In the \(\theta\)-stage, we conduct our experiment with 8\(\times\)A100-80G GPUs. Specifically we use batch size of 16 for each GPU and gradient accumulation step of 1, resulting in a total batch size of 128. For optimizer and scheduler, we use AdamW with a peak learning rate 3e-5, a weight decay of 0.05, and a linear decay scheduler with no warmup. We train \(\theta\) for 10k gradient steps.
+
+**Other hyper-parameters.** We set the ground truth data ratio \(\rho_{\text{real}}=0.5\) and the energy-based policy temperature \(\alpha=1\) (see equation 10) for all experiments. In \(\theta\)-stage, we use \(\beta_{\text{adv}}=0.1\) and \(\beta_{\text{ee}}=0.5\).
+
+## Appendix I Ablation on \(m\)
+
+Table 5 conduct an ablation study on ranking budgets \(m\), it can be observed that our ranking strategy achieves consistent improvements under different budgets \(m\).
+
+Figure 5: Ablation on \(m\): our ranking strategy achieves consistent improvements under different budgets \(m\).
+
+## Appendix J Comments on \(\mathcal{B}^{q}\) Properties
+
+### Proposition 4.1
+
+Proof.: \[\|\mathcal{B}^{q}Q_{1}-\mathcal{B}^{q}Q_{2}\|_{\infty} =\max_{s,a}|r(s,a)+\gamma\mathbb{E}_{s^{\prime}}Q_{1}\left(s^{ \prime},\hat{a}^{\prime}\right)-r(s,a)-\gamma\mathbb{E}_{s^{\prime}}Q_{2}(s^{ \prime},\hat{a}^{\prime})|\] (\(\hat{a}^{\prime}=\arg\max_{a}q(a|s^{\prime})\)) \[=\max_{s,a}\gamma\left|\mathbb{E}_{s^{\prime}}\left[Q_{1}(s^{ \prime},\hat{a}^{\prime})-Q_{2}(s^{\prime},\hat{a}^{\prime})\right]\right|\] (21) \[\leq\max_{s,a}\gamma\mathbb{E}_{s^{\prime}}\left|Q_{1}(s^{\prime },\hat{a}^{\prime})-Q_{2}(s^{\prime},\hat{a}^{\prime})\right|\] (22) \[\leq\max_{s,a}\gamma\mathbb{E}_{s^{\prime}}\max_{s^{\prime},a^{ \prime}}\left|Q_{1}(s^{\prime},a^{\prime})-Q_{2}(s^{\prime},a^{\prime})\right|\] (23) \[=\gamma\|Q_{1}-Q_{2}\|_{\infty}\] (24)
+
+### Proposition 4.2
+
+Proof.: The proof is similar to Lemma C.3. in Garg et al. (2021). To prove that \(\mathcal{T}^{p}\) is a bijection, it suffices to show that for any \(r:\mathcal{S}\times\mathcal{A}\rightarrow\mathbb{R}\), there exists a unique \(Q:\mathcal{S}\times\mathcal{A}\rightarrow\mathbb{R}\) such that \(r=\mathcal{T}^{p}Q\). Note that by proposition 4.1, there exists a unique \(Q^{p}=\mathcal{B}^{p}r\) that satisfies \(Q^{p}(s,a)=r(s,a)+\gamma\mathbb{E}_{s^{\prime}}Q^{p}\left(s^{\prime},\arg\max_ {a}p(a|s^{\prime})\right)\). Rearranging the terms gives \(r=\mathcal{T}^{p}Q^{p}\). This completes the proof.
+
+## Appendix K Discussion on Limitations
+
+While being exploratory, our work admits certain limitations including: additional frozen parameters introduced, and we observe that raw performance (without ranking) is mixed compared to CodeRL (see Table 8) (which we believe is somewhat excusable as we use less reward designs). However, we remark the effectiveness of our overall framework including the dual strategy is non-trivial, especially with limited reward engineering.
+
+\begin{table}
+\begin{tabular}{r|c c} \hline \hline Pass@ & CodeRL & \(\mathcal{B}\)-Coder \\ \hline
+1 & **1.60** & **1.60** \\
+5 & **3.28** & 2.88 \\
+50 & 7.16 & **7.35** \\
+100 & 8.76 & **9.18** \\ \hline \hline \end{tabular}
+\end{table}
+Table 8: Pass@1 is evaluated with greedy decoded programs, Pass@{5, 50, 100} are computed by sampled programs using temperature = 0.4.

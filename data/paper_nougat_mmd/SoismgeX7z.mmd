@@ -1,0 +1,639 @@
+# Generalized Schrodinger Bridge Matching
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Modern distribution matching algorithms for training diffusion or flow models directly _prescribe_ the time evolution of the marginal distributions between two boundary distributions. In this work, we consider a generalized distribution matching setup, where these marginals are only _implicitly_ described as a solution to some task-specific objective function. The problem setup, known as the Generalized Schrodinger Bridge (GSB), appears prevalently in many scientific areas both within and without machine learning. We propose **Generalized Schrodinger Bridge Matching (GSBM)**, a new matching algorithm inspired by recent advances, generalizing them beyond kinetic energy minimization and to account for task-specific state costs. We show that such a generalization can be cast as solving _conditional_ stochastic optimal control, for which efficient variational approximations can be used, and further debiased with the aid of path integral theory. Compared to prior methods that also provide approximate solutions to the GSB problems, our GSBM algorithm better preserves a feasible transport map between the boundary distributions throughout training, thereby enabling stable convergence and significantly improved scalability. We empirically validate our claims on an extensive suite of experimental setups, including crowd navigation, opinion depolarization, LiDAR manifolds, and image domain transfer. Our work brings new algorithmic opportunities for training diffusion models enhanced with task-specific optimality structures.
+
+## 1 Introduction
+
+The distribution matching problem--of learning transport maps that match specific distributions--is a ubiquitous problem setup that appears in many areas of machine learning, with extensive applications in optimal transport (Peyre and Cuturi, 2017), domain adaptation (Wang and Deng, 2018), and generative modeling (Sohl-Dickstein et al., 2015; Chen et al., 2018). The tasks are often cast as learning mappings, \(X_{0}\mapsto X_{1}\), such that \(X_{0}\sim\mu\,X_{1}\sim\nu\) follow the (unknown) laws of two distributions \(\mu,\nu\). For instance, diffusion models1 construct the mapping as the solution to a stochastic differential equation (SDE) whose drift \(u_{t}^{\theta}(X_{t}):\mathbb{R}^{d}\times[0,1]\to\mathbb{R}^{d}\) is parameterized by \(\theta\):
+
+Footnote 1: We adopt constant \(\sigma\in\mathbb{R}\) throughout the paper but note that all analysis generalize to time-dependent \(\sigma_{t}\).
+
+\[\mathrm{d}X_{t}=u_{t}^{\theta}(X_{t})\mathrm{d}t+\sigma\mathrm{d}W_{t},\quad X _{0}\sim\mu,X_{1}\sim\nu. \tag{1}\]
+
+The marginal density \(p_{t}\) induced by (1) evolves as the Fokker Plank equation (FPE; Risken (1996)),
+
+\[\frac{\partial}{\partial t}p_{t}(X_{t})=-\nabla\cdot(u_{t}^{\theta}(X_{t})\;p_ {t}(X_{t}))+\frac{\sigma^{2}}{2}\Delta p_{t}(X_{t}),\quad p_{0}=\mu,p_{1}=\nu, \tag{2}\]
+
+and prescribing \(p_{t}\) with fixed \(\sigma\) uniquely determines a family of parametric SDEs in (1). Indeed, modern successes of diffusion models in synthesizing high-fidelity data (Song et al., 2021; Dhariwal and Nichol, 2021) are attributed, partly, to constructing \(p_{t}\) as a mixture of tractable conditional probability paths (Liu et al., 2023; Albergo et al., 2023; Tong et al., 2023). These tractabilities enable scalable algorithms that "_match \(u_{t}^{\theta}\) given \(p_{t}\)"_, hereafter referred to as _matching algorithms_.
+
+Alternatively, one may also specify \(p_{t}\) implicitly as the optimal solution to some objective function, with examples such as optimal transport (OT; Villani et al. (2009)), or the Schrodinger Bridge problem (SB; Schrodinger (1931); Fortet (1940); De Bortoli et al. (2021)). SB generalizes standard diffusion models to arbitrary \(\mu\) and \(\nu\) with fully nonlinear stochastic processes and, among all possible SDEs that match between \(\mu\) and \(\nu\), seeks the _unique_\(u_{t}\) that minimizes the kinetic energy.
+
+While finding the transport with minimal kinetic energy can be motivated from statistical physics or entropic optimal transport (Peyre and Cuturi, 2019; Vargas et al., 2021), with kinetic energy often being correlated with sampling efficiency in generative modeling (Chen et al., 2022; Shaul et al., 2023), it nevertheless limits the flexibility in the design of "optimality". Indeed, kinetic energy corresponds to the squared-Euclidean cost in OT, which, despite its popularity, is merely one among numerous alternatives available for deployment (Di Marino et al., 2017; Cuturi et al., 2023). On one hand, it remains debatable whether the \(\ell_{2}\) distance defined in the original data space (_e.g._, pixel space for images), as opposed to other metrics, are best suited for quantifying the optimality of transport maps. On the other hand, distribution matching in general scientific domains, such as population modeling (Ruthotto et al., 2020), robot navigation (Liu et al., 2018), or molecule simulation (Noe et al., 2020), often involves more complex optimality conditions that require more general algorithms to handle.
+
+To this end, we advocate a generalized setup for distribution matching, previously introduced as the Generalized Schrodinger Bridge problem (GSB; Chen et al. (2015); Chen (2023); Liu et al. (2022)):
+
+\[\min_{\theta}\int_{0}^{1}\mathbb{E}_{p_{t}}\left[\frac{1}{2}\|u_{t}^{\theta}( X_{t})\|^{2}+V_{t}(X_{t})\right]\mathrm{d}t\quad\text{subject to (1) or, equivalently, (2)}. \tag{3}\]
+
+GSB is a distribution matching problem--as it still seeks a diffusion model (1) that transports \(\mu\) to \(\nu\). Yet, in contrast to standard SB, the objective of GSB involves an additional state cost \(V_{t}\) which affects the solution by quantifying a penalty--or equivalently a reward--similar to general decision-making problems. This state cost can also include distributional properties of the random variable \(X_{t}\). Examples of \(V_{t}\) include, _e.g._, the mean-field interaction in opinion propagation (Gaitonde et al., 2021), quantum potential (Philippidis et al., 1979), or a geometric prior.
+
+Solving GSB problems involves addressing two distinct aspects: optimality (3) and feasibility (2). Within the set of feasible solutions that satisfy (2), GSB considers the one with the lowest objective in (3) to be optimal. Therefore, it is essential to develop algorithms that search _within_ the feasible set for the optimal solution. Unfortunately, existing algorithms that provide approximate solutions to (3) either require relaxing feasibility (Koshizuka and Sato, 2023), or, following the design of Sinkhorn algorithms (Cuturi, 2013), prioritize optimality over feasibility (Liu et al., 2022). While an exciting line of new matching algorithms (Peluchetti, 2023; Shi et al., 2023) has been developed for SB, _i.e._, when \(V_{t}:=0\), to ensure that the approximate solutions are proximity to the feasible set throughout training, it remains unclear whether, or how, these "_SB Matching_" (SBM) algorithms can be extended to handle nontrivial \(V_{t}\).
+
+We propose **Generalized Schrodinger Bridge Matching (GSBM)**, a new matching algorithm that generalizes SBM to nontrivial \(V_{t}\). We discuss how such a generalization can be tied to a _conditional stochastic optimal control_ (CondSOC) problem, from which existing SBM algorithms can be derived as special cases. We develop scalable solvers to the CondSOC using Gaussian path approximation, which can be further debiased with path integral theory (Kappen, 2005). GSBM inherits a similar algorithmic characterization to its ancestors (Liu et al., 2023; Shi et al., 2023), in that, during the optimization process, the learned \(p_{0}^{\theta}\) and \(p_{1}^{\theta}\) induced by the subsequent solutions of \(u_{t}^{\theta}\) remain close to the boundary marginals \((\mu,\nu)\) and preserve them exactly under stricter theoretical conditions.2 This distinguishes GSBM from prior methods (_e.g._, Liu et al. (2022)) that learn approximate solutions to the same problem (3) but whose subsequent solutions only approach \((\mu,\nu)\) after final convergence. This further results in a framework that relies solely on samples from \(\mu,\nu\)--without knowing their densities--and enjoys stable convergence, making it suitable for high dimensional applications. A note on the connection to stochastic optimal control and related works (Liu et al., 2022) can be found in Appendix A. Summarizing, we present the following contributions:
+
+Footnote 2: Provided the subsequent solutions reach the minimizers of each optimization stage; see Sec. 3.1 for details.
+
+* We propose GSBM, a new matching algorithm for learning diffusion models between two distributions that also respect some task-specific optimality structures in (3) via specifying \(V_{t}\).
+* GSBM casts recent matching methods as conditional stochastic optimal control problems, from which nontrivial \(V_{t}\) can be incorporated and solved at scale via Gaussian path approximation.
+* Compared to prior methods, _e.g._, Liu et al. (2022), that also provide approximate solutions to (3), GSBM enjoys stable convergence, improved scalability, and, crucially, maintains a transport map that remains _much_ closer to the distribution boundaries throughout the entire training.
+
+* Through extensive experiments, we showcase GSBM's remarkable capabilities across a variety of distribution matching problems, ranging from standard crowd navigation and 3D navigation over LiDAR manifolds, to high-dimensional opinion modeling and unpaired image translation.
+
+## 2 Preliminaries: Matching Diffusion Models given Prob. Paths
+
+As mentioned in Sec. 1, the goal of matching algorithms is to learn a SDE parametrized with \(u_{t}^{\theta}\) such that its FPE (2) matches some prescribed marginal \(p_{t}\) for all \(t\in[0,1]\). In this section, we review two classes of matching algorithms that will play crucial roles in the development of our GSBM.
+
+**Entropic Action Matching (implicit).** This is a recently proposed matching method (Neklyudov et al., 2023) that learns the unique gradient field governing an FPE prescribed by \(p_{t}\). Specifically, let \(s_{t}^{\theta}(X_{t}):\mathbb{R}^{d}\times[0,1]\to\mathbb{R}\) be a parametrized function, then the unique gradient field \(\nabla s_{t}^{\theta}(X_{t})\)--by which the probability density of the pushforward from \(\mu\) at time \(0\) to \(t\) matches \(p_{t}\)--minimizes
+
+\[\mathcal{L}_{\text{implicit}}(\theta):=\mathbb{E}_{\mu}\left[s_{0}^{\theta}(X_ {0})\right]-\mathbb{E}_{\nu}\left[s_{1}^{\theta}(X_{1})\right]+\int_{0}^{1} \mathbb{E}_{p_{t}}\left[\frac{\partial s_{t}^{\theta}}{\partial t}+\frac{1}{2 }\|\nabla s_{t}^{\theta}\|^{2}+\frac{\sigma^{2}}{2}\Delta s_{t}^{\theta}\right] \text{d}t. \tag{4}\]
+
+Neklyudov et al. (2023) showed that \(\mathcal{L}_{\text{implicit}}(\theta)\)_implicitly matches_ a unique gradient field \(\nabla s_{t}^{\star}\) with least kinetic energy, _i.e._, it is equivalent to minimizing \(\int_{0}^{1}\mathbb{E}_{p_{t}}\left[\frac{1}{2}\|\nabla s_{t}^{\theta}-\nabla s _{t}^{\star}\|^{2}\right]\text{d}t\), where
+
+\[\nabla s_{t}^{\star}{=}\operatorname*{arg\,min}_{u_{t}}\int_{0}^{1}\mathbb{E} _{p_{t}}\left[\frac{1}{2}\|u_{t}(X_{t})\|^{2}\right]\text{d}t\text{ subject to (\ref{eq:s_t}).}\]
+
+**Bridge & Flow Matching (explicit).** If the \(p_{t}\) can be factorized into \(p_{t}:=\mathbb{E}_{p_{0},1}[p_{t}(X_{t}|x_{0},x_{1})]\), where the conditional density \(p_{t}(X_{t}|x_{0},x_{1})\)--denoted with the shorthand \(p_{t|0,1}\)--is associated with an SDE, \(\text{d}X_{t}=u_{t}(X_{t}|x_{0},x_{1})\text{d}t+\sigma\text{d}W_{t}\), then it can be shown (Lipman et al., 2023; Albergo and Vanden-Eijnden, 2023; Liu et al., 2023) that the minimizer of (see Appendix C.1 for the derivation)
+
+\[\mathcal{L}_{\text{explicit}}(\theta):=\int_{0}^{1}\mathbb{E}_{p_{0},1}\mathbb{E }_{p_{t|0,1}}\left[\frac{1}{2}\|u_{t}^{\theta}(X_{t})-u_{t}(X_{t}|x_{0},x_{1}) \|^{2}\right]\text{d}t, \tag{5}\]
+
+similar to \(\nabla s_{t}^{\theta^{\star}}\), also satisfies the FPE prescribed by \(p_{t}\). In other words, \(u_{t}^{\theta^{\star}}\) preserves \(p_{t}\) for all \(t\).
+
+**Implicit vs. explicit matching losses.** While Entropic Action Matching presents a general matching method with the least assumptions, its implicit matching loss \(\mathcal{L}_{\text{implicit}}\) (4) scales unfavorably to high-dimensional applications, due to the need to approximate the Laplacian (using _e.g._, Hutchinson (1989)), and also introduces unquantifiable bias when optimizing over a restricted family of functions such as deep neural networks. The explicit matching loss \(\mathcal{L}_{\text{explicit}}\) (5) offers a computationally efficient alternative but requires additional information, namely \(u_{t}(X_{t}|x_{0},x_{1})\equiv u_{t|0,1}\). Remarkably, in both cases, the minimizers preserve the prescribed marginal \(p_{t}\). Hence, if \(p_{0}=\mu\) and \(p_{1}=\nu\), these matching algorithms shall _always_ return a feasible solution--a diffusion model that matches between \(\mu\) and \(\nu\). We summarize the aforementioned two methods in Alg. 1 and 2.
+
+```
+\(p_{t}:=\mathbb{E}_{p_{0},1}[p_{t|0,1}]\) s.t. \(p_{0}{=}\mu\), \(p_{1}{=}\nu\), \(u_{t|0,1}\) repeat  Sample \(X_{0},X_{1}\sim p_{0,1}\), \(X_{t}\sim p_{t|0,1}\)  Compute \(u_{t|0,1}\) given \((X_{0},X_{t},X_{1})\)  Take gradient step w.r.t. \(\mathcal{L}_{\text{explicit}}(\theta)\) until converges return\(u_{t}^{\theta^{\star}}\)
+```
+
+**Algorithm 2**match(explicit)
+
+## 3 Generalized Schrodinger Bridge Matching (GSBM)
+
+We propose **Generalized Schrodinger Bridge Matching (GSBM)**, a novel matching algorithm that, in contrast to those in Sec. 2 assuming prescribed \(p_{t}\), concurrently optimizes \(p_{t}\) to minimize (3) subject to the feasibility constraint (2). All proofs can be found in Appendix B.
+
+### Alternating optimization scheme
+
+Let us revisit the GSB problem (3), particularly its FPE constraint in (2). Recent advances in dynamic optimal transport (Liu et al., 2023b) and SB (Peluchetti, 2023) propose a decomposition of this dynamical constraint into two components: the marginal \(p_{t}\), \(t\in(0,1)\), and the joint coupling between boundaries \(p_{0,1}\), and employ alternating optimization between \(u^{\theta}_{t}\) and \(p_{t}\). Specifically, these optimization methods, which largely inspired recent variants of SB Matching (Shi et al., 2023) and our GSBM, generally obey the following recipe, _alternating_ between two stages:
+
+* Optimize the objective, in our case, (3) w.r.t. the drift \(u^{\theta}_{t}\) given fixed \(p_{t\in[0,1]}\).
+* Optimize (3) w.r.t. the marginals \(p_{t\in(0,1)}\) given the coupling \(p^{\theta}_{0,1}\) defined by \(u^{\theta}_{t}\).
+
+Notice particularly that the optimization posed in Stage 1 resembles the matching algorithms in Sec. 2. We make the connection concrete in the following proposition:
+
+**Proposition 1** (Stage 1).: _The unique minimizer to Stage 1 coincides with \(\nabla s^{*}_{t}(X_{t})\)._
+
+This may seem counter-intuitive at first glance, both the kinetic energy and \(V_{t}\) show up in (3). This is due to the fact that \(u^{\theta}_{t}\) no longer affects the value of \(\mathbb{E}_{p_{t}}[V_{t}(X_{t})]\) once \(p_{t}\) is fixed, and out of all \(u^{\theta}_{t}\) whose probability density matches \(p_{t}\), the gradient field is the unique minimizer of kinetic energy.3 We emphasize that the role of Stage 1 is to learn a \(u^{\theta}_{t}\) given the prescribed \(p_{t}\) and provides a better coupling \(p^{\theta}_{0,1}\) which is then used to refine \(p_{t}\) in Stage 2. Therefore, the explicit matching loss (5) provides just the same algorithmic purpose. Though it only upper-bounds the objective of Stage 1, its solution often converges stably from a measure-theoretic perspective (see Appendix C.1 for more explanations). In practice, we find that \(\mathcal{L}_{\text{explicit}}\) performs as effectively as \(\mathcal{L}_{\text{implicit}}\), while exhibiting significantly improved scalability, hence better suited for high-dimensional applications.
+
+Footnote 3: Notably, the absence of \(V_{t}\) in optimization was previously viewed as an issue for Sinkhorn methods aimed at solving (3) (Liu et al., 2022). Yet, in GSBM, it appears naturally from how the optimization is decomposed.
+
+We now present our main result, which shows that Stage 2 of GSBM can be cast as a variational problem, where \(V_{t}\) appears through optimizing a conditional controlled process.
+
+**Proposition 2** (Stage 2; Conditional stochastic optimal control; CondSOC).: _Let the minimizer to Stage 2 be factorized by \(p_{t}(X_{t})=\int p_{t}(X_{t}|x_{0},x_{1})p^{\theta}_{0,1}(x_{0},x_{1})\text{ d}x_{0}\text{d}x_{1}\) where \(p^{\theta}_{0,1}\) is the boundary coupling induced by solving (1) with \(u^{\theta}_{t}\). Then, \(p_{t}(X_{t}|x_{0},x_{1})\equiv p_{t|0,1}\) solves :_
+
+\[\min_{u_{t|0,1}} \mathcal{J}:=\int_{0}^{1}\mathbb{E}_{p_{t}(X_{t}|x_{0},x_{1})}\left[ \frac{1}{2}\|u_{t}(X_{t}|x_{0},x_{1})\|^{2}+V_{t}(X_{t})\right]\text{d}t \tag{6a}\] \[s.t.\ \text{d}X_{t}=u_{t}(X_{t}|x_{0},x_{1})\text{d}t+\sigma\text{d }W_{t},\quad X_{0}=x_{0},\ \ X_{1}=x_{1} \tag{6b}\]
+
+Note that (6) differs from (3) only in the boundary conditions, where the original distributions \(\mu,\nu\) are replaced by the two end-points \((x_{0},x_{1})\) drawn from the coupling induced by \(u^{\theta}_{t}\). Generally, the solution to (6) is not known in closed form, except in special cases. In Lemma 3, we show such a case when \(V(x)\) is quadratic and \(\sigma{>}0\). Note that as \(V(x)\) vanishes, \(p_{t|0,1}\) in Lemma 3 collapses to the Brownian bridge and GSBM recovers the matching algorithm appearing in prior works (Liu, 2022; Shi et al., 2023) to approximate OT and SB, as summarized in Table 1. This suggests that our Prop. 2 directly generalizes them to nontrivial \(V_{t}\).
+
+**Lemma 3** (Analytic solution to (6) for quadratic \(V\) and \(\sigma>0\)).: _Let \(V(x):=\alpha\|\sigma x\|^{2}\), \(\alpha,\sigma>0\), then the optimal solution to (6) follows a Gaussian path \(X^{*}_{t}\sim\mathcal{N}(c_{t}x_{0}+e_{t}x_{1},\gamma^{*}_{t}\mathbf{I}_{t})\), where_
+
+\[c_{t}=\frac{\sinh(\eta(1{-}t))}{\sinh\eta},\ \ e_{t}=\cosh(\eta(1{-}t))-c_{t} \cosh\eta,\ \ \gamma_{t}=\sigma\sqrt{\frac{\sinh(\eta(1{-}t))}{\eta}}e_{t},\ \ \eta=\sigma\sqrt{2\alpha}.\]
+
+_These coefficients recover Brownian bridges as \(\alpha\to 0\) and, if further \(\sigma\to 0\), straight lines._
+
+\begin{table}
+\begin{tabular}{c c c} \hline \hline Method & \(V_{t}(x)\) & \(p_{t}(X_{t}|x_{0},x_{1})\) \\ \hline RecFlow & 0 & straight line \\ (\(\sigma{=}0\)) & & (Lemma 3 with \(\alpha\), \(\sigma{\to}0\)) \\ DSBM & 0 & Brownian bridge \\ (\(\sigma{=}0\)) & & (Lemma 3 with \(\alpha{\to}0\)) \\ \hline
+**GSBM** & quadratic & Lemma 3 \\ (\(\sigma{\geq}0\)) & arbitrary & Sec. 3.2 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Solutions to (6) w.r.t. different \(V_{t}\), and how they link to different methods, including Rectified flow (Liu et al., 2023b), DSBM (Shi et al., 2023), and our GSBM.
+
+### Approximate solutions to CondSOC for general nonlinear state cost
+
+We develop methods for searching the approximate solutions to CondSOC in (6), when \(V_{t}\) is neither quadratic nor degenerate. As we need to search for every pair \((x_{0},x_{1})\) drawn from \(p^{\theta}_{0,1}\), we seek efficient methods that are parallizable and simulation-free--outside of sampling from \(p^{\theta}_{0,1}\).
+
+**Gaussian path approximation.** Drawing inspirations from Lemma 3, and since the boundary conditions of (6) are simply two fixed points, we propose to approximate the solution to (6) as a Gaussian probability path pinned at \(x_{0},x_{1}\):
+
+\[p_{t}(X_{t}|x_{0},x_{1})\approx\mathcal{N}(\mu_{t},\gamma_{t}^{2}\mathbf{I}_{d}), \quad\text{s.t.}\quad\mu_{0}=x_{0},\;\;\mu_{1}=x_{1},\;\;\gamma_{0}=\gamma_{1} =0, \tag{7}\]
+
+where \(\mu_{t}\in\mathbb{R}^{d}\) and \(\gamma_{t}\in\mathbb{R}\) are respectively the time-varying mean and standard deviation. An immediate result following from (7) is a closed-form conditional drift (Sarkka and Solin, 2019) (see Appendix C.2 for the derivation):
+
+\[u_{t}(X_{t}|x_{0},x_{1})=\partial_{t}\mu_{t}+a_{t}(X_{t}-\mu_{t}),\quad\text {where}\;a_{t}:=\frac{1}{\gamma_{t}}\left(\partial_{t}\gamma_{t}-\frac{\sigma ^{2}}{2\gamma_{t}}\right). \tag{8}\]
+
+Notice that \(a_{t}\in\mathbb{R}\) is a time-varying scalar. Hence, however complex \(\mu_{t},\sigma_{t}\) may be, the underlying SDE (with the conditional drift \(u_{t}(X_{t}|x_{0},x_{1})\) in (8)) remains linear. Also note that this drift, since it is a gradient field, is the kinetic optimal choice out of all drifts that generate \(p_{t}(X_{t}|x_{0},x_{1})\).
+
+**Spline optimization.** To facilitate efficient optimization, we parametrize \(\mu_{t},\sigma_{t}\) respectively as \(d\)- and \(1\)-D splines with some control points \(X_{t_{k}}\in\mathbb{R}^{d}\) and \(\gamma_{t_{k}}\in\mathbb{R}\) sampled sparsely and uniformly along the time steps \(0<t_{1}<...<t_{K}<1\):
+
+\[\mu_{t}:=\mathrm{Spline}(t;\;x_{0},\{X_{t_{k}}\},x_{1})\qquad\gamma_{t}:= \mathrm{Spline}(t;\;\gamma_{0}\!\!=\!\!0,\{\gamma_{t_{k}}\},\gamma_{1}\!\!=\! \!0). \tag{9}\]
+
+Notice that the parameterization in (9) satisfy the boundary in (7), hence remains as a feasible solution to (6b) however \(\{X_{t_{k}},\gamma_{t_{k}}\}\) change. The number of control points \(K\) is much smaller than discretization steps (\(K\!\leq\!30\) for all experiments). This significantly reduces the memory complexity compared to prior works (Liu et al., 2022), which require caching entire discretized SDEs.
+
+Alg. 3 summarizes the spline optimization, which, crucially, involves no simulation of an SDE (6b). This is because we optimize using just independent samples from \(p_{t|0,1}\), which are known in closed form. Since the CondSOC problem relaxes distributional boundary constraints to just two endpoints, our computationally efficient variational approximation holds out very well in practice. Furthermore, since we only need to optimize very few spline parameters, we did not find the need to consider amortized variational inference (Kingma and Welling, 2014). Finally, note that since we solve CondSOC for each pair \((x_{0},x_{1})\sim p^{\theta}_{0,1}\) and later marginalize to construct \(p_{t}\), we need not explicitly consider mixture solutions for \(p_{t|0,1}\), as long as we sample sufficiently many pairs of \((x_{0},x_{1})\). In practice, we initialize \(\{X_{t_{k}}\}\) from \(u^{\theta,4}_{t}\), and \(\gamma_{t_{k}}:=\sigma\sqrt{t_{k}(1-t_{k})}\) from the standard deviation of the Brownian bridge. Figure 1 demonstrates a 2D example.
+
+**Resampling using path integral theory.** In cases where the family of Gaussian probability paths is not sufficient for modeling solutions of (6), a more rigorous approach involves the path integral theory (Kappen, 2005), which provides analytic expression to the optimal density of (6) given any sampling distribution with sufficient support. We discuss this in the following proposition.
+
+Figure 1: Example of spline optimization (Alg. 3) for \(\mu_{t}\in\mathbb{R}^{2},\gamma_{t}\in\mathbb{R}\), and the resulting CondSOC (6) solution.
+
+**Proposition 4** (Path integral solution to (6)).: _Let \(r(\bar{X}|x_{0},x_{1})\) be a distribution absolutely continuous w.r.t. the Brownian motion, denoted \(q(\bar{X}|x_{0})\), where we shorthand \(\bar{X}\equiv X_{t\in[0,1]}\). Suppose \(r\) is associated with an SDE \(\mathrm{d}X_{t}=v_{t}(X_{t})\mathrm{d}t+\sigma\mathrm{d}W_{t}\), \(X_{0}\)=\(x_{0}\), \(X_{1}\)=\(x_{1}\), \(\sigma\)\(>\)\(0\). Then, the optimal, path-integral solution to (6) can be obtained via_
+
+\[p^{\star}(\bar{X}|x_{0},x_{1})=\tfrac{1}{2}\omega(\bar{X}|x_{0},x_{1})r(\bar{X }|x_{0},x_{1}), \tag{10}\]
+
+_where \(Z\) is the normalization constant and \(\omega\) is the importance weight:_
+
+\[\omega(\bar{X}|x_{0},x_{1}):=\exp\left(-\int_{0}^{1}\frac{1}{\sigma^{2}}\left( V_{t}(X_{t})+\frac{1}{2}\|v_{t}(X_{t})\|^{2}\right)\mathrm{d}t-\int_{0}^{1} \frac{1}{\sigma}v_{t}(X_{t})^{\top}\mathrm{d}W_{t}\right). \tag{11}\]
+
+In practice, \(r(\bar{X}|x_{0},x_{1})\) can be any distribution, but the closer it is to the optimal \(p^{\star}\), the lower the variance of the importance weights \(\omega\)(Kappen & Ruiz, 2016). It is therefore natural to consider using the aforementioned Gaussian probability paths as \(r(\bar{X}|x_{0},x_{1})\), properly optimized with Alg. 3, then resampled following proportional to (10)--this is equivalent in expectation to performing self-normalized importance sampling but algorithmically simpler and helps reduce variance when many samples have low weight values. While path integral resampling may make \(\mathcal{L}_{\text{explicit}}\) less suitable due to the change in the conditional drift governing \(p^{\star}(\bar{X}|x_{0},x_{1})\) from (8), we still observe empirical, sometimes significant, improvement (see Sec. 4.4). Overall, we propose path integral resampling as an optional step in our GSBM algorithm, as it requires sequential simulation.5 In practice, we also find empirically that the Gaussian probability paths alone perform sufficiently well and is easy to use at scale.
+
+Footnote 5: We note that simulation of trajectories \(\bar{X}\)\(\equiv\)\(X_{t\in[0,1]}\) from (6a,8) can be done efficiently by computing the covariance function, which requires merely solving an 1D ODE; see Appendix C.2 for a detailed explanation.
+
+### Algorithm outline & convergence analysis
+
+We summarize our GSBM in Alg. 5, which, as previously sketched in Sec. 3.1, alternates between Stage 1 (line 3) and Stage 2 (lines 4-9). In contrast to DSBM (Shi et al., 2023), which constructs analytic \(p_{i|0,1}\) and \(u_{t|0,1}\) when \(V_{t}=0\), our GSBM solves the underlying CondSOC (6) with nontrivial \(V_{t}\). We stress that these computations are easily parallelizable and admit fast converge due to our efficient parameterization, hence inducing little computational overhead (see Sec. 4.4).
+
+We note that **GSBM (Alg. 5) remains functional even when \(\sigma\)\(=\)\(0\)**, although the GSB problem (3) was originally stated with \(\sigma\)\(>\)(Chen et al., 2015). In such cases, the implicit and explicit matching still preserve \(p_{t}\) and correspond, respectively, to action (Neklyudov et al., 2023) and flow matching (Lipman et al., 2023), and CondSOC corresponds to a generalized geodesic path accounting for \(V_{t}\).
+
+Finally, we provide convergence analysis in the following theorems.
+
+**Theorem 5** (Local convergence).: _Let the intermediate result of Stage 1 and 2, after repeating \(n\) times, be \(\theta^{n}\). Then, its objective value in (3), \(\mathcal{L}(\theta^{n})\), is monotonically non-increasing as \(n\) grows:_
+
+\[\mathcal{L}(\theta^{n})\geq\mathcal{L}(\theta^{n+1}).\]
+
+**Theorem 6**.: _The optimal solution to GSB problem (3) is a fixed point of GSBM, Alg. 5._
+
+## 4 Experiment
+
+We test out GSBM on a variety of distribution matching tasks, each entailing its own state cost \(V_{t}(x)\). By default, we use the explicit matching loss (5) without path integral resampling, mainly due to its scalability, but ablate their relative performances in Sec. 4.4. Our GSBM is compared primarily to DeepGSB (Liu et al., 2022), a Sinkhorn-inspired machine learning method that outperforms existing deep methods (Ruthotto et al., 2020; Lin et al., 2021). Other details are in Appendix D.
+
+### Crowd navigation with mean-field and geometric state costs
+
+We first validate our GSBM in solving crowd navigation, a canonical example for the GSB problem (3). Specifically, we consider the following two classes of tasks (see Appendix D.1 for details):
+
+**Mean-field interactions.** These are synthetic dataset in \(\mathbb{R}^{2}\) introduced in DeepGSB, where the state cost \(V_{t}\) consists of two components: an obstacle cost that assesses the physical constraints, and an "mean-field" interaction cost between individual agents and the population density \(p_{t}\):
+
+\[V_{t}(x)=L_{\text{obstacle}}(x)+L_{\text{interact}}(x;p_{t}),\ \ L_{\text{interact}}(x;p_{t})= \left\{\begin{array}{ll}\log p_{t}(x)&\text{(entropy)}\\ \mathbb{E}_{y\sim p_{t}\left[\frac{2}{\|x-y\|^{2}+1}\right]}&\text{(congestion) }\end{array}\right.. \tag{12}\]
+
+Both entropy and congestion costs are fundamental elements of mean-field games. They measure the costs incurred for individuals to stay in densely crowded regions with high population density.
+
+**Geometric surfaces defined by LiDAR.** A more realistic scenario involves navigation through a complex geometric surface. In particular, we consider surfaces observed through LiDAR scans of Mt. Rainier (Legg & Anderson, 2013), thinned to 34,183 points (see Fig. 4). We adopt the state cost
+
+\[V(x)=L_{\text{manifold}}(x)+L_{\text{height}}(x),\ \ L_{\text{manifold}}(x)=\|\pi(x)-x\|^{2},\ \ L_{\text{height}}(x)=\exp\left(\pi^{(x)}(x)\right), \tag{13}\]
+
+where \(\pi(x)\) projects \(x\) to an approximate tangent plane fitted by a \(k\)-nearest neighbors (see Fig. 4 and Appendix D.3) and \(\pi^{(z)}(x)\) refers to the \(z\)-coordinate of \(\pi(x)\), _i.e.,_ its height.
+
+Figure 2 tracks the feasibility and optimality, measured by \(\mathcal{W}_{2}(p_{1}^{\theta},\nu)\) and (3), of three mean-field tasks (Stunnel, Vneck, GMM). On all tasks, our GSBM maintains feasible solutions throughout training while gradually improving optimality. In contrast, due to the lack of convergence analysis, training DeepGSB exhibits relative instability and occasional divergence (see Fig. 3). As for the geometric state costs, Fig. 4 demonstrates how our GSBM faithfully recovers the desired multi-modal distribution: It successfully identify two viable pathways with low state cost, one of which bypasses the saddle point. In constrast, DeepGSB generates only uni-modal distributions with samples scattered over tall mountain regions with high state cost, yielding a higher objective value (3).
+
+Figure 4: Crowd navigation over a LiDAR surface. Height is denoted by the grayscale color.
+
+### Image domain interpolation and unpaired translation
+
+Next, we consider unpaired translation between dogs and cats from AFHQ (Choi et al., 2020). We aim to explore how appropriate choices of state cost \(V_{t}\) can help encourage more natural interpolations and more semantically meaningful couplings. While the design of \(V_{t}\) itself is an interesting open question, here we exploit the geometry of a learned latent space. To this end, we use a pretrained variational autoencoder (Kingma and Welling, 2014), then define \(V_{t}\) conditioned on an interpolation of two end points (notice that \(x\) and \(z\) respectively belong to image and latent spaces):
+
+\[V_{t}(x|x_{0},x_{1})=\|x-\mathrm{Decoder}(z_{t})\|^{2},\quad z_{t}:=I(t, \mathrm{Encoder}(x_{0}),\mathrm{Encoder}(x_{1})). \tag{14}\]
+
+Though \(I(t,z_{0},z_{1})\) can be any appropriate interpolation, we find the spherical linear interpolation (Shoemake, 1985) to be particularly effective, due to the Gaussian geometry in latent space. As the high dimensionality greatly impedes DeepGSB, we mainly compare with DSBM (Shi et al., 2023), the special case of our GSBM when \(V_{t}\) is degenerate. As in DSBM, we resize images to 64\(\times\)64.
+
+Figure 5 reports the qualitative comparison between the generation processes of DSBM and our GSBM, along with their coupling during training. It is clear that, with the aid of a semantically meaningful \(V_{t}\), GSBM typically converges to near-optimal coupling early in training, and, as expected, yields more interpretable generation processes. Interestingly, despite being subject to the same noise level (\(\sigma{=}0.5\) in this case), the GSBM's generation processes are generally less noisy than DSBM. This is due to the optimization of the CondSOC problem (6) with our specific choice of \(V_{t}\). As shown in Fig. 6, the conditional density \(p_{t}(X_{t}|x_{0},x_{1})\) used in GSBM appears to eliminate unnatural artifacts observed in Brownian bridges, which rely on simple linear interpolation in pixel space. Quantitatively, our GSBM also achieves lower FID value as a measure of feasibility, as shown in Table 2. Finally, we note that the inclusion of \(V_{t}\) and the solving of CondSOC increase wallclock time by _a mere 0.5%_ compared to DSBM (see Table 5).
+
+### High-dimensional opinion depolarization
+
+Finally, we consider high-dimensional opinion depolarization, initially introduced in DeepGSB, where an opinion \(X_{t}\in\mathbb{R}^{1000}\) is influenced by a polarizing effect (Schweighofer et al., 2020) when evolving through interactions with the population (see Appendix D.2):
+
+\[\mathrm{d}X_{t}=f_{\mathrm{polarize}}(X_{t};p_{t})\mathrm{d}t+\sigma\mathrm{d} W_{t} \tag{15}\]
+
+\begin{table}
+\begin{tabular}{c c} \hline \hline DSBM & GSBM \\ \hline
+14.16 & **12.39** \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: FID values of dog\(\rightarrow\)cat for DSBM and our GSBM.
+
+Figure 5: Comparison between DSBM (Shi et al., 2023) and our GSBM on: (_leftmost 5 columns_) the generation processes and (_rightmost 3 columns_) their couplings \(p^{\theta}(X_{1}|X_{0})\) during training. By constructing \(V_{t}\) via a latent space, GSBM **improves the learnability** with **faster convergence**.
+
+Figure 6: Mean of \(p_{t}(X_{t}|x_{0},x_{1})\). Instead of using linear interpolation as in DSBM, GSBM _optimizes_\(p_{t|0,1}\) w.r.t. (6) where \(V_{t}\) is defined via a latent space, thereby exhibiting **more semantically meaningful interpolations**.
+
+Without any intervention, the opinion dynamics in (15) tend to segregate into groups with diametrically opposed views (first column of Fig. 7), as opposed to the desired unimodal distribution \(p_{1}\) (second column of Fig. 7). To adapt our GSBM for this task, we treat (15) as a base drift, specifically defining \(u_{t}^{\theta}(X_{t}):=f_{\text{polarize}}(X_{t};p_{t})+v_{t}^{\theta}(X_{t})\), and then solving the CondSOC (6) by replacing the kinetic energy with \(\int\|v_{t}^{\theta}\|^{2}\text{d}t\). Similar to DeepGSB, we consider the same congestion cost \(V_{t}\) defined in (12). As shown in Fig. 7, both DeepGSB and our GSBM demonstrate the capability to mitigate opinion segregation. However, our GSBM achieves closer proximity to the target \(p_{1}\), indicating stronger feasibility, and achieve almost half the objective value (3) relative to DeepGSB.
+
+### Discussions
+
+Effect of noise (\(\sigma\)).In the stochastic control setting (Theodorou et al., 2010), the task-specific value of \(\sigma\) plays a crucial role in representing the uncertainty from environment or the error in executing control. The optimal control thus changes drastically depending on \(\sigma\). Figure 8 demonstrates how our GSBM correctly resolves this phenomenon, on an example of the famous "drunken spider" problem discussed in Kappen (2005). In the absence of noise (\(\sigma\)=0), it is very easy to steer through the narrow passage. When large amounts of noise is present (\(\sigma\)=\(1.0\)), there is a high chance of colliding with the obstacles, so the optimal solution is to completely steer around the obstacles.
+
+Ablation study on path integral (PI) resampling.In Table 4, we ablate how the objective value changes when enabling PI resampling on different matching losses and noise \(\sigma\) and report their performance (averaged over 5 independent trails) on the Stunnel task. We observe that PI resampling tends to enhance overall performance, particularly in low noise conditions, at the expense of a slightly increased runtime of 8%. Meanwhile, as shown in Table 3, implicit matching (4) typically requires longer time overall (\(\times\)2.7 even in two dimensions), compared to its explicit counterpart.
+
+Profiling GSBM.The primary algorithmic distinction between our GSBM and previous SB matching methods (Shi et al., 2023; Peluchetti, 2023) lies in how \(p_{t|0,1}\) and \(u_{t|0,1}\) are computed (see Lemma 3), where GSBM involves solving an additional CondSOC problem, _i.e.,_ lines 5-6 in Alg. 5. Table 5 suggests that these computations, uniquely attached to GSBM, induce little computational overhead compared to other components in Alg. 5. This computational efficiency is due to our efficient variational approximation admitting simulation-free, parallelizable optimization.
+
+## 5 Conclusion and limitation
+
+We developed GSBM, a new matching algorithm that provides approximate solutions to the Generalized Schrodinger Bridge (GSB) problems. We demonstrated strong capabilities of GSBM over prior methods in solving crowd navigation, opinion modeling, and interpretable domain transfer. It should be noticed that GSBM requires differentiability of \(V_{t}\) and relies on the quadratic control cost to establish its convergence analysis, which, despite notably improving over prior methods, remains as necessary conditions. We acknowledge these limitations and leave them for future works.
+
+\begin{table}
+\begin{tabular}{l r r r} \hline \hline  & \(\sigma=0.5\) & \(1.0\) & \(2.0\) \\ \hline \(\mathcal{L}_{\text{explicit}}\) & \(-44.6\pm 5.9\) & \(-5.2\pm 2.6\) & \(1.5\pm 3.5\) \\ \(\mathcal{L}_{\text{implicit}}\) & \(-112.4\pm 53.7\) & \(-2.0\pm 8.0\) & \(-0.7\pm 6.0\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: How the objective value (3) changes when enabling PI resampling on each matching loss and \(\sigma\) in Stunnel. Performance is improved by deceasing (\(-\)) the objective values.
+
+Figure 8: Our GSBM reveals how the optimal solution drastically changes w.r.t. the levels of noise (\(\sigma\)) when navigating through a narrow passway surrounded by the obstacles (shown in gray).
+
+\begin{table}
+\begin{tabular}{l r r} \hline \hline  & \(\mathcal{L}_{\text{explicit}}\) & \(\mathcal{L}_{\text{implicit}}\) \\ \hline without PI & 100\% & 276\% \\ with PI & 108\% & 284\% \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Percentage of time spent in different stages of Alg. 5, measured on the AFHQ task.
+
+## References
+
+* Albergo & Vanden-Eijnden (2023) Michael S Albergo and Eric Vanden-Eijnden. Building normalizing flows with stochastic interpolants. In _International Conference on Learning Representations (ICLR)_, 2023.
+* Albergo et al. (2023) Michael S Albergo, Nicholas M Boffi, and Eric Vanden-Eijnden. Stochastic interpolants: A unifying framework for flows and diffusions. _arXiv preprint arXiv:2303.08797_, 2023.
+* Ambrosio et al. (2008) Luigi Ambrosio, Nicola Gigli, and Giuseppe Savare. _Gradient flows: In metric spaces and in the space of probability measures_. Springer Science & Business Media, 2008.
+* Anderson (1982) Brian DO Anderson. Reverse-time diffusion equation models. _Stochastic Processes and their Applications_, 12(3):313-326, 1982.
+* Chen & Lipman (2023) Ricky T. Q. Chen and Yaron Lipman. Riemannian flow matching on general geometries. _arXiv preprint arXiv:2302.03660_, 2023.
+* Chen et al. (2018) Ricky T. Q. Chen, Yulia Rubanova, Jesse Bettencourt, and David K Duvenaud. Neural ordinary differential equations. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2018.
+* Chen et al. (2022) Tianrong Chen, Guan-Horng Liu, and Evangelos A Theodorou. Likelihood training of Schrodinger bridge using forward-backward SDEs theory. In _International Conference on Learning Representations (ICLR)_, 2022.
+* Chen (2023) Yongxin Chen. Density control of interacting agent systems. _IEEE Transactions on Automatic Control_, 2023.
+* Chen & Georgiou (2015) Yongxin Chen and Tryphon Georgiou. Stochastic bridges of linear systems. _IEEE Transactions on Automatic Control_, 61(2):526-531, 2015.
+* Chen et al. (2015) Yongxin Chen, Tryphon Georgiou, and Michele Pavon. Optimal steering of inertial particles diffusing anisotropically with losses. In _American Control Conference (ACC)_. IEEE, 2015.
+* Choi et al. (2020) Yunjey Choi, Youngjung Uh, Jaejun Yoo, and Jung-Woo Ha. Stargan v2: Diverse image synthesis for multiple domains. In _IEEE Conference on Computer Vision and Pattern Recognition (CVPR)_, 2020.
+* Cuturi (2013) Marco Cuturi. Sinkhorn distances: Lightspeed computation of optimal transport. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2013.
+* Cuturi et al. (2023) Marco Cuturi, Michal Klein, and Pierre Ablin. Monge, Bregman and Occam: Interpretable optimal transport in high-dimensions with feature-sparse maps. In _International Conference on Machine Learning (ICML)_, 2023.
+* De Bortoli et al. (2021) Valentin De Bortoli, James Thornton, Jeremy Heng, and Arnaud Doucet. Diffusion Schrodinger bridge with applications to score-based generative modeling. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2021.
+* Dhariwal & Nichol (2021) Prafulla Dhariwal and Alex Nichol. Diffusion models beat GANs on image synthesis. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2021.
+* Marino et al. (2017) Simone Di Marino, Augusto Gerolin, and Luca Nenna. Optimal transportation theory with repulsive costs. _Topological optimization and optimal transport_, 17:204-256, 2017.
+* Fortet (1940) Robert Fortet. Resolution d'un systeme d'equations de M. Schrodinger. _Journal de Mathematiques Pures et Appliquees_, 19(1-4):83-105, 1940.
+* Gaitonde et al. (2021) Jason Gaitonde, Jon Kleinberg, and Eva Tardos. Polarization in geometric opinion dynamics. In _ACM Conference on Economics and Computation_, pp. 499-519, 2021.
+* Higgins et al. (2016) Irina Higgins, Loic Matthey, Arka Pal, Christopher Burgess, Xavier Glorot, Matthew Botvinick, Shakir Mohamed, and Alexander Lerchner. \(\beta\)-vae: Learning basic visual concepts with a constrained variational framework. In _International Conference on Learning Representations (ICLR)_, 2016.
+
+* Hutchinson (1989) Michael F Hutchinson. A stochastic estimator of the trace of the influence matrix for Laplacian smoothing splines. _Communications in Statistics-Simulation and Computation_, 18(3):1059-1076, 1989.
+* Ito (1951) Kiyosi Ito. _On stochastic differential equations_, volume 4. American Mathematical Soc., 1951.
+* Kappen (2005) Hilbert J Kappen. Path integrals and symmetry breaking for optimal control theory. _Journal of Statistical Mechanics: Theory and Experiment_, 2005(11):P11011, 2005.
+* Kappen and Ruiz (2016) Hilbert Johan Kappen and Hans Christian Ruiz. Adaptive importance sampling for control and inference. _Journal of Statistical Physics_, 162(5):1244-1266, 2016.
+* Kingma and Welling (2014) Diederik P Kingma and Max Welling. Auto-Encoding variational bayes. In _International Conference on Learning Representations (ICLR)_, 2014.
+* Koshizuka and Sato (2023) Takeshi Koshizuka and Issei Sato. Neural Lagrangian Schrodinger bridge: Diffusion modeling for population dynamics. In _International Conference on Learning Representations (ICLR)_, 2023.
+* Legg and Anderson (2013) Nicholas Legg and Scott Anderson. Southwest Flank of Mt.Rainier, WA, 2013. URL [https://opentopography.org/meta/OT.052013.26910.1](https://opentopography.org/meta/OT.052013.26910.1). Accessed on 2023-09-12.
+* Leonard (2013) Christian Leonard. A survey of the Schrodinger problem and some of its connections with optimal transport. _Discrete and Continuous Dynamical Systems_, 2013.
+* Leonard et al. (2014) Christian Leonard, Sylvie Roelly, and Jean-Claude Zambrini. Reciprocal processes. A measure-theoretical point of view. _Probability Surveys_, 2014.
+* Levin (1998) David Levin. The approximation power of moving least-squares. _Mathematics of Computation_, 67(224):1517-1531, 1998.
+* Levine (2018) Sergey Levine. Reinforcement learning and control as probabilistic inference: Tutorial and review. _arXiv preprint arXiv:1805.00909_, 2018.
+* Li et al. (2020) Xuechen Li, Ting-Kam Leonard Wong, Ricky T. Q. Chen, and David Duvenaud. Scalable gradients for stochastic differential equations. In _International Conference on Artificial Intelligence and Statistics (AISTATS)_, 2020.
+* Lin et al. (2021) Alex Tong Lin, Samy Wu Fung, Wuchen Li, Levon Nurbekyan, and Stanley J Osher. Alternating the population and control neural networks to solve high-dimensional stochastic mean-field games. _Proceedings of the National Academy of Sciences_, 118(31), 2021.
+* Lipman et al. (2023) Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le. Flow matching for generative modeling. In _International Conference on Learning Representations (ICLR)_, 2023.
+* Liu et al. (2022) Guan-Horng Liu, Tianrong Chen, Oswin So, and Evangelos A Theodorou. Deep generalized Schrodinger bridge. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2022.
+* Liu et al. (2023a) Guan-Horng Liu, Arash Vahdat, De-An Huang, Evangelos A Theodorou, Weili Nie, and Anima Anandkumar. I\({}^{2}\)SB: Image-to-Image Schrodinger bridge. In _International Conference on Machine Learning (ICML)_, 2023a.
+* Liu (2022) Qiang Liu. Rectified flow: A marginal preserving approach to optimal transport. _arXiv preprint arXiv:2209.14577_, 2022.
+* Liu et al. (2023b) Xingchao Liu, Chengyue Gong, and Qiang Liu. Flow straight and fast: Learning to generate and transfer data with rectified flow. In _International Conference on Learning Representations (ICLR)_, 2023b.
+* Liu et al. (2018) Zhiyu Liu, Bo Wu, and Hai Lin. A mean field game approach to swarming robots control. In _American Control Conference (ACC)_. IEEE, 2018.
+* Loshchilov and Hutter (2019) Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In _International Conference on Learning Representations (ICLR)_, 2019.
+
+* Mazzolo and Monthus (2022) Alain Mazzolo and Cecile Monthus. Conditioning diffusion processes with killing rates. _Journal of Statistical Mechanics: Theory and Experiment_, 2022(8):083207, 2022.
+* Neklyudov et al. (2023) Kirill Neklyudov, Daniel Severo, and Alireza Makhzani. Action matching: A variational method for learning stochastic dynamics from samples. In _International Conference on Machine Learning (ICML)_, 2023.
+* Noe et al. (2020) Frank Noe, Alexandre Tkatchenko, Klaus-Robert Muller, and Cecilia Clementi. Machine learning for molecular simulation. _Annual Review of Physical Chemistry_, 71:361-390, 2020.
+* Okada and Taniguchi (2020) Masashi Okada and Tadahiro Taniguchi. Variational inference mpc for bayesian model-based reinforcement learning. In _Conference on Robot Learning (CoRL)_, 2020.
+* Pardoux and Peng (2005) Etienne Pardoux and Shige Peng. Backward stochastic differential equations and quasilinear parabolic partial differential equations. In _Stochastic Partial Differential Equations and Their Applications_. Springer, 2005.
+* Paszke et al. (2019) Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-performance deep learning library. In _Advances in neural information processing systems_, pp. 8026-8037, 2019.
+* Peluchetti (2022) Stefano Peluchetti. Non-Denoising forward-time diffusions, 2022. URL [https://openreview.net/forum?id=0VfIKuhgfC](https://openreview.net/forum?id=0VfIKuhgfC).
+* Peluchetti (2023) Stefano Peluchetti. Diffusion bridge mixture transports, Schrodinger bridge problems and generative modeling. _arXiv preprint arXiv:2304.00917_, 2023.
+* Peyre and Cuturi (2017) Gabriel Peyre and Marco Cuturi. Computational optimal transport. _Center for Research in Economics and Statistics Working Papers_, 2017.
+* Peyre and Cuturi (2019) Gabriel Peyre and Marco Cuturi. Computational optimal transport: With applications to data science. _Foundations and Trends(r) in Machine Learning_, 11(5-6):355-607, 2019.
+* Philippidis et al. (1979) Chris Philippidis, Chris Dewdney, and Basil J Hiley. Quantum interference and the quantum potential. _Nuovo Cimento B_, 52(1):15-28, 1979.
+* Rawlik et al. (2013) Konrad Rawlik, Marc Toussaint, and Sethu Vijayakumar. On stochastic optimal control and reinforcement learning by approximate inference. In _International Joint Conference on Artificial Intelligence (IJCAI)_, 2013.
+* Risken (1996) Hannes Risken. Fokker-Planck equation. In _The Fokker-Planck Equation_, pp. 63-95. Springer, 1996.
+* Ronneberger et al. (2015) Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-Net: Convolutional networks for biomedical image segmentation. In _International Conference on Medical Image Computing and Computer-assisted Intervention_. Springer, 2015.
+* Ruthotto et al. (2020) Lars Ruthotto, Stanley J Osher, Wuchen Li, Levon Nurbekyan, and Samy Wu Fung. A machine learning framework for solving high-dimensional mean field game and mean field control problems. _Proceedings of the National Academy of Sciences_, 117(17):9183-9193, 2020.
+* Sarkka and Solin (2019) Simo Sarkka and Arno Solin. _Applied stochastic differential equations_, volume 10. Cambridge University Press, 2019.
+* Schrodinger (1931) Erwin Schrodinger. _Uber die Umkehrung der Naturgesetze_, volume IX. Sitzungsberichte der Preuss Akad. Wissen. Phys. Math. Klasse, Sonderausgabe, 1931.
+* Schweighofer et al. (2020) Simon Schweighofer, David Garcia, and Frank Schweitzer. An agent-based model of multi-dimensional opinion dynamics and opinion alignment. _Chaos: An Interdisciplinary Journal of Nonlinear Science_, 30(9):093139, 2020.
+* Shaul et al. (2023) Neta Shaul, Ricky T. Q. Chen, Maximilian Nickel, Matthew Le, and Yaron Lipman. On kinetic optimal probability paths for generative models. In _International Conference on Machine Learning (ICML)_, 2023.
+
+* Shi et al. (2023) Yuyang Shi, Valentin De Bortoli, Andrew Campbell, and Arnaud Doucet. Diffusion Schrodinger bridge matching. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2023.
+* Shoemake (1985) Ken Shoemake. Animating rotation with quaternion curves. In _Conference on Computer Graphics and Interactive Techniques_, 1985.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In _International Conference on Machine Learning (ICML)_, 2015.
+* Song et al. (2021) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. In _International Conference on Learning Representations (ICLR)_, 2021.
+* Theodorou (2015) Evangelos Theodorou. Nonlinear stochastic control and information theoretic dualities: Connections, interdependencies and thermodynamic interpretations. _Entropy_, 17(5):3352-3375, 2015.
+* Theodorou et al. (2010) Evangelos Theodorou, Jonas Buchli, and Stefan Schaal. A generalized path integral control approach to reinforcement learning. _Journal of Machine Learning Research (JMLR)_, 11(Nov):3137-3181, 2010.
+* Todorov (2007) Emanuel Todorov. Linearly-solvable Markov decision problems. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2007.
+* Tong et al. (2023) Alexander Tong, Nikolay Malkin, Guillaume Huguet, Yanlei Zhang, Jarrid Rector-Brooks, Kilian Fatras, Guy Wolf, and Yoshua Bengio. Improving and generalizing flow-based generative models with minibatch optimal transport. In _International Conference on Machine Learning (ICML), Workshop Track_, 2023.
+* Vargas et al. (2021) Francisco Vargas, Pierre Thodoroff, Neil D Lawrence, and Austen Lamacraft. Solving Schrodinger bridges via maximum likelihood. _Entropy_, 2021.
+* Villani et al. (2009) Cedric Villani et al. _Optimal transport: Old and new_, volume 338. Springer, 2009.
+* Wang & Deng (2018) Mei Wang and Weihong Deng. Deep visual domain adaptation: A survey. _Neurocomputing_, 312:135-153, 2018.
+* Wendland (2004) Holger Wendland. _Scattered data approximation_, volume 17. Cambridge university press, 2004.
+* Yong & Zhou (1999) Jiongmin Yong and Xun Yu Zhou. _Stochastic controls: Hamiltonian systems and HJB equations_, volume 43. Springer Science & Business Media, 1999.
+* Zhu et al. (2017) Jun-Yan Zhu, Taesung Park, Phillip Isola, and Alexei A Efros. Unpaired image-to-image translation using cycle-consistent adversarial networks. In _Proceedings of the IEEE international conference on computer vision_, pp. 2223-2232, 2017.
+
+A Reviews on stochastic optimal control and related works
+
+Solving Generalized Schrodinger bridge by reframing as stochastic optimal controlThe solution to a Generalized Schrodinger Bridge (GSB) problem (3) can also be expressed as the solution a stochastic optimal control (SOC) problem, typically structured as
+
+\[\min_{u_{t}(\cdot)}\int_{0}^{1}\mathbb{E}_{p_{t}}\left[\frac{1}{2} \|u_{t}(X_{t})\|^{2}+V_{t}(X_{t})\right]\mathrm{d}t+\mathbb{E}_{p_{1}}\left[ \phi(X_{1})\right], \tag{16a}\] \[\text{s.t.}\;\mathrm{d}X_{t}=u_{t}(X_{t})\mathrm{d}t+\sigma\mathrm{d}W_{t},\quad X_{0}\sim\mu, \tag{16b}\]
+
+where we see that the terminal distribution "hard constraint" in GSB (3) is instead relaxed into a soft "terminal cost" \(\phi(\cdot):\mathbb{R}^{d}\to\mathbb{R}\). Problems with the forms of either (16) or (3) are known to be tied to linearly-solvable Markov decision processes (Todorov, 2007; Rawlik et al., 2013), corresponding to a _trackable_ class of SOC problems whose optimality conditions--the Hamilton-Jacobi-Bellman equations--amt efficient approximation. This is attributed to the presence of the \(\ell_{2}\)-norm control cost, which can be interpreted as the KL divergence between controlled and uncontrolled processes. The interpretation bridges the SOC problems to probabilistic inference (Levine, 2018; Okada and Taniguchi, 2020), from which machine learning algorithms, such as our GSBM, can be developed.
+
+However, naively transforming GSB problems (3) into SOC problems can introduce many potential issues. The design of the terminal cost is extremely important, and in many cases, it is an _intractable cost function_ as we do not have access to the densities \(\mu\) and \(\nu\). Prior works have mainly stuck to simple terminal costs (Ruthotto et al., 2020), using biased approximations based on batch estimates (Koshizuka and Sato, 2023), or using an adversarial approach to learn the cost function (Zhu et al., 2017; Lin et al., 2021). Furthermore, this approach will necessitate differentiating through an SDE simulation, requiring _high memory usage_. Though memory-efficient adjoint methods have been developed (Chen et al., 2018; Li et al., 2020), they remain _computationally expensive_ to use at scale.
+
+In contrast, our GBSM approach only requires samples from \(\mu\) and \(\nu\). By enforcing boundary distributions as a hard constraint instead of a soft one, our algorithm finds solutions that satisfy feasibility much better in practice. This further allows us to consider higher dimensional problems without the need to introduce additional hyperparameters for tuning a terminal cost. Finally, our algorithm drastically reduces the number of SDE simulations required, as both the matching algorithm (Stage 1) and the CondSOC variational formulation (Stage 2) of GSBM can be done simulation-free.
+
+Comparison to related worksTable 6 compares to prior learning based methods that also provide approximate solutions to (3) to our GSBM. Meanwhile, Fig. 9 summarizes different classes of matching algorithms.
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline  & **Fe**asibility (2) & Requirement from distributions \(\mu,\nu\) & Convergence analysis & Dimension \(d\) \\ \hline NLSB (Koshizuka and Sato, 2023) & ✗(relaxed) & samples \& densities & ✓(local) & 5 \\ DeepGSB (Liu et al., 2022) & \(\approx\)**F** only in limit & samples \& densities & ✗ & 1000 \\ \hline
+**GSBM** (this work) & \(\approx\)**F** & only samples & ✓(local) & \(\gtrsim\) 12K \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Our **GSBM** features better feasibility, requires only samples from \(\mu,\nu\), has local convergence analysis, and exhibits much better scalability.
+
+Figure 9: Summary of different matching algorithms. Notice that OT and SB are w.r.t. \(\ell_{2}\) costs.
+
+Proofs
+
+**Proposition 1** (Stage 1).: _The unique minimizer to Stage 1 coincides with \(\nabla s_{t}^{*}(X_{t})\)._
+
+Proof.: By keeping \(p_{t}\) fixed in (3), the value of \(\mathbb{E}_{p_{t}}[V_{t}(X_{t})]\) no longer relies on \(u_{t}^{\theta}\), rendering (3) the same optimization problem as in the implicit matching; see (4) and Sec. 2. As the implicit matching (4) admits a unique minimizer \(\nabla s_{t}^{*}\), we conclude the proof. 
+
+**Proposition 2** (Stage 2; Conditional stochastic optimal control; CondSOC).: _Let the minimizer to Stage 2 be factorized by \(p_{t}(X_{t})=\int p_{t}(X_{t}|x_{0},x_{1})p_{0,1}^{\theta}(x_{0},x_{1})\text{d}x _{0}\text{d}x_{1}\) where \(p_{0,1}^{\theta}\) is the boundary coupling induced by solving (1) with \(u_{t}^{\theta}\). Then, \(p_{t}(X_{t}|x_{0},x_{1})\equiv p_{t|0,1}\) solves :_
+
+\[\min_{u_{t|0,1}}\mathcal{J} :=\int_{0}^{1}\mathbb{E}_{p_{t}(X_{t}|x_{0},x_{1})}\left[\frac{1} {2}\|u_{t}(X_{t}|x_{0},x_{1})\|^{2}+V_{t}(X_{t})\right]\text{d}t \tag{6a}\] \[\text{s.t.}\ \text{d}X_{t} =u_{t}(X_{t}|x_{0},x_{1})\text{d}t+\sigma\text{d}W_{t},\quad X_{0 }=x_{0},\ \ X_{1}=x_{1} \tag{6b}\]
+
+Proof.: Let us recall the GSB problem (3) in the form of FPE constraint (2):
+
+\[\min_{u_{t}}\int_{0}^{1}\mathbb{E}_{p_{t}}\left[\frac{1}{2}\|u_{t }(X_{t})\|^{2}+V_{t}(X_{t})\right]\text{d}t \tag{17a}\] \[\text{s.t.}\ \frac{\partial}{\partial t}p_{t}(X_{t})= -\nabla\cdot\left(u_{t}(X_{t})\,p_{t}(X_{t})\right)+\frac{\sigma^{ 2}}{2}\Delta p_{t}(X_{t}),\quad p_{0}=\mu,p_{1}=\nu. \tag{17b}\]
+
+Under mild regularity assumptions (Anderson, 1982; Yong & Zhou, 1999) such that Leibniz rule and Fubini's Theorem apply, we can separate \(p_{0,1}\)--as it is assumed to be fixed--out of the marginal \(p_{t}\). Specifically, the objective value (17a) can be decomposed into
+
+\[\int_{0}^{1}\mathbb{E}_{p_{t}}\left[\frac{1}{2}\|u_{t}\|^{2}+V_{ t}\right]\text{d}t =\int_{0}^{1}\int p_{0,1}p_{t|0,1}\left[\frac{1}{2}\|u_{t}\|^{2}+V _{t}\right]\text{d}x_{0,1}\text{d}t\] \[=\mathbb{E}_{p_{0,1}}\left[\int_{0}^{1}\mathbb{E}_{p_{t|0,1}} \left(\frac{1}{2}\|u_{t}\|^{2}+V_{t}\right)\text{d}t\right],\quad\text{by Fubini's Theorem}\]
+
+which recovers (6a). Similarly, each term in the FPE (17b) can be decomposed into
+
+\[\frac{\partial}{\partial t}p_{t}(X_{t}) =\frac{\partial}{\partial t}\int p_{t}(X_{t}|x_{0},x_{1})p_{0,1} (x_{0},x_{1})\text{d}x_{0,1}=\mathbb{E}_{p_{0,1}}\left[\frac{\partial}{ \partial t}p_{t|0,1}\right],\] \[\nabla\cdot\left(u_{t}(X_{t})\,p_{t}(X_{t})\right) =\nabla\cdot\left(u_{t}(X_{t})\int p_{t}(X_{t}|x_{0},x_{1})p_{0,1 }(x_{0},x_{1})\text{d}x_{0,1}\right)\] \[=\nabla\cdot\left(\int u_{t}(X_{t})p_{t}(X_{t}|x_{0},x_{1})p_{0, 1}(x_{0},x_{1})\text{d}x_{0,1}\right)\] \[=\mathbb{E}_{p_{0,1}}\left[\nabla\cdot\left(u_{t}\,p_{t|0,1} \right)\right],\] \[\Delta p_{t}(X_{t}) =\nabla\cdot\left(\nabla p_{t}(X_{t})\right)\] \[=\nabla\cdot\left(\nabla\int p_{t}(X_{t}|x_{0},x_{1})p_{0,1}(x_{ 0},x_{1})\text{d}x_{0,1}\right)\] \[=\mathbb{E}_{p_{0,1}}\left[\nabla\cdot\nabla p_{t|0,1}\right]\] \[=\mathbb{E}_{p_{0,1}}\left[\Delta p_{t|0,1}\right],\]
+
+and, finally, \(p_{0}(x_{0})=\mathbb{E}_{p_{0,1}}[\delta_{x_{0}}(x)]\) and \(p_{1}(x_{1})=\mathbb{E}_{p_{0,1}}[\delta_{x_{1}}(x)]\). Collecting all related terms yields:
+
+\[\frac{\partial}{\partial t}p_{t|0,1}=-\nabla\cdot\left(u_{t}\,p_{t|0,1} \right)+\Delta p_{t|0,1},\quad p_{0}=\delta_{x_{0}},p_{1}=\delta_{x_{1}},\]
+
+which is equivalent to the conditional SDE in (6b).
+
+**Remark** (PDE interpretation of Proposition 2 and (6)).: The optimal control to (6) is given by \(u_{t}^{*}(X_{t}|x_{0},x_{1})=\sigma^{2}\nabla\log\Psi_{t}(X_{t}|x_{1})\), where the time-varying potential \(\Psi_{t}(X_{t}|x_{1})\) solves a partial differential equation (PDE) known as the Hamilton-Jacobi-Bellman (HJB) PDE:
+
+\[\frac{\partial}{\partial t}\Psi_{t}(x|x_{1})=-\frac{1}{2}\sigma^{2}\Delta\Psi_{ t}(x|x_{1})+V_{t}(x)\Psi_{t}(x|x_{1}),\quad\Psi_{1}(x|x_{1})=\delta_{x_{1}}(x). \tag{18}\]
+
+In general, (18) lacks closed-form solutions, except in specific instances. For example, when \(V\) is quadratic, the solution is provided in (19). Additionally, when \(V\) is degenerate, (18) simplifies to a heat kernel, and its solution corresponds to the drift of the Brownian bridge utilized in DSBM (Shi et al., 2023). Otherwise, one can approximate its solution with the aid of path-integral theory, as shown in Prop. 4).
+
+**Lemma 3** (Analytic solution to (6) for quadratic \(V\) and \(\sigma>0\)).: _Let \(V(x):=\alpha\|\sigma x\|^{2}\), \(\alpha,\sigma>0\), then the optimal solution to (6) follows a Gaussian path \(X_{t}^{*}\sim\mathcal{N}(c_{t}x_{0}+e_{t}x_{1},\gamma_{t}^{2}\mathbf{I}_{d})\), where_
+
+\[c_{t}=\frac{\sinh(\eta(1{-}t))}{\sinh\eta},\ \ e_{t}=\cosh(\eta(1{-}t))-c_{t} \cosh\eta,\ \ \gamma_{t}=\sigma\sqrt{\frac{\sinh(\eta(1{-}t))}{\eta}}e_{t},\ \ \eta=\sigma\sqrt{2\alpha}.\]
+
+_These coefficients recover Brownian bridges as \(\alpha\to 0\) and, if further \(\sigma\to 0\), straight lines._
+
+Proof.: This is a direct consequence of conditioned diffusion processes with quadratic killing rates (Mazzolo and Monthus, 2022). Specifically, Mazzolo and Monthus (2022, Eq. (84)) give the analytic expression to the optimal control of (6), when \(V_{t}:=\alpha\|\sigma x\|^{2}\):
+
+\[u_{t}(X_{t}|x_{0},x_{1})=\frac{\eta}{\sinh(\eta(1{-}t))}x_{1}-\frac{\eta}{ \tanh(\eta(1{-}t))}X_{t},\quad\eta:=\sigma\sqrt{2\alpha}. \tag{19}\]
+
+As (19) suggests a linear SDE, its mean \(\mu_{t}\in\mathbb{R}^{d}\) solves an ODE (Sarkka and Solin, 2019):
+
+\[\frac{\mathrm{d}\mu_{t}}{\mathrm{d}t}=\frac{\eta}{\sinh(\eta(1{-}t))}x_{1}- \frac{\eta}{\tanh(\eta(1{-}t))}\mu_{t}\]
+
+whose analytic solution is given by
+
+\[\mu_{t}=\frac{x_{1}\int_{0}^{t}\left(\frac{\eta g_{t}}{\sinh(\eta(1{-}\tau))} \right)\mathrm{d}\tau+K}{g_{t}}, \tag{20}\]
+
+where \(K\) depends on the initial condition and
+
+\[g_{t}:=\exp\left(\int_{0}^{t}\frac{\eta}{\tanh(\eta(1{-}\tau))}\mathrm{d}\tau \right)\stackrel{{(*)}}{{=}}\exp\left([\ln v_{\tau}]_{\sinh(\eta( 1{-}t))}^{\sinh\eta}\right)=\frac{\sinh\eta}{\sinh(\eta(1{-}t))}.\]
+
+Note that \((*)\) is due to change of variable \(v_{\tau}:=\sinh(\eta(1{-}\tau))\). Substituting \(g_{t}\) back to (20), and noticing that \(x_{0}=\mu_{0}=\frac{x_{1}\int_{0}^{t}K}{1}=K\), yields the desired coefficients:
+
+\[\mu_{t}=c_{t}x_{0}+e_{t}x_{1},\quad c_{t}=\frac{\sinh(\eta(1{-}t))}{\sinh\eta },\quad e_{t}=\cosh(\eta(1{-}t))-c_{t}\cosh\eta. \tag{21}\]
+
+Similarly, the variance \(\Sigma_{t}\in\mathbb{R}^{d{\times}d}\) of the SDE in (19) solves an ODE
+
+\[\frac{\mathrm{d}\Sigma_{t}}{\mathrm{d}t}=-\frac{2\eta}{\tanh(\eta(1{-}t))} \Sigma_{t}+\sigma^{2}\mathbf{I}_{d}.\]
+
+Repeating similar derivation, as in solving \(\mu_{t}\), leads to
+
+\[\Sigma_{t}=\frac{\sigma^{2}}{\eta}\sinh^{2}(\eta(1{-}t))\left(\coth(\eta(1{-}t) )-\coth\eta\right)\mathbf{I}_{d}=\frac{\sigma^{2}}{\eta}\sinh(\eta(1{-}t))e_{t} \mathbf{I}_{d}. \tag{22}\]
+
+which gives the desired \(\gamma_{t}\) since \(\Sigma_{t}=\gamma_{t}^{2}\mathbf{I}_{d}\).
+
+We now show how these coefficients (21) and (22) recover Brownian bridge as \(\alpha\) or, equivalently, \(\eta:=\sigma\sqrt{2\alpha}\) approaches the zero limit.
+
+\[\lim_{\eta\to 0}c_{t} =\lim_{\eta\to 0}\frac{e^{\eta(1{-}t)}-e^{-\eta(1{-}t)}}{e^{\eta}-e^{ \eta}}\stackrel{{(*)}}{{=}}\frac{1+\eta(1{-}t)-(1-\eta(1{-}t))} {1+\eta-(1-\eta)}=1-t,\] \[\lim_{\eta\to 0}e_{t} =\lim_{\eta\to 0}\left(\cosh(\eta(1{-}t))-c_{t}\cosh\eta\right)=1-(1 -t)\cdot 1=t,\] \[\lim_{\eta\to 0}\gamma_{t} =\lim_{\eta\to 0}\sigma\sqrt{\frac{\sinh(\eta(1{-}t))}{\eta}}e_{t} \stackrel{{(**)}}{{=}}\sigma\sqrt{(1-t)t},\]where \((*)\) and \((**)\) are respectively due to \(\exp(x)\approx 1+x\) and
+
+\[\lim_{\eta\to 0}\frac{\sinh(\eta(1{-}t))}{\eta}=\lim_{\eta\to 0}\frac{e^{\eta(1{-}t)}-e^{- \eta(1{-}t)}}{2\eta}\stackrel{{(*)}}{{=}}\frac{1+\eta(1{-}t)-(1- \eta(1{-}t))}{2\eta}=1-t.\]
+
+Hence, we recover the analytic solution to Brownian bridge. It can be readily seen that, if further \(\sigma\to 0\), the solution collapses to linear interpolation between \(x_{0}\) and \(x_{1}\). 
+
+**Remark** (Lemma 3 satisfies the boundary conditions in (6b)).: One can verify that \(c_{0}=1\), \(e_{0}=0\), and \(\gamma_{0}=0\). Furthermore, we have \(c_{1}=0\), \(e_{1}=1\), and \(\gamma_{1}=0\). Hence, as expected, Lemma 3 satisfies the boundary condition in (6b).
+
+**Proposition 4** (Path integral solution to (6)).: _Let \(r(\bar{X}|x_{0},x_{1})\) be a distribution absolutely continuous w.r.t. the Brownian motion, denoted \(q(\bar{X}|x_{0})\), where we shorthand \(\bar{X}\equiv X_{t\in[0,1]}\). Suppose \(r\) is associated with an SDE \(\mathrm{d}X_{t}=v_{t}(X_{t})\mathrm{d}t+\sigma\mathrm{d}W_{t}\), \(X_{0}{=}x_{0}\), \(X_{1}{=}x_{1}\), \(\sigma{>}0\). Then, the optimal, path-integral solution to (6) can be obtained via_
+
+\[p^{*}(\bar{X}|x_{0},x_{1})=\tfrac{1}{Z}\omega(\bar{X}|x_{0},x_{1})r(\bar{X}|x_ {0},x_{1}), \tag{10}\]
+
+_where \(Z\) is the normalization constant and \(\omega\) is the importance weight:_
+
+\[\omega(\bar{X}|x_{0},x_{1}):=\exp\left(-\int_{0}^{1}\frac{1}{\sigma^{2}}\left( V_{t}(X_{t})+\frac{1}{2}\|v_{t}(X_{t})\|^{2}\right)\mathrm{d}t-\int_{0}^{1} \frac{1}{\sigma}v_{t}(X_{t})^{\top}\mathrm{d}W_{t}\right). \tag{11}\]
+
+Proof.: As the terminal boundary condition of (6b) is pinned at \(x_{1}\), we can transform (6) into:
+
+\[\min_{u_{t|0,1}}\int_{0}^{1}\mathbb{E}_{p_{t}(X_{t}|x_{0},x_{1})} \left[\frac{1}{2\sigma^{2}}\|u_{t}(X_{t}|x_{0},x_{1})\|^{2}+\frac{1}{\sigma^{ 2}}V_{t}(X_{t})\right]\mathrm{d}t-\log\mathbb{1}_{x_{1}}(X_{1}), \tag{23a}\] \[\text{s.t.}\ \mathrm{d}X_{t}=u_{t}(X_{t}|x_{0},x_{1})\mathrm{d}t+ \sigma\mathrm{d}W_{t},\quad X_{0}=x_{0} \tag{23b}\]
+
+where \(\mathbb{1}_{A}(\cdot)\) is the indicator function of the set \(\mathcal{A}\). Hence, the terminal cost "\(-\log\mathbb{1}_{x_{1}}(x)\)" vanishes at \(x=x_{1}\) but otherwise explodes. Equation (23) is a valid stochastic optimal control (SOC) problem, and its optimal solution can be obtained as the form of path integral (Kappen, 2005):
+
+\[p^{*}(\bar{X}|x_{0},x_{1})=\frac{1}{Z^{\prime}}\exp\left(-\int_{0}^{1}\frac{1 }{\sigma^{2}}V_{t}(X_{t})\ \mathrm{d}t\right)\mathbb{1}_{x_{1}}(X_{1})q(\bar{X}|x_{0}), \tag{24}\]
+
+where \(q(\cdot|x_{0})\) is the density of the Brownian motion conditioned on \(X_{0}=x_{0}\), the normalization constant \(Z^{\prime}\) is such that (24) remains as a proper distribution, and we shorthand \(\bar{X}\equiv X_{t\in[0,1]}\). We highlight that Equations (23) and (24) are essential transformation that allow us to recover the conditional distribution used in prior works (Shi et al., 2023) when \(V_{t}:=0\) (see the remark below)
+
+Directly re-weighting samples from \(q\) using (24) may have poor complexity as most samples are assigned with zero weights due to \(\mathbb{1}_{x_{1}}(\cdot)\). A more efficient alternative is to rebase the sampling distribution in (24) from \(q\) to an importance sampling \(r(\bar{X}|x_{0},x_{1})\) such that \(X_{0}=x_{0}\), \(X_{1}=x_{1}\), and is absolutely continuous with respect to \(q\). Then, the remarkable results from information-theoretic SOC (Theodorou et al., 2010; Theodorou, 2015) suggest
+
+\[p^{*}(\bar{X}|x_{0},x_{1})=\frac{1}{Z}\exp\left(-\int_{0}^{1}\frac{1}{\sigma^{ 2}}V_{t}(X_{t})\ \mathrm{d}t\right)\frac{q(\bar{X}|x_{0})}{r(\bar{X}|x_{0},x_{1})}r(\bar{X}|x _{0},x_{1}), \tag{25}\]
+
+where the Radon-Nikodym derivative \(\frac{q}{r}\) can be computed via Girsanov's theorem (Sarkka & Solin, 2019):
+
+\[\frac{q(\bar{X}|x_{0})}{r(\bar{X}|x_{0},x_{1})}=\exp\left(-\int_{0}^{1}\frac{ 1}{2\sigma^{2}}\|v_{t}(X_{t})\|^{2}\mathrm{d}t-\int_{0}^{1}\frac{1}{\sigma}v_{ t}(X_{t})^{\top}\mathrm{d}W_{t}\right). \tag{26}\]
+
+Substituting (26) back to (25) concludes the proof. 
+
+**Remark** (Equation (24) recovers Brownian bridge when \(V_{t}:=0\)).: One can verify that, when \(V_{t}:=0\), the optimal solution \(p^{*}(\bar{X}|x_{0},x_{1})\propto q(\bar{X}|x_{0})\mathbb{1}_{x_{1}}(X_{1})=q( \bar{X}|x_{0},x_{1})\) is simply the Brownian motion _conditioned_ on the end point being \(x_{1}\), which is precisely the Brownian bridge.
+
+**Theorem 5** (Local convergence).: _Let the intermediate result of Stage 1 and 2, after repeating \(n\) times, be \(\theta^{n}\). Then, its objective value in (3), \(\mathcal{L}(\theta^{n})\), is monotonically non-increasing as \(n\) grows:_
+
+\[\mathcal{L}(\theta^{n})\geq\mathcal{L}(\theta^{n+1}).\]
+
+Proof.: Let \(p_{t}^{\theta^{n}}\) and \(u_{t}^{\theta^{n}}\) be the marginal distribution and vector field, respectively, after \(n\) steps of alternating optimization according to Alg. 5, _i.e.,_\(p_{t}^{\theta^{n}}\) and \(u_{t}^{\theta^{n}}\) satisfy the FPE. Furthermore, let \(p_{0,1}^{\theta^{n}}\) and \(p_{t|0,1}^{\theta^{n}}\) be the coupling and conditional distribution, respectively, defined by \(u_{t}^{\theta^{n}}\), and let \(p_{t|0,1}^{\star}\) be the solution to CondSOC (6). This implies that the marginal distributions at step \(n+1\) are given by
+
+\[p_{t}^{\theta^{n+1}}:=\int p_{0,1}^{\theta^{n}}p_{t|0,1}^{\star}\mathrm{d}x_{0,1}. \tag{27}\]
+
+Now, under mild assumptions (Anderson, 1982; Yong & Zhou, 1999) such that all distributions approach zero at a sufficient speed as \(\|x\|\to\infty\), and that all integrands are bounded, we have (note that inputs to all functions are dropped for notational simplicity):
+
+\[\mathcal{L}(\theta^{n}) =\int\int p_{t}^{\theta^{n}}\left(\frac{1}{2}\|u_{t}^{\theta^{n} }\|^{2}+V_{t}\right)\mathrm{d}x_{t}\mathrm{d}t\] \[=\int p_{0,1}^{\theta^{n}}\bigg{[}\int\int p_{t|0,1}^{\theta^{n}} \left(\frac{1}{2}\|u_{t}^{\theta^{n}}\|^{2}+V_{t}\right)\mathrm{d}x_{t|0,1} \mathrm{d}t\bigg{]}\mathrm{d}x_{0,1}\quad\text{by Fubini's Theorem}\] \[\geq\int p_{0,1}^{\theta^{n}}\bigg{[}\int\int p_{t|0,1}^{\star} \left(\frac{1}{2}\|u_{t}^{\theta^{n}}\|^{2}+V_{t}\right)\mathrm{d}x_{t|0,1} \mathrm{d}t\bigg{]}\mathrm{d}x_{0,1}\quad\text{by optimizing (\ref{eq:p_t})}\] \[=\int\int p_{t}^{\theta^{n+1}}\left(\frac{1}{2}\|u_{t}^{\theta^{n} }\|^{2}+V_{t}\right)\mathrm{d}x_{t}\mathrm{d}t\] by Fubini's Theorem and (27) \[\geq\int\int p_{t}^{\theta^{n+1}}\left(\frac{1}{2}\|u_{t}^{\theta^ {n+1}}\|^{2}+V_{t}\right)\mathrm{d}x_{t}\mathrm{d}t \tag{28}\] \[=\mathcal{L}(\theta^{n+1}),\]
+
+where we factorize the solution of Stage 1 by \(p_{t}^{\theta^{n}}:=\int p_{0,1}^{\theta^{n}}p_{t|0,1}^{\theta^{n}}\mathrm{d}x_ {0,1}\). The inequality in (28) follows from the fact that \(u_{t}^{\theta^{n+1}}\), as the solution to the proceeding Stage 1, finds the unique minimizer that yields the same marginal as \(p_{t}^{\theta^{n+1}}\) while minimizing kinetic energy, _i.e.,_
+
+\[\int p_{t}^{\theta^{n+1}}\left\|u_{t}^{\theta^{n}}\right\|^{2}\mathrm{d}x_{t} \geq\int p_{t}^{\theta^{n+1}}\left\|u_{t}^{\theta^{n+1}}\right\|^{2}\mathrm{d} x_{t}.\]
+
+**Theorem 6**.: _The optimal solution to GSB problem (3) is a fixed point of GSBM, Alg. 5._
+
+Proof.: Let \(p_{t}^{\star}\) and \(u_{t}^{\star}\) be the optimal solution to the GSB problem in (3), and suppose \(p_{t}^{\star}:=\int p_{t|0,1}^{\star}p_{0,1}^{\star}\mathrm{d}x_{0}\mathrm{d}x _{1}\). It suffices to show that
+
+1. Given \(x_{0},x_{1}\sim p_{0,1}^{\star}\), the conditional distribution \(p_{t|0,1}^{\star}\) is the optimal solution to (6).
+2. Given \(p_{t}^{\star}\), both matching algorithms (Alg. 1 and 2) return \(u_{t}^{\star}\).
+
+The first statement follows directly from the Forward-Backward SDE (FBSDE) representation of (3), initially derived in Liu et al. (2022, Theorem 2). The FBSDE theory suggests that the (conditional) optimal control bridging any \(x_{0},x_{1}\sim p_{0,1}^{\star}\) satisfies a BSDE (Pardoux & Peng, 2005) that is uniquely associated with the HJB PDE of (6), _i.e.,_ (18). This readily implies that \(p_{t|0,1}^{\star}\) is the solution to (6).
+
+Since \(u_{t}^{\star}\) is known to be a gradient field (Liu et al., 2022, Eq. (3)), it must be with the solution returned by the implicit matching algorithm (Alg. 1), as \(\mathcal{L}_{\text{implicit}}\) returns the unique gradient field that matches \(p_{t}^{\star}\). On the other hand, since the explicit matching loss (5) can be interpreted as a Markovian projection (Shi et al., 2023), _i.e.,_ it returns the closest (in the KL sense) Markovian process to the reciprocal path measure (Leonard, 2013; Leonard et al., 2014) defined by the solution to (6). Sincethe solution to (6), as proven in the first statement, is simply \(p_{t|0,1}^{*}\), the closest Markovian process is by construction \(u_{t}^{*}\). Hence, the second statement also holds, and we conclude the proof. It is important to note that, while \(\mathcal{L}_{\text{explicit}}\) and \(\mathcal{L}_{\text{implicit}}\) do not share the same minimizer in general, they do at the equilibrium \(p_{t}^{*}\). 
+
+## Appendix C Additional derivations and discussions
+
+### Explicit matching loss
+
+How (5) preserves the prescribed \(p_{t}\).A rigorous derivation of (5) can be found in, _e.g._, Shi et al. (2023, Proposition 2), called _Markovian projection_. Here, we provide an alternative derivation that follows closer to the one from flow matching (Lipman et al., 2023).
+
+**Lemma 7**.: _Let the marginal \(p_{t}\) be constructed from a mixture of conditional probability paths, i.e., \(p_{t}:=\mathbb{E}_{p_{0,1}}[p_{t}(X_{t}|x_{0},x_{1})]\), where \(p_{t}(X_{t}|x_{0},x_{1})\equiv p_{t|0,1}\) is associated with an SDE, \(\mathrm{d}X_{t}=u_{t}(X_{t}|x_{0},x_{1})\mathrm{d}t+\sigma\mathrm{d}W_{t}\), \(X_{0}=x_{0}\), \(X_{1}=x_{1}\), then the SDE drift that satisfies the FPE prescribed by \(p_{t}\) is given by_
+
+\[u_{t}^{*}(x)=\frac{\mathbb{E}_{p_{0,1}}[u_{t}(x|x_{0},x_{1})]}{p_{t}(x)}. \tag{29}\]
+
+Proof.: It suffices to check that \(u_{t}^{*}(x)\) satisfies the FPE prescribed by \(p_{t}\):
+
+\[\frac{\partial}{\partial t}p_{t}(X_{t}) =\int\left(\frac{\partial}{\partial t}p_{t|0,1}\right)p_{0,1} \mathrm{d}x_{0,1}\] \[=\int\left(-\nabla\cdot\left(u_{t|0,1}\;p_{t|0,1}\right)\right)p_ {0,1}\mathrm{d}x_{0,1}+\int\left(\frac{1}{2}\sigma^{2}\Delta p_{t|0,1}\right)p _{0,1}\mathrm{d}x_{0,1}\] \[\stackrel{{\eqref{eq:fPE_t}}}{{=}}-\nabla\cdot\left( u_{t}^{*}\;p_{t}\right)+\frac{1}{2}\sigma^{2}\Delta p_{t}.\]
+
+An immediate consequence of Lemma 7 is that
+
+\[\mathcal{L}_{\text{explicit}}(\theta)=\mathbb{E}_{p_{t}}\left[\frac{1}{2}\|u_ {t}^{\theta}(X_{t})-u_{t}^{*}(X_{t})\|^{2}\right]+\mathcal{O}(1), \tag{30}\]
+
+where \(\mathcal{O}(1)\) is independent of \(\theta\). Hence, the \(u_{t}^{\theta^{*}}\) preserves the prescribed \(p_{t}\).
+
+Relation to implicit matching (4).Both explicit and implicit matching losses are associated to some regression objectives, except w.r.t. different targets, _i.e._, \(u_{t}^{*}\) in (30) _vs._\(\nabla s_{t}^{*}\) in Sec. 2. As pointed out in Neklyudov et al. (2023), the two targets relate to each other via the Helmholtz decomposition (Ambrosio et al., 2008, Lemma 8.4.2), which suggests that \(u_{t}^{*}=\nabla s_{t}^{*}+w_{t}\) where \(w_{t}\) is the divergence-free vector field, _i.e._, \(\nabla\cdot\left(w_{t}p_{t}\right)=0\). Though this implies that \(\mathcal{L}_{\text{explicit}}\) only upper-bounds the kinetic energy, its solution sequential, by alternating between solving (6) in Stage 2, remains well-defined from the measure perspective (Peluchetti, 2022, 2023; Shi et al., 2023). Specifically, the sequential performs alternate projection between reciprocal path measure defined by the solution to (6), in the form \(p_{t}:=\mathbb{E}_{p_{0,1}}[p_{t|0,1}]\), and the Markovian path measure, and admits convergence to the optimal solution for standard SB problems.
+
+### Gaussian probability path
+
+Derivation of analytic conditional drift in (8).Recall the Gaussian path approximation in (7):
+
+\[X_{t}=\mu_{t}+\gamma_{t}Z,\quad Z\sim\mathcal{N}(0,\mathbf{I}_{d}),\]
+
+which immediately implies the velocity vector field and the score function (Sarkka & Solin, 2019; Albergo et al., 2023):
+
+\[\partial_{t}X_{t}=\partial_{t}\mu_{t}+\frac{\partial_{t}\gamma_{t}}{\gamma_{t} }\left(X_{t}-\mu_{t}\right),\quad\nabla\log p_{t}(X_{t})=-\frac{1}{\gamma_{t} ^{2}}\left(X_{t}-\mu_{t}\right).\]We can then construct the conditional drift:
+
+\[u_{t}(X_{t}|x_{0},x_{1})=\partial_{t}X_{t}+\frac{\sigma^{2}}{2}\nabla\log p_{t}(X _{t})=\partial_{t}\mu_{t}+\frac{1}{\gamma_{t}}\left(\partial_{t}\gamma_{t}- \frac{\sigma^{2}}{2\gamma_{t}}\right)(X_{t}-\mu_{t}). \tag{31}\]
+
+Notice that (31) is of the form of a gradient field due to the linearity in \(X_{t}\). One can verify that substituting the Brownian bridge, \(\mu_{t}:=(1-t)x_{0}+tx_{1}\) and \(\gamma_{t}:=\sigma\sqrt{t(1-t)}\), to (31) indeed yields the desired drift \(\frac{x_{1}-X_{t}}{1-t}\).
+
+Efficient simulation with analytic covariance function (Footnote 5).Proposition 4 requires samples from the "_joint_" distribution in path space. This requires sequential simulation, which can scale poorly to higher-dimensional applications. Fortunately, there exists efficient computation to (6b) with the (linear) conditional drift \(u_{t|0,1}\) given by (8), as the analytic solution to (6b) reads
+
+\[X_{t}=e^{g_{t}}\left(x_{0}+\int_{0}^{t}e^{-g_{\tau}}b_{\tau}\mathrm{d}\tau+ \int_{0}^{t}e^{-g_{\tau}}\sigma\mathrm{d}W_{s}\right),\quad g_{t}:=\int_{0}^{t }a_{\tau}\mathrm{d}\tau, \tag{32}\]
+
+where \(a_{t}:=\frac{1}{\gamma_{t}}\left(\partial_{t}\gamma_{t}-\frac{\sigma^{2}}{2 \gamma_{t}}\right)\in\mathbb{R}\) is defined as in (8), \(b_{t}:=\partial_{t}\mu_{t}-a_{t}\mu_{t}\), and \(\int\mathrm{d}W_{s}\) is the Ito stochastic integral (16, 1951). The covariance function between two time steps \(s,t\), such that \(0\leq s<t\leq 1\), can then be computed by
+
+\[\mathrm{Cov}(s,t) =e^{g_{s}+g_{t}}\langle\int_{0}^{s}e^{-g_{\tau}}\sigma\mathrm{d}W _{\tau},\int_{0}^{t}e^{-g_{\tau}}\sigma\mathrm{d}W_{\tau}\rangle\] \[\stackrel{{(i)}}{{=}}e^{g_{s}+g_{t}}\langle\int_{0}^{ s}e^{-g_{\tau}}\sigma\mathrm{d}W_{\tau},\int_{0}^{s}e^{-g_{\tau}}\sigma\mathrm{d}W _{\tau}\rangle\] \[\stackrel{{(ii)}}{{=}}e^{g_{s}+g_{t}}\int_{0}^{s}e^{- 2g_{\tau}}\sigma^{2}\mathrm{d}t\] \[\stackrel{{(iii)}}{{=}}e^{g_{t}-g_{s}}\;\gamma_{s}^{2},\]
+
+where \((i)\) is due to the independence of the Ito integral between \([0,s]\) and \([s,t],(ii)\) is due to the Ito isometry, and, finally, \((iii)\) is due to substituting \(\gamma_{s}^{2}=\mathrm{Var}(s):=e^{2g_{s}}\int_{0}^{s}e^{-2g_{\tau}}\sigma^{2} \mathrm{d}t\).
+
+Repeating the same derivation for \(t,s\) such that \(0\leq t<s\leq 1\), the covariance function of (6b) between any given two timesteps \(s,t\in[0,1]\) can be written cleanly as
+
+\[\mathrm{Cov}(s,t)=\gamma_{\min(s,t)}^{2}e^{g_{\max(s,t)}-g_{\min(s,t)}}, \tag{33}\]
+
+which, crucially, requires only solving an "1D" ODE, \(\mathrm{d}g_{t}=a_{t}\mathrm{d}t,g_{0}=0\). We summarize the algorithm in Alg. 6 with an example of Brownian bridge in Fig. 10. We note again that all computation is parallelizable over the batches.
+
+```
+0: SDE (6b) with \(\mu_{t},\gamma_{t}\)
+0: Discretize \(\bar{t}:=[t_{1},\cdots,t_{K}]\), \(0<t_{1}<\cdots<t_{K}<1\)
+0: Solve \(g_{\bar{t}}\) according the 1D ODE in (32)
+0: Compute covariance matrix \(C_{\bar{t}}\in\mathbb{R}^{K\times K}\) by (33)
+0: Perform Cholesky decomposition \(C_{\bar{t}}=L_{\bar{t}}L_{\bar{t}}^{T}\)
+0: Sample \(X_{\bar{t}}=\mu_{\bar{t}}+L_{\bar{t}}Z_{\bar{t}}\), \(Z_{\bar{t}}\in\mathbb{R}^{K\times d}\), \([Z_{\bar{t}}]_{ij}\sim\mathcal{N}(0,1)\)return\(X_{\bar{t}}\)
+```
+
+**Algorithm 6**CovSample (line 1 in Alg. 4)
+
+## Appendix D Experiment details
+
+### Experiment setup
+
+Baselines.All experiments on DeepGSB are run with their official implementation6 and default hyperparameters. We adopt the "actor-critic" parameterization as it generally yields better performance, despite requiring additional value networks. On the other hand, we implement DSBM by
+
+Figure 10: How Alg. 6 faithfully recovers the covariance matrix of, in this case, Brownian bridge.
+
+ourselves, as our GSBM can be made equivalent to DSBM by disabling the optimization of the CondSOC problem in (6) and returning the analytic solution of Brownian bridges instead. This allows us to more effectively ablate the algorithmic differences, ensuring that any performance gaps are attributed to the presence of \(V_{t}\). All methods, including our GSBM, are implemented in PyTorch (Paszke et al., 2019).
+
+Network architectures.For crowd navigation (Sec. 4.1) and opinion depolarization (Sec. 4.3), we adopt the same network architectures from DeepGSB, which consists of 4 to 5 residual blocks with sinusoidal time embedding. As for the AFHQ task, we consider the U-Net (Ronneberger et al., 2015) architecture implemented by Dhariwal & Nichol (2021).7 All networks are trained from scratch, without utilizing any pretrained checkpoint, and optimized with AdamW (Loshchilov & Hutter, 2019).
+
+Footnote 7: [https://github.com/openai/guided-diffusion](https://github.com/openai/guided-diffusion), under MIT License.
+
+Task-specific noise level (\(\sigma\)).For crowd navigation tasks with mean-field cost, we adopt \(\sigma=\{1.0,2.0\}\), whereas the opinion depolarization task uses \(\sigma=0.5\). These values are inherited from DeepGSB. On the other hand, we use \(\sigma=1\) and \(0.5\) respectively for LiDAR and AFHQ tasks.
+
+GSBM hyperparameters.Table 7 summarizes the hyperparameters used in the spline optimization. By default, the generation processes are discretized into 1000 steps, except for the opinion depolarization task, where we follow DeepGSB setup and discretize into 300 steps.
+
+GSBM implementation (forward & backward scheme).In practice, we employ the same "forward and backward" scheme proposed in DSBM (Shi et al., 2023), parameterizing _two_ drifts, one for the forward SDE and another for the backward. During odd epochs, we simulate the coupling (line 4 in Alg. 5) from the forward drift, solve the corresponding CondSOC problem (6), then match the resulting \(p_{t}\) with the backward drift. Conversely, during even epochs, we follow the reverse process, matching the forward drift with the \(p_{t}\) obtained from backward drift. The forward-backward alternating scheme generally improves the performance, as the forward drift always matches the ground-truth terminal distribution \(p_{1}=\nu\) (and vise versa for the backward drift).
+
+Crowd navigation setup.All three mean-field tasks-Stunnel, Vneck, and GMM--are adopted from DeepGSB, as shown in Fig. 11. We slightly modify the initial distribution of GMM to testify fully multi-model distributions. As for the mean-field interaction cost (12), we consider entropy cost for the Vneck task, and congestion cost for the Stunnel and GMM tasks. We adjust the multiplicative factors between \(L_{\text{obstacle}}\) and \(L_{\text{interact}}\) to ensure that noticeable changes occur when enabling mean-field interaction; see Table 8. These factors are much larger than the ones considered in DeepGSB (\(\lambda_{2}<3\)). In practice, we soften the obstacle cost for differentiability, similar to prior works (Ruthotto et al., 2020; Lin et al., 2021), and approximate \(p_{t}(x)\approx\sum_{(x_{0},x_{1})}p_{t}(x|x_{0},x_{1})\) as the mixture of Gaussians.
+
+AFHQ setup.As our state cost \(V_{t}\) is defined via a latent space, we pretrain a \(\beta\)-VAE (Higgins et al., 2016) with \(\beta=0.1\). On the other hand, the spherical linear interpolation
+
+\begin{table}
+\begin{tabular}{l r r r r r r} \hline \hline  & Stunnel & Vneck & GMM & Lidar & AFHQ & Opinion \\ \hline Number of control pts. \(K\) & 30 & 30 & 30 & 30 & 8 & 30 \\ Number of gradient steps \(M\) & 1000 & 3000 & 2000 & 200 & 100 & 700 \\ Number of samples \(|i|\) & 4 & 4 & 4 & 4 & 4 & 4 \\ Optimizer & SGD & SGD & SGD & mSGD & Adam & SGD \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: Hyperparameters of the SplineOpt (Alg. 3) for each task.
+
+Figure 11: Initial and terminal distributions for each crowd navigation task with mean-field state cost. Obstacles are marked gray.
+
+(Slerp; Shoemake (1985)) refers to constant-speed rotational motion along a great circle arc:
+
+\[I_{\text{Slerp}}(t,z_{0},z_{1}):=\frac{\sin((1-t)\;\Omega)}{\sin\Omega}z_{0}+ \frac{\sin(t\;\Omega)}{\sin\Omega}z_{1},\qquad\Omega=\arccos(\langle z_{0},z_{1 }\rangle). \tag{34}\]
+
+### Opinion depolarization
+
+**Polarize drift in (15).** We use the same polarize drift from DeepGSB, based on the party model (Gaitonde et al., 2021). At each time step \(t\), all agents receive the same random information \(\xi_{t}\in\mathbb{R}^{d}\) sampled independently of \(p_{t}\), then react to this information according to
+
+\[f_{\text{polarize}}(x;p_{t},\xi_{t}):=\mathbb{E}_{y\sim p_{t}}\left[a(x,y,\xi_{ t})\bar{y}\right],\;\;a(x,y,\xi_{t}):=\left\{\begin{array}{ll}1&\text{if }\operatorname{sign}(\langle x,\xi_{t}\rangle)=\operatorname{sign}( \langle y,\xi_{t}\rangle)\\ -1&\text{otherwise}\end{array}\right., \tag{35}\]
+
+where \(\bar{y}:=\nicefrac{{y}}{{\|y\|}}\frac{1}{2}\) and \(a(x,y,\xi_{t})\)--the agreement function--indicates whether the two opinions \(x\) and \(y\) agree on the information \(\xi_{t}\). Hence, (35) suggests that the agents are inclined to be receptive to opinions they agree with while displaying antagonism towards opinions they disagree with. This is known to yield polarization, as shown in Figure 12.
+
+**Directional similarity in Figures 7 and 12.** Directional similarity is a standard visualization for opinion modeling (Schweighofer et al., 2020) that counts the histogram of cosine angle between pairwise opinions. Hence, flatter directional similarity suggests less polarize opinion distribution.
+
+### Approximating geometric manifolds with LiDAR data
+
+Since LiDAR data is a collection of point clouds in \([-5,5]^{3}\subset\mathbb{R}^{3}\), we use standard methods for treating it more as a Riemannian manifold. For every point in the ambient space, we define the projection operator by first taking a \(k\)-nearest neighbors and fitting a 2D tangent plane. Let \(\mathcal{N}_{k}(x)=\{x_{1},\ldots,x_{k}\}\) be the set of \(k\)-nearest neighbors for a query point \(x\in\mathbb{R}^{3}\) in the ambient space. We then fit a 2D plane through a moving least-squares approach (Levin, 1998; Wendland, 2004),
+
+\[\operatorname*{arg\,min}_{a,b,c}\frac{1}{k}\sum_{i=1}^{k}w(x,x_{i})(ax_{i}^{(x )}+bx_{i}^{(y)}+c-x_{i}^{(z)})^{2} \tag{36}\]
+
+where the superscripts denotes the \(x,y,z\) coordinates and we use the weighting \(w(x,x_{i})=\exp\{-\|x-x_{i}\|/\tau\}\) with \(\tau=0.001\). We solve this through a pseudoinverse and obtain the approximate tangent plane \(ax+by+c=z\). When \(k\to\infty\), this tangent plane is smooth; however, we find that using \(k=20\) works sufficiently well in our experiments, and our GSBM algorithm is robust to the value of \(k\). The projection operator \(\pi(x)\) is then defined using the plane,
+
+\[\pi(x)=x-\left(\frac{x^{\top}n+c}{\|n\|^{2}}\right)n,\qquad\text{ where }n=\left[a\quad b\quad-1\right]^{\top}. \tag{37}\]
+
+This projection operator is all we need to treat the LiDAR dataset as a manifold. Differentiating through \(\pi\) will automatically project the gradient onto the tangent plane. This will ensure that optimization through the state cost \(V_{t}\) will be appropriated projected onto the tangent plane, allowing us to optimize quantities such as the height of the trajectory over the manifold.
+
+Figure 12: Simulation of the polarize drift (35) in \(\mathbb{R}^{1000}\).
+
+The exact state cost we use includes an additional boundary constraint:
+
+\[V(x)=\lambda\Big{[}\underbrace{\|\pi(x)-x\|^{2}}_{L_{\text{boundary}}}+\underbrace{ \exp(\pi(x)^{(z)})}_{L_{\text{height}}}+\underbrace{\sum_{p\in\{x^{(x)},x^{(y)} \}}\text{sigm}^{(p-5/0.1)}+(1-\text{sigm}^{(p+5/0.1)})}_{L_{\text{boundary}}} \Big{]}, \tag{38}\]
+
+where "sigm" is the sigmoid function, used for relaxing the boundary constraint. The loss \(L_{\text{boundary}}\) simply ensures we don't leave the area where the LiDAR data exists. We set \(\lambda=5000\). The gradient of \(L_{\text{manifold}}(x)\) moves \(x\) in a direction that is orthogonal to the tangent plane while the gradient of \(L_{\text{height}}(x)\) moves \(x\) along directions that lie on the tangent plane. If we only have \(L_{\text{manifold}}\), then CondSOC essentially solves for geodesic paths and we recover an approximation of Riemannian Flow Matching (Chen and Lipman, 2023) (parameterized in the ambient space) when \(\sigma\to 0\). The state cost \(L_{\text{height}}\) depends on \(\pi(x)\) as this ensures we travel down the mountain slope when optimizing for height. Other state costs can of course also be considered instead of \(L_{\text{height}}\).
+
+### Additional experiment results
+
+Additional interpolation results on AFHQ.Figure 13 provides comparison results between DSBM (Shi et al., 2023) and our GSBM on \(p_{t}(X_{t}|x_{0},x_{1}\) with randomly sampled \((x_{0},x_{1})\).
+
+Additional comparisons on crowd navigation with mean-field cost.Figure 14 provides additional comparison between DeepGSB (Liu et al., 2022) and our GSBM. Figure 15 and Table 9 report the performance of NLSB8(Koshizuka and Sato, 2023)--an adjoint-based method for approximating solutions to the same GSB problem (3). It should be obvious that our GSBM outperforms both methods.
+
+Figure 13: Additional comparison between DSBM (Shi et al., 2023) and our GSBM through the mean of \(p_{t}(X_{t}|x_{0},x_{1})\) with randomly sampled \((x_{0},x_{1})\). While DSBM simply performs linear interpolation between \(x_{0}\) and \(x_{1}\), our GSBM _optimizes_ w.r.t. (6) where \(V_{t}\) is defined via a latent space, thereby exhibiting **more semantically meaningful interpolations**.
+
+Figure 14: Additional comparison between DeepGSB (Liu et al., 2022) our GSBM on (_top to bottom_) Stunnel with \(\sigma=2.0\) and Vneck with \(\sigma=\{1.0,2.0\}\). Notice again how the training of DeepGSB exhibits relative instability and occasional divergence.
+
+Figure 15: Performance of NLSB (Koshizuka & Sato, 2023) on the same three crowd navigation tasks with mean-field cost. Notice how NLSB was trapped in some local minima on Stunnel and completely failed on GMM.
+
+#### Analytic solution to (6) for quadratic \(V\) and \(\sigma=0\).
+
+Recall the finite-horizon and continuous-time linear quadratic regulator, defined as:
+
+\[\min_{u_{t}}x_{1}^{\top}Fx_{1}+\int_{0}^{1}\left[x_{t}^{\top}Qx_{t}+u_{t}^{\top }Ru_{t}\right]\text{d}t\quad\text{s.t. }\dot{x}_{t}=Ax_{t}+Bu_{t}, \tag{39}\]
+
+whose optimal control \(u_{t}^{\star}=-R^{-1}BP_{t}x_{t}\) can be obtained by solving a Riccati differential equation:
+
+\[-\dot{P}_{t}=A^{\top}P_{t}+P_{t}A-P_{t}BR^{-1}B^{\top}P_{t}+Q,\quad P_{1}=F,\]
+
+or, equivalently, a Lyapunov differential equation (one can verify that \(H_{t}=P_{t}^{-1}\) for all \(t\)):
+
+\[\dot{H}_{t}=AH_{t}+H_{t}A^{\top}-BR^{-1}B^{\top}+H_{t}QH_{t},\quad H_{1}=F^{-1}. \tag{40}\]
+
+The end-point constraint can be accounted by setting \(F\to\infty\), as suggested in Chen & Georgiou (2015), yielding \(H_{1}=0\). With that, the solution to (6) for quadratic \(\widetilde{V}(x):=\alpha\|x\|^{2}\) and \(\sigma:=0\) can be obtained by solving the matrix ODE in (40) with \(A=0\), \(B=\mathbf{I}_{d}\), \(R=\frac{1}{2}I_{d}\), and \(Q=\alpha\mathbf{I}_{d}\), which admits an analytic solution in the form of hyperbolic tangent functions, similar to its stochastic counterpart in (19).
+
+Figure 16: Illustration of how different couplings, \(X_{1}|X_{0}=x_{0}\), emerge with nontrivial state costs \(V(x)\). Specifically, we color different regions of the initial distribution (leftmost column) with different colors and track their pushforward maps. We consider the same \(V(x)\), _i.e._, obstacle and congestion costs, for Stunnel (top row) and adopt quadratic cost for Spiral \(\to\) Moon (bottom row). In these two particular cases, having nontrivial \(V(x)\) encourages stronger mixing, thereby yielding a different coupling (rightmost column) compared to the one induced without \(V(x)\) (middle column).
+
+\begin{table}
+\begin{tabular}{l r r r r r} \hline \hline  & \multicolumn{3}{c}{Feasibility \(\mathcal{W}(p_{1}^{\theta},\nu)\)} & \multicolumn{3}{c}{Optimality (3)} \\ \cline{2-7}  & Stunnel & Vneck & GMM & Stunnel & Vneck & GMM \\ \hline NLSB (Koshizuka \& Sato, 2023) & 30.54 & 0.02 & 67.76 & 207.06 & 147.85 & 4202.71 \\
+**GSBM (ours)** & 0.03 & 0.01 & 4.13 & 460.88 & 155.53 & 229.12 \\ \hline \hline \end{tabular}
+\end{table}
+Table 9: Quantitative comparison between NLSB (Koshizuka & Sato, 2023) and our **GSBM**. Notice that our GSBM consistently ensures feasibility. In contrast, as NLSB approaches the GSB problem by transforming it into a stochastic optimal control (SOC) problem with a soft terminal cost (see Appendix A), it may overly emphasize on optimality at the expense of feasibility.

@@ -1,0 +1,483 @@
+## Prompt-tuning latent diffusion models for inverse problems
+
+### Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+We propose a new method for solving imaging inverse problems using text-to-image latent diffusion models as general priors. Existing methods using latent diffusion models for inverse problems typically rely on simple null text prompts, which can lead to suboptimal performance. To address this limitation, we introduce a method for prompt tuning, which jointly optimizes the text embedding on-the-fly while running the reverse diffusion process. This allows us to generate images that are more faithful to the diffusion prior. In addition, we propose a method to jointly utilize the VAE generative prior. Synergistically leveraging both the diffusion and the VAE prior to solving inverse problems helps to reduce image artifacts, a major problem when using latent diffusion models instead of pixel-based diffusion models. Our combined method, called P2L, outperforms both image- and latent-diffusion model-based inverse problem solvers on a variety of tasks, such as super-resolution, deblurring, and inpainting.
+
+## 1 Introduction
+
+Imaging inverse problems are often solved by optimizing or sampling a functional that combines a data-fidelity/likelihood term with a regularization term or signal prior (Romano et al., 2017; Venkatakrishnan et al., 2013; Ongie et al., 2020; Karimov et al., 2023; Kawar et al., 2022; Kadkhodaie and Simoncelli, 2021; Chung et al., 2023b). A common regularization strategy is to use pre-trained image priors from generative models, such as GANs (Bora et al., 2017), VAEs (Bora et al., 2017; Gonzalez et al., 2022), Normalizing flows (Whang et al., 2021) or Diffusion models (Song et al., 2022; Chung and Ye, 2022).
+
+In particular, diffusion models have gained significant attention as implicit generative priors for solving inverse problems in imaging (Kadkhodaie and Simoncelli, 2021; Whang et al., 2022; Daras et al., 2022; Kawar et al., 2022; Feng et al., 2023; Laroche et al., 2023; Chung et al., 2023b). Leaving the pre-trained diffusion prior intact, one can guide the inference process to perform posterior sampling conditioned on the measurement at inference time by resorting to Bayesian inference. In the end, the ultimate goal of Diffusion model-based Inverse problem Solvers (DIS) would be to act as a fully general inverse problem solver, which can be used not only regardless of the imaging model, but also regardless of the data distribution.
+
+Solving inverse problems in a fully general domain is hard. This directly stems from the difficulty of generative modeling a wide distribution, where it is known that one has to trade-off diversity with fidelity by some means of sharpening the distribution (Brock et al., 2018; Dhariwal and Nichol, 2021). The standard approach in modern diffusion models is to condition on text prompts (Rombach et al., 2022; Saharia et al., 2022b), among them the most popular being Stable Diffusion (SD), a latent diffusion model (LDM), which is itself an under-explored topic in the context of inverse problem solving. While text conditioning is now considered standard practice in content creation including images (Ramesh et al., 2022; Saharia et al., 2022b), 3D (Poole et al., 2023; Wang et al., 2023d), video (Ho et al., 2022), personalization (Gal et al., 2022), and editing (Hertz et al., 2022), it has been completely disregarded in the inverse problem solving context. This is natural, as it is highly ambiguous which text would be beneficial to use when all we have is a degraded measurement. The wrong prompt could easily lead to degraded performance.
+
+In this work, we aim to bridge this gap by proposing a way to _automatically_ find the right prompt to condition diffusion models when solving inverse problems. This can be achieved through optimizingthe continuous text embedding _on-the-fly_ while running DIS. We formulate this into a Bayesian framework of updating the text embedding and the latent in an alternating fashion, such that they become gradually aligned during the sampling process. Orthogonal and complementary to embedding optimization, we devise a simple LDM-based DIS (LDIS) that controls the evolution of the latents to stay on the natural data manifold and additionally utilizes the VAE prior for stability of the solutions. We name the algorithm that combines these components P2L, short for **P**rompt-tuning **P**rojected **L**atent diffusion model-based inverse problem solver. In reaching for the ultimate goal of DIS, we focus on 1) **LDM-based DIS** (LDIS) for solving inverse problems in the 2) **fully general domain** (using a single pre-trained checkpoint) that targets 3) **512\(\times\)512 resolution1. All the aforementioned components are highly challenging, and to the best of our knowledge, have not been studied in conjunction before.
+
+Footnote 1: All prior works on DIS/LDIS focused on 256\(\times\)256 resolution. Most LDIS focused their evaluation on a constrained dataset such as FFHQ, and did not scale their method to more general domains such as ImageNet.
+
+## 2 Background
+
+### Latent diffusion models
+
+Diffusion models are generative models that learn to reverse the forward noising process (Sohl-Dickstein et al., 2015; Ho et al., 2020; Song et al., 2021), starting from the initial distribution \(p_{0}(\mathbf{x}),\,\mathbf{x}\in\mathbb{R}^{n}\) and approaching the standard Gaussian \(p_{T}(\mathbf{x})=\mathcal{N}(\mathbf{0},\mathbf{I})\) as \(T\rightarrow\infty\) by the forward Gaussian perturbation kernels \(p(\mathbf{x}_{t}|\mathbf{x}_{0})=\mathcal{N}(\mathbf{x}_{0},t^{2}\mathbf{I})\)2. The forward/reverse processes can be characterized with Ito stochastic differential equations (SDE). Sampling from the distribution can either be done through solving the reverse SDE, or equivalently by solving the probability-flow ordinary differential equation (PF-ODE) (Song et al., 2021; Karras et al., 2022):
+
+Footnote 2: Here, we use the choice used in Karras et al. (2022) for simplicity, but use variance preserving (VP) models (Song et al., 2021) for experiments as pre-trained models are available in this form. The different choices can be considered equivalent (Kawar et al., 2022)
+
+\[d\mathbf{x}_{t}=-t\nabla_{\mathbf{x}_{t}}\log p(\mathbf{x}_{t})\,dt=\frac{\mathbf{x}_{t}-\mathbb{ E}[\mathbf{x}_{0}|\mathbf{x}_{t}]}{t}\,dt,\,\,\mathbf{x}_{T}\sim p_{T}(\mathbf{x}_{T}), \tag{1}\]
+
+where we use the Tweedie's formula (Efron, 2011) given as \(\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t}]=\mathbf{x}_{t}+t^{2}\nabla_{\mathbf{x}_{t}}\log p(\bm {x}_{t})\). Here \(\nabla_{\mathbf{x}_{t}}\log p_{t}(\mathbf{x}_{t})\) is typically approximated with a score network \(\mathbf{s}_{\mathbf{\theta}}(\cdot)\) or a noise estimation network \(\mathbf{e}_{\mathbf{\theta}}(\cdot)\), and learned through denoising score matching (DSM) (Vincent, 2011) or epsilon-matching loss (Ho et al., 2020).
+
+Image diffusion models that operate on the pixel space \(\mathbf{x}\) are compute-heavy. One workaround for compute-efficient generative modeling is to leverage a variational autoencoder that maximizes the evidence lower bound (ELBO) (Rombach et al., 2022; Kingma and Welling, 2013). This leads to the following encoder and decoder representation for all \(\mathbf{x}\sim p_{\mathrm{data}}(\mathbf{x})\in\mathbb{R}^{n}\):
+
+\[\mathbf{x}=\mathcal{D}_{\mathbf{\varphi}}(\mathbf{z}),\quad\text{where}\quad\mathbf{z}=\mathcal{ E}_{\mathbf{\phi}}(\mathbf{x}):=\mathcal{E}_{\mathbf{\phi}}^{\mathbf{\mu}}(\mathbf{x})+\mathcal{E}_{ \mathbf{\phi}}^{\mathbf{\sigma}}(\mathbf{x})\odot\mathbf{\epsilon},\quad\mathbf{\epsilon}\sim \mathcal{N}(0,\mathbf{I}), \tag{2}\]
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c c c} \hline \hline  & \multicolumn{4}{c}{**FFHQ**} & \multicolumn{4}{c}{**ImageNet**} \\ \cline{3-14}  & & \multicolumn{3}{c}{SR\(\times\)8} & \multicolumn{3}{c}{Inpaint (\(p=0.8\))} & \multicolumn{3}{c}{SR\(\times\)8} & \multicolumn{3}{c}{Inpaint (\(p=0.8\))} \\ \cline{3-14}
+**Prompt** & FID\({}_{1}\) & LPIPS\({}_{1}\) & PSNR\({}_{1}\) & FID\({}_{1}\) & LPIPS\({}_{2}\) & PSNR\({}_{1}\) & FID\({}_{1}\) & LPIPS\({}_{1}\) & PSNR\({}_{1}\) & FID\({}_{1}\) & LPIPS\({}_{1}\) & PSNR\({}_{1}\) \\ \hline \multirow{3}{*}{\(\mathbf{z}^{-}\)} & 6.16 & 0.327 & 26.49 & 52.34 & 0.241 & **29.78** & 78.68 & 0.397 & 23.49 & 70.87 & 0.350 & 26.20 \\ \hline \multirow{3}{*}{\(\mathbf{z}^{\text{-}}\)A high quality photo*} & 61.17 & 0.327 & 26.57 & 52.82 & 0.237 & 20.70 & 77.00 & 0.396 & 25.51 & 0.100 & 0.350 & 26.26 \\  & \multirow{3}{*}{\(\mathbf{z}^{\text{-}}\)A high quality photo of a cat*} & 69.03 & 0.377 & 26.39 & 55.15 & 0.248 & 29.63 & 76.69 & 40.02 & **23.63** & 68.48 & 0.355 & 26.13 \\  & \multirow{3}{*}{\(\mathbf{z}^{\text{-}}\)A high quality photo of a dog*} & 66.55 & 0.371 & 26.48 & 55.51 & 0.249 & 29.65 & 76.45 & 0.394 & 23.58 & 67.75 & 0.354 & 26.10 \\  & \multirow{3}{*}{\(\mathbf{z}^{\text{-}}\)A high quality photo of a face*} & 60.41 & 0.325 & 26.74 & 52.33 & 0.239 & 29.09 & 77.32 & 0.403 & 23.60 & 68.33 & 0.352 & 26.20 \\ \hline Proposed & **58.73** & **0.317** & 26.68 & **51.40** & **20.33** & 29.69 & 66.96 & **0.386** & 23.57 & 66.82 & **0.314** & **26.29** \\ \hline PALL prompts from \(\mathbf{y}\) & 61.33 & 0.329 & **26.81** & 54.34 & 0.249 & 29.76 & 68.28 & 0.388 & 23.57 & 69.55 & 0.355 & 26.26 \\ PALL prompts from \(\mathbf{x}\) & 60.73 & 0.322 & 26.76 & 52.06 & 0.238 & 29.75 & **66.55** & 0.387 & 23.57 & **64.00** & 0.348 & 26.17 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Difference in restoration performance using LDPS on SR\(\times\)8 task with varying text prompts. Proposed: text embedding optimized without access to ground truth. PALL prompts from \(\mathbf{x}\)/\(\mathbf{y}\): captions are generated with PALI (Chen et al., 2022) from \(\mathbf{x}\): ground truth clean images / \(\mathbf{y}\): degraded images. The former can be considered an empirical upper bound.
+
+where \(\mathcal{E}_{\phi}^{\mathbf{\mu}},\mathcal{E}_{\phi}^{\mathbf{\sigma}}\) are parts of the encoder that outputs the mean and the variance of the encoder distribution, \(\mathcal{D}_{\phi}\) is the decoder, and \(\mathbf{z}\in\mathbb{R}^{k}\) with \(k<n\) corresponds to the _latent_ representation.
+
+After encoding into the latent space (Rombach et al., 2022), one can train a diffusion model in the low-dimensional latent space. Latent diffusion models (LDM) are beneficial in that the computation is cheaper as it operates in a lower-dimensional space, consequently being more suitable for modeling higher dimensional data (e.g. large images of size \(\geq 512^{2}\)). The effectiveness of LDMs have democratized the use of diffusion models as the de facto standard of generative models especially for images under the name of Stable Diffusion (SD), which we focus on extensively in this work.
+
+One notable difference of SD from standard image diffusion models (Dhariwal and Nichol, 2021) is the use of text conditioning \(\epsilon_{\mathbf{\theta}}(\cdot,\mathcal{C})\), where \(\mathcal{C}\) is the continuous embedding vector usually obtained through the CLIP text embedder (Radford et al., 2021). As the model is trained with LAION-5B (Schuhmann et al., 2022), a large-scale dataset containing image-text pairs, SD can be conditioned during the inference time to generate images that are aligned with the given text prompt by directly using \(\epsilon_{\mathbf{\theta}}(\cdot,\mathcal{C})\), or by means of classifier-free guidance (CFG) (Ho and Salimans, 2021).
+
+### Solving inverse problem with (latent) diffusion models
+
+Given access to some measurement
+
+\[\mathbf{y}=\mathbf{A}\mathbf{x}+\mathbf{n},\quad\mathbf{x}\in\mathbb{R}^{n},\,\mathbf{y}\in\mathbb{R}^ {m},\,\mathbf{A}\in\mathbb{R}^{m\times n},\,\mathbf{n}\sim\mathcal{N}(\mathbf{0},\sigma_{y }^{2}\mathbf{I}_{m}) \tag{3}\]
+
+where \(\mathbf{A}\) is the forward operator and \(\mathbf{n}\) is additive white Gaussian noise, the task is retrieving \(\mathbf{x}\) from \(\mathbf{y}\). As the problem is ill-posed, a natural way to solve it is to perform posterior sampling \(\mathbf{x}\sim p(\mathbf{x}|\mathbf{y})\) by defining a suitable prior \(p(\mathbf{x})\). In DIS, diffusion models (i.e. denoisers) act as the implicit prior with the use of the score function.
+
+Earlier methods utilized an alternating projection approach, where hard measurement constraints are applied in-between the denoising steps whether in pixel space (Kadkhodaie and Simoncelli, 2021; Song et al., 2021) or measurement space (Song et al., 2022; Chung and Ye, 2022). Distinctively, projection in the spectral space via singular value decomposition (SVD) to incorporate measurement noise has been developed (Kawar et al., 2021, 2022). Subsequently, methods that aim to approximate the gradient of the log posterior in the diffusion model context have been proposed (Chung et al., 2023; Song et al., 2023), expanding the applicability to nonlinear problems. Broadening the range even further, methods that aim to solve blind (Chung et al., 2023; Murata et al., 2023), 3D (Chung et al., 2023; Lee et al., 2023), and unlimited resolution problems (Wang et al., 2023) were introduced. More recently, methods leveraging diffusion score functions within variational inference to solve inverse imaging has been proposed (Mardani et al., 2023; Feng et al., 2023). Notably, all the aforementioned methods utilize _image-domain_ diffusion models. Orthogonal to this direction, some of the recent works have shifted their attention to using _latent_ diffusion models (Rout et al., 2023; Song et al., 2023; He et al., 2023), a direction that we follow in this work.
+
+In fact, inverse solvers can be directly linked to posterior sampling from \(p(\mathbf{x}_{0}|\mathbf{y})\), which can be achieved by modifying Eq. (1) with
+
+\[d\mathbf{x}_{t}=-t\nabla_{\mathbf{x}_{t}}\log p(\mathbf{x}_{t}|\mathbf{y})\,dt=\frac{\mathbf{x}_{t }-\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t},\mathbf{y}]}{t}\,dt,\,\,\mathbf{x}_{T}\sim p_{T}( \mathbf{x}_{T}). \tag{4}\]
+
+Here, \(\log p(\mathbf{x}_{t}|\mathbf{y})=\log p(\mathbf{x}_{t})+\log p(\mathbf{y}|\mathbf{x}_{t})\), and the second equality is given by conditioning the Tweedie's formula with \(\mathbf{y}\), i.e. \(\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t},\mathbf{y}]=\mathbf{x}_{t}+t^{2}\nabla_{\mathbf{x}_{t}} \log p(\mathbf{x}_{t}|\mathbf{y})\). However, as \(\log p(\mathbf{y}|\mathbf{x}_{t})\) is intractable, DPS (Chung et al., 2023) proposes to approximate it with \(\log p(\mathbf{y}|\mathbf{x}_{t})\simeq\log p(\mathbf{y}|\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t}])\), whose approximation error can be quantified and bounded by the Jensen gap.
+
+This idea was recently extended to LDMs in a few recent works (Rout et al., 2023; He et al., 2023)
+
+\[\nabla_{\mathbf{z}_{t}}\log p(\mathbf{y}|\mathbf{z}_{t})\simeq\nabla_{\mathbf{z}_{t}}\log p( \mathbf{y}|\mathcal{D}_{\mathbf{\varphi}}(\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t}]))=\nabla_{ \mathbf{z}_{t}}\|\mathbf{y}-\mathcal{D}_{\mathbf{\varphi}}(\tilde{\mathbf{z}}_{0})\|_{2}^{2}/ \sigma_{y}^{2}, \tag{5}\]
+
+with \(\tilde{\mathbf{z}}_{0}:=\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t}]\). We refer to the sampler that uses the approximation in Eq. (5) as Latent DPS (LDPS) henceforth. Rout et al. (2023) extends LDPs with an additional regularization term by showing that there exists a step size for which guiding the latents towards a fixed point is optimal. He et al. (2023) extends LDPs by using history updates as in Adam (Kingma and Ba, 2015). However, _all_ of the existing works in the literature that aim for LDIS, to the best of our knowledge, neglect the use of text embedding by resorting to the use of null text embedding \(\mathcal{C}_{\varnothing}\).
+
+### Prompt tuning
+
+In modern language models and vision-language models, _prompting_ is a standard technique (Radford et al., 2021; Brown et al., 2020) to guide the large pre-trained models to solve downstream tasks. As it has been found that even slight variations in the prompting technique can lead to vastly different outcomes (Kojima et al., 2022), prompt tuning (learning) has been introduced (Shin et al., 2020; Zhou et al., 2022), which defines a _learnable_ context vector to optimize over. It was shown that by only optimizing over the continuous embedding vector while maintaining the model parameters fixed, one can achieve a significant performance gain.
+
+In the context of diffusion models, prompt tuning has been adopted for personalization (Gal et al., 2022), where one defines a special token to embed a specific concept with only a few images. Moreover, it has also been demonstrated that one can achieve superior editing performance by optimizing for the null text prompt \(\mathcal{C}_{\varnothing}\)(Mokady et al., 2023) before the reverse diffusion sampling process.
+
+## 3 Main Contribution: the P2L algorithm
+
+### Prompt-tuning inverse problem solver
+
+The objective of solving inverse problems is to provide a restoration that is as close as possible to the ground truth given the measurement, whether we are targeting to minimize the distortion or to maximize the perceptual quality (Blau and Michaeli, 2018; Delbracio and Milanfar, 2023). In the context of LDIS,
+
+\[\operatorname*{arg\,min}_{\mathbf{x},\mathbf{c}}\mathcal{L}(\mathbf{x},\mathbf{c})\equiv \operatorname*{arg\,min}_{\mathbf{z},\mathbf{c}}\mathcal{L}(\mathcal{D}_{\mathbf{\varphi} }(\mathbf{z}),\mathbf{c}) \tag{6}\]
+
+where the first equation follows from \(\mathbf{x}=\mathcal{D}_{\mathbf{\varphi}}(\mathbf{z})\) in deterministic decoder mapping VAE, where \(\mathbf{c}\) is the text embedding and the loss \(\mathcal{L}\) will be explained in more detail in subsequent session. It is easy to see that
+
+\[\operatorname*{arg\,min}_{\mathbf{z},\mathbf{c}}\mathcal{L}(\mathcal{D}_{\mathbf{\varphi} }(\mathbf{z}),\mathbf{c})\leq\operatorname*{arg\,min}_{\mathbf{z}}\mathcal{L}(\mathcal{D} _{\mathbf{\varphi}}(\mathbf{z}),\mathbf{c}=\mathcal{C}_{\varnothing}), \tag{7}\]
+
+where \(\mathcal{C}_{\varnothing}\) is the text embedding from the null text prompt. Notably, by keeping one of the variables fixed, we are optimizing for the _upper bound_ of the objective that we truly wish to optimize over. It would be naturally beneficial to optimize the LHS of Eq. (7), rather than the RHS used in the previous methods.
+
+A motivating exampleTo see Eq. (7) in effect, we conduct two canonical experiments with 256 test images of FFHQ (Karras et al., 2019) and ImageNet (Deng et al., 2009): super-resolution (SR) of scale \(\times 8\) and inpainting with 80% of the pixels randomly dropped, using the LDPS algorithm. Keeping all the other hyper-parameters fixed, we only vary the text condition for the diffusion model.
+
+In addition to using a general text prompt, we use PALI (Chen et al., 2022) to provide captions from the ground truth images (\(\mathbf{x}\)) and from the measurements (\(\mathbf{y}\)) and use them when running LDPS. Further details on the experiment can be found in Appendix B. In Table 1, we first see that simply varying the text prompts can lead to dramatic difference the performance. For instance, we see an increase of over 10 FID when we use the text prompts from PALI for the task of \(\times 8\) SR on ImageNet. In contrast, using the prompts generated from \(\mathbf{y}\) often degrades the performance (e.g. inpainting) as the correct captions cannot be generated. From this motivating example, it is evident that additionally optimizing for \(\mathbf{c}\) would bring us gains that are orthogonal to the development of the solvers (Rout et al., 2023; He et al., 2023; Song et al., 2023a), a direction that has not been explored in the literature. Indeed, from the table, we see that by applying our prompt tuning approach, we achieve a large performance gain, sometimes even outperforming the PALI captions which has full access to the ground truth when attaining the text embeddings.
+
+Overall frameworkTo effectively utilize the Latent Diffusion Inverse Solver (LDIS), it is essential to ensure two key criteria: 1) consistency with the measurements, and 2) the feasibility of the solution as per the latent diffusion model. In the context of prompt-tuning LDIS, the optimization of the prompt is also a crucial aspect. Instead of trying to meet these objectives all at once, our approach in this paper is a more pragmatic one, where we alternate between these optimization goals. Specifically, we focus on maintaining data consistency and optimizing the prompt in every iteration. This approach often intertwines with the need to uphold the feasibility condition dictated by latent diffusion. We will delve into the specifics of this methodology in the subsequent section.
+
+### Data consistency and prompt tuning
+
+Existing LDIS approaches attempt to sample from \(p(\mathbf{x}_{0}|\mathbf{y},\mathcal{C}_{\varnothing})\), as it is hard to specify a generally good condition \(\mathcal{C}\) when all we have access to is the corrupted \(\mathbf{y}\). Hence, our goal is to find a good \(\mathcal{C}\)_on-the-fly_ while solving for the inverse problem. Before diving into the design of the algorithm, let us first revisit Eq. (4) for the case where we consider \(\mathcal{C}\) as a condition.
+
+\[d\mathbf{z}_{t}=-t\nabla_{\mathbf{z}_{t}}\log p(\mathbf{z}_{t}|\mathbf{y},\mathcal{C})\,dt= \frac{\mathbf{z}_{t}-\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t},\mathbf{y},\mathcal{C}]}{t}\,dt, \tag{8}\]
+
+where \(\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t},\mathbf{y},\mathcal{C}]\) is approximated with the _empirical_ conditional posterior mean and
+
+\[\nabla_{\mathbf{z}_{t}}\log p(\mathbf{z}_{t}|\mathbf{y},\mathcal{C}_{t}) =\nabla_{\mathbf{z}_{t}}\log p(\mathbf{z}_{t}|\mathcal{C}_{t})+\nabla_{ \mathbf{z}_{t}}\log p(\mathbf{y}|\mathbf{z}_{t},\mathcal{C}_{t}) \tag{9}\] \[\simeq\mathbf{s}_{\mathbf{\theta}^{*}}(\mathbf{z}_{t},\mathcal{C}_{t})+\rho_{ t}\nabla_{\mathbf{z}_{t}}\|\mathbf{y}-\mathbf{A}\mathcal{D}_{\mathbf{\varphi}}(\mathbb{E}[ \mathbf{z}_{0}|\mathbf{z}_{t},\mathcal{C}_{t}])\|_{2}^{2}, \tag{10}\]
+
+where we used the neural network parameterized score function \(\mathbf{s}_{\mathbf{\theta}^{*}}(\mathbf{z}_{t},\mathcal{C}_{t})\simeq\nabla_{\mathbf{z}_{t}} \log p(\mathbf{z}_{t}|\mathcal{C}_{t})\)3, and the second term comes from DPS (Chung et al., 2023b) by defining the prompt conditioned posterior mean \(\hat{\mathbf{z}}_{0}^{(\mathcal{C})}:=\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t},\mathcal{C}]\).
+
+Footnote 3: Only using Eq. (13) with \(\mathcal{C}_{t}=\mathcal{C}_{\varnothing}\) would result in standard LDPS.
+
+\[p(\mathbf{y}|\mathbf{z}_{t},\mathcal{C})=p(\mathbf{y}|\mathcal{D}_{\varphi}(\mathbf{z}_{t}), \mathcal{C})\overset{(\mathrm{DPS})}{\rightleftarrows}p(\mathbf{y}|\mathcal{D}_{ \varphi}(\mathbf{z}_{0}^{(\mathcal{C})})). \tag{11}\]
+
+Equipped with the approximation in Eq. (11), we propose a sampler that alternates between the optimization of \(\mathcal{C}\) while keeping \(\mathbf{z}_{t}\) fixed, the sampling of \(\mathbf{z}_{t}\) while keeping the \(\mathcal{C}\) fixed from the previous iteration.
+
+Step 1: \(\mathcal{C}\) updateAs \(\mathcal{C}\) is an unknown, we propose to optimize it such that the data fidelity is met. Specifically, from Eq. (13), we use the following optimization:
+
+\[\mathcal{C}_{t}^{*}=\operatorname*{arg\,min}_{\mathcal{C}}\|\mathbf{y}-\mathbf{A} \mathcal{D}_{\mathbf{\varphi}}(\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t},\mathbf{y},\mathcal{C} ])\|_{2}^{2}. \tag{12}\]
+
+This corresponds to the OptimizeEmb in Algorithm 1, with details of the optimization function in Algorithm 2. Further details can be found in Appendix A,D.
+
+Step 2: \(\mathbf{z}_{t}\) updatePlugging in the obtained \(\mathcal{C}_{t}^{*}\) into Eq. (13), we can obtain the standard LDPS gradient equipped with \(\mathcal{C}_{t}^{*}\), the optimized text embedding for step \(t\). i.e.,
+
+\[\nabla_{\mathbf{z}_{t}}\log p(\mathbf{z}_{t}|\mathbf{y},\mathcal{C}_{t}^{*})\simeq\mathbf{s}_{ \mathbf{\theta}^{*}}(\mathbf{z}_{t},\mathcal{C}_{t}^{*})+\rho_{t}\nabla_{\mathbf{z}_{t}}\| \mathbf{y}-\mathbf{A}\mathcal{D}_{\mathbf{\varphi}}(\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t}, \mathcal{C}_{t}^{*}])\|_{2}^{2}, \tag{13}\]where we set \(\rho_{t}\) to be the step size that weights the likelihood, similar to Chung et al. (2023b). We summarize our alternating sampling method in Algorithm 1 and Algorithm 2, based on DDIM sampling, with standard noise schedule notations adopted from Ho et al. (2020). The reason we refer this step to Step 3 in Algorithm 1 is that this is intertwined with the feasibility constraint from the latent diffusion model at every \(\gamma\) iteration, which will be described in the following.
+
+### Enforcing feasibility
+
+Step 2: projectionTo obtain the feasible solutions by the latent diffusion model, we additionally incorporate the VAE prior. Specifically, we consider the following loss, which is the maximum a posteriori (MAP) objective under the VAE prior in Eq. (2) with isotropic covariance.
+
+\[\mathcal{L}(\mathbf{x},\mathbf{z})=\|\mathbf{y}-\mathbf{A}\mathcal{D}_{\varphi}( \mathbf{z})\|_{2}^{2}+\zeta\|\mathbf{z}-\mathcal{E}_{\mathbf{\mu}}(\mathbf{x})\|_{2}^{2}, \tag{14}\]
+
+where \(\zeta\) absorbs the weighting caused by the variance of respective terms. We can solve Eq. (14) by splitting the variables similar in spirit to the alternating direction method of multipliers (Boyd et al., 2011). Namely, using the decoder approximation and setting \(\mathbf{x}=\mathcal{D}_{\varphi}(\mathbf{z})\), the optimization problem with respect to \(\mathbf{x}\) becomes
+
+\[\min_{\mathbf{x}}\|\mathbf{y}-\mathbf{A}\mathbf{x}\|_{2}^{2}+\zeta\|\mathbf{z}- \mathcal{E}_{\mathbf{\phi}}^{\mathbf{\mu}}(\mathcal{D}_{\varphi}(\mathbf{z}))\|_{2}^{2}+ \lambda\|\mathbf{x}-\mathcal{D}_{\varphi}(\mathbf{z})+\mathbf{\eta}\|_{2}^{2}. \tag{15}\]
+
+Here, we set dual variable \(\mathbf{\eta}\) as a zero vector and do not consider its update. This leads to
+
+\[\mathbf{x}^{*}=\operatorname*{arg\,min}_{\mathbf{x}}\|\mathbf{y}-\mathbf{A}\mathbf{x }\|_{2}^{2}+\lambda\|\mathbf{x}-\mathcal{D}_{\varphi}(\mathbf{z})\|_{2}^{2}, \tag{16}\]
+
+which can be solved with negligible computation cost such as conjugate gradient (CG). Subsequently, using the encoder approximation and setting \(\mathbf{z}=\mathcal{E}_{\mathbf{\phi}}(\mathbf{x})\) with \(\mathbf{\eta}=\mathbf{0}\), the optimization problem with respect to \(\mathbf{z}\) reads
+
+\[\mathbf{z}^{*}=\operatorname*{arg\,min}_{\mathbf{z}}\|\mathbf{y}-\mathbf{A}\mathcal{D}_{ \varphi}\mathcal{E}_{\mathbf{\phi}}(\mathbf{x})\|_{2}^{2}+\zeta\|\mathbf{z}-\mathcal{E}_{ \mathbf{\phi}}(\mathbf{x})\|_{2}^{2}, \tag{17}\]
+
+which has a closed-form solution \(\mathbf{z}_{0}^{*}=\mathcal{E}_{\mathbf{\phi}}(\mathbf{x}_{0})\). Solving for Eq. (14) is performed on the _clean_ data manifold with the latents obtained through the Tweedie's formula, similar to Chung et al. (2023c); Zhu et al. (2023), as presented in line 6-7 of Algorithm 1.
+
+In practice, we choose to apply Eq. (16),Eq. (17) every few iteration to control dramatic changes in the sampling, and to save computation. Nevertheless, solving Eq. (16) requires access to \(\mathbf{A}^{\top}\), which is often non-trivial to define. Contrarily, our jax implementation enables defining \(\mathbf{A}^{\top}\) through jax.vjp. For further discussion, see Appendix E. Note that by Eq. (17), we guarantee that the clean latents stay on the _range space_ of the encoder4, which minimizes the train-test time discrepancy. This is natural as the training of LDMs is done with latents that are in the range space of \(\mathcal{E}_{\mathbf{\phi}}\). For this reason, we often denote the method proposed in this section simply as "projection".
+
+Footnote 4: This is different from the range-null space decomposition of the imaging operator, as proposed in Wang et al. (2023c).
+
+### Further discussions
+
+Relation to the previous approachThe crucial component that delineates LDM is the existence of VAE. When naively using the VAE, the decoder introduces a significant amount of error especially when the estimated clean latent \(\hat{\mathbf{z}}_{0}^{(\mathcal{C})}\) falls off the manifold of the clean latents, which inevitably happens with the LDPS approximation. Rout et al. (2023) proposed Posterior Sampling using Latent Diffusion (PSLD) to regularize the update steps on the latent so that the clean latents are led to the fixed point of the successive application of decoding-encoding. Formally, omitting the dependence on \(\mathcal{C}\), they use the following gradient step
+
+\[\nabla_{\mathbf{z}_{s}}\log(\mathbf{y}|\mathbf{z}_{t})\simeq\nabla_{\mathbf{z}_{ t}}\left(\|\mathbf{y}-\mathbf{A}\mathcal{D}_{\varphi}(\hat{\mathbf{z}}_{0})\|_{2}^{2}+ \lambda\|\hat{\mathbf{z}}_{0}-\mathcal{E}_{\mathbf{\phi}}(\mathcal{D}_{\varphi}(\hat{ \mathbf{z}}_{0}))\|_{2}^{2}\right), \tag{18}\]
+
+where the additional regularization term weighted by \(\lambda\) leads \(\hat{\mathbf{z}}_{0}\) towards the fixed point. From our context summarized in the loss function in Eq. (14), their approach is equivalent to using the following loss function:
+
+\[\mathcal{L}_{PSLD}(\mathbf{z})=\mathcal{L}(\mathcal{D}_{\varphi}(\mathbf{ z}),\mathbf{z}) \tag{19}\]In order word, rather than using a soft constraint by alternating minimization between \(\mathbf{x}\) and \(z\) as in our approach, they enforce hard constraint between the \(\mathbf{x}\) and \(\mathbf{z}\) in the form of \(\mathbf{x}=\mathcal{D}_{\mathbf{\varphi}}(\mathbf{z})\). Although this provided a first successful demonstration of the LDIS, the nature of VAE is not used in the formulation, which may explain why our approach is outperforming.
+
+Targetting arbitrary resolutionDespite its fully convolutional nature, as SD was trained with 64\(\times\)64 latents (\(\leftrightarrow 512\times 512\) images), the performance degrades when we aim to deal with larger dimensions, again due to train-test time discrepancy. Several works aimed to mitigate this issue by processing the latents with strided patches (Bar-Tal et al., 2023; Jimenez, 2023; Wang et al., 2023a) that increases the computational burden by roughly \(\mathcal{O}(n^{2})\). In contrast, we show that our projection approach, used _without_ any patch processing, can outperform previous methods that rely on patches, resulting in significantly faster inference speed. In Appendix F, we show that our approach is also useful for targeting arbitrary resolution image restoration, as the errors accumulated by processing latents in higher dimensions can be corrected through our projection approach.
+
+## 4 Experiments
+
+Datasets, ModelsWe consider two different well-established datasets: 1) FFHQ 512\(\times\)512 (Karras et al., 2019), and 2) ImageNet 512\(\times\)512 (Deng et al., 2009). For the former, we use the first 1000 images for testing, similar to Chung et al. (2023b). For the latter, we choose 1k images out of 10k test images provided in Saharia et al. (2022a) by interleaved sampling, i.e. using images of index 0, 10, 20, etc. after ordering by name. For the latent diffusion model, we choose SD v1.4 pre-trained on the LAION dataset for all the experiments, including the baseline comparison methods based on LDM. As there is no publicly available image diffusion model that is trained on an identical dataset, we choose ADM (Dhariwal and Nichol, 2021) trained on ImageNet 512\(\times\)512 data as the universal prior when implementing baseline image-domain DIS. Note that this discrepancy may lead to an unfair advantage in the performance for evaulation on ImageNet, and an unfair disadvantage in the performance when evaluating on FFHQ. All experiments were done on NVIDIA A100 40GB GPUs.
+
+Inverse ProblemsWe test our method on the following degradations: 1) Super-resolution from \(\times 8\) averagepooling, 2) Inpainting from 10-20% free-form masking as used in Saharia et al. (2022a), 3) Gaussian deblurring from an image convolved with a 61\(\times\)61 size Gaussian kernel with \(\sigma=3.0\), 4) Motion deblurring from an image convolved with a 61\(\times\)61 motion kernel that is randomly sampled with intensity 0.55, following Chung et al. (2023b). For all degradations, we include mild additive white Gaussian noise with \(\sigma_{y}=0.01\).
+
+Footnote 5: [https://github.com/LeviBorodenko/motionblur](https://github.com/LeviBorodenko/motionblur)
+
+EvaluationAs the main objective of this study is to improve the performance of LDIS, we mainly focus our evaluation on the comparison against the current SOTA LDIS: we compare against LDPS, GML-DPS (Rout et al., 2023), PSLD (Rout et al., 2023), and LDIR (He et al., 2023). Notably, all LDIS including the proposed P2L use 1000 NFE DDIM sampling with \(\eta=0.0\)6. We additionally compare against SOTA image-domain DIS: DPS (Chung et al., 2023b), Diff-PIR (Zhu et al., 2023), DDS (Chung et al., 2023c), and IIGDM (Song et al., 2023b). For DPS, we use 1000 NFE DDIM sampling. For Diff-PIR, DDS, and IIGDM, we use 100 NFE DDIM sampling. We choose the optimal \(\eta\) values for these algorithms through grid-search. Details about the comparison methods can be found in Appendix D.3. We perform a quantitative evaluation with standard metrics: PSNR, FID, and LPIPS.
+
+Footnote 6: The parameter \(\eta\) indicates the stochasticity of the sampler. \(\eta=0.0\) leads to deterministic PF-ODE.
+
+Comparison against baselineIn all of the inverse problems that we consider in the paper, our method outperforms all the baselines by quite a large margin in terms of perceptual quality, measured by FID and LPIPS, while keeping the distortion at a comparable level against the current state-of-the-art methods. Especially, we see about 10 FID decrease in deblurring and inpainting tasks compared to the runner up in both FFHQ and ImageNet dataset (See Tables 8,2). The superiority can also be clearly seen in Fig. 1, where P2L achieves stable, high-quality reconstruction throughout all tasks. Results from both LDPS and PSLD often contain local grid-like artifacts (Red boxes in Figures) and are blurry. With P2L, the restored images are sharpened while the artifacts are effectively removed.
+
+LDIR are less prone to artifacts owing to the smoothed history gradient updates, but often results in unrealistic textures and deviations from the measurement, which is also reflected in having the lowest PSNR among the LDIS-class methods. In contrast, P2L is free from such drawbacks even when leveraging Adam-like gradient update steps. However, it should be noted that the compute time for P2L linearly increases as we increase the number of training iterations for the text embedding. The compute time for \(K=0\) is similar to other LDIS baselines, but it becomes slower if \(K\) becomes larger. Devising a more time-efficient way to perform text embedding optimization is thus a promising future research direction. For further details on the runtime analysis, see Appendix C.
+
+One rather surprising finding is the heavy downgrade in the performance for DIS methods. Even on in-distribution ImageNet test data, methods such as DPS and DiffPIR become very unstable. This can be attributed to the generative prior being poor: directly training diffusion models on high-resolution images often result in poor performance7. This observation again points to the importance of developing methods that can leverage foundation models when aiming for general domain higher-resolution data. See Appendix G for further results. As a final note, we believe that the compromise in PSNR is related to the imperfectness of the VAE used in SD v1.48, and we expect
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c c c} \hline \hline  & \multicolumn{3}{c}{**SR (\(\times\)8)**} & \multicolumn{3}{c}{**Deblur (motion)**} & \multicolumn{3}{c}{**Deblur (gauss)**} & \multicolumn{3}{c}{**Inguinal**} \\ \cline{2-13}
+**Method** & FID\(\downarrow\) & LPIPS\(\downarrow\) & PSNR\(\uparrow\) & FID\(\downarrow\) & LPIPS\(\downarrow\) & PSNR\(\uparrow\) & FID\(\downarrow\) & LPIPS\(\downarrow\) & PSNR\(\uparrow\) & FID\(\downarrow\) & LPIPS\(\downarrow\) & PSNR\(\uparrow\) \\ \hline P2L (ours) & **51.81** & **0.386** & **23.38** & **54.11** & **0.360** & **24.79** & **39.10** & **0.325** & 25.11 & **32.82** & **0.229** & 21.99 \\ \hline LDPS & 61.09 & 0.475 & 23.21 & 71.12 & 0.441 & 23.32 & 48.17 & 0.392 & 24.91 & 46.72 & 0.332 & 21.54 \\ GML-DPS (Rout et al., 2023) & 60.36 & 0.456 & 23.21 & 59.08 & 0.403 & 24.35 & 45.33 & 0.377 & **25.44** & 47.30 & 0.294 & 21.12 \\ PSLD (Rout et al., 2023) & 60.81 & 0.471 & 23.17 & 59.63 & 0.398 & 24.21 & 45.44 & 0.376 & 25.42 & 40.57 & 0.251 & 20.92 \\ LDIR (He et al., 2023) & 63.46 & 0.480 & 22.28 & 88.51 & 0.475 & 21.37 & 72.10 & 0.506 & 22.45 & 50.65 & 0.313 & **23.28** \\ \hline DDS (Chung et al., 2023c) & 203.2 & 1.213 & 12.72 & 84.67 & 0.925 & 14.52 & 70.51 & 0.835 & 16.58 & 60.18 & 0.354 & 17.03 \\ DPS (Chung et al., 2023b) & 54.61 & 0.544 & 20.70 & 71.99 & 0.599 & 19.62 & 98.33 & 0.910 & 15.05 & 71.70 & 0.360 & 15.15 \\ DiffPIR (Zhu et al., 2023) & 488.3 & 1.182 & 13.44 & 87.04 & 0.622 & 19.32 & 79.31 & 0.755 & 20.55 & 45.97 & 0.300 & 20.11 \\ TIGDM (Song et al., 2023b) & 53.00 & 0.490 & 21.08 & 75.35 & 0.682 & 18.66 & 70.26 & 0.797 & 21.96 & 65.75 & 0.322 & 16.84 \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Quantitative evaluation (PSNR, LPIPS, FID) of inverse problem solving on ImageNet 512\(\times\)512-1k validation dataset. **Bold**: best, underline: second best. Methods that are not LDM-based are shaded in gray.
+
+Figure 1: Inverse problem solving results on ImageNet \(512\times 512\) test set. Row 1: SR\(\times\)8, Row 2: gaussian deblurring, Row 3: motion deblurring, row 4: inpainting.
+
+such degradation to be mitigated when switching to better, larger autoencoders such as SDXL (Podell et al., 2023).
+
+Design componentsIn Table 3, we perform an ablation study on the design components of the proposed method. From the table, we confirm that prompt tuning, projection to the range space of the encoder, and performing proximal update step (denoted as \(\Gamma\)) before the projection all contributes to the gain in the performance. It is important that these gains are synergistic, and one component does not hamper the other. In the Appendix Tab. 7, we further show that our prompt-tuning approach is robust to the variation in the hyper-parameters (learning rate, number of iterations). Specifically, among the 9 configurations that we try, only the one with 5 iterations, lr=0.001 is inferior to not using prompt tuning. In Fig. 2, we visualize the progress of \(\mathcal{D}(\hat{\mathbf{z}}_{0})\) through time \(t\) starting from the same random seed, comparing LDPS, PSLD, and LDPS + projection (row 4 of Tab. 6). Here, we see that our proposed projection approach effectively suppresses the artifacts that arise during the reconstruction process, whereas PSLD introduces additional artifacts. Furthermore, in Appendix F, we show that our approach is also useful for targeting arbitrary resolution image restoration, as the errors accumulated by processing latents in higher dimensions can be corrected through our projection approach. Remarkably, we see that our approach often offers better results (e.g. see Fig. 4) than operating in strided patches (Bar-Tal et al., 2023; Jimenez, 2023), which requires quadratic scaling of compute time.
+
+Choice of \(\Gamma\)When projecting to the range space of \(\mathcal{E}\), we choose to use the proximal optimization strategy in Eq. (16). Instead, one could resort to projection to the measurement subspace ("gluing" of Rout et al. (2023)) by using \(\mathbf{\Gamma}(\hat{\mathbf{x}}_{0})=\mathbf{A}^{\top}\mathbf{y}+(\mathbf{I}-\mathbf{A}^{\top}\mathbf{A} )\hat{\mathbf{x}}_{0}\). In Table 4, we compare our choice of \(\mathbf{\Gamma}\) against the gluing on various noise levels on FFHQ SR\(\times 8\). We see that for all noise levels, the proximal steps consistently outperform the gluing, even when \(\mathbf{\Gamma}\) is applied every \(\gamma=4\) steps of reverse diffusion. Furthermore, due to the noise-amplifying nature of projection, the differences become more pronounced as we increase the noise level. The difference in the compute time between the two choices is minimal: 331.7 [s] vs 333.2 [s] measured in wall-clock time using RTX 3090 GPU per the restoration of a single image when we compare gluing vs. proximal optimization.
+
+## 5 Conclusion
+
+We proposed P2L, a latent diffusion model-based inverse problem solver that introduces two new strategies. First, a prompt tuning method to optimize the continuous input text embedding used for diffusion models was developed. We observed that our strategy can boost the performance by a good margin compared to the usage of null text embedding that prior works employ. Second, a projection approach to keep the latents in the range space of the encoder during the reverse diffusion process was proposed. We show that our approach paves way to jointly utilizing diffusion generative prior and the VAE generative prior. Our approach effectively mitigated the artifacts that often arise during inverse problem solving, while also sharpening the final output. P2L outperforms previous diffusion model-based inverse problem solvers that operate on the latent and the image domain.
+
+LimitationsWhile prompt tuning enhances the performance, it also incurs additional computational complexity as additional forward/backward passes through the latent diffusion model and the decoder is necessary. Consequently, the method will need future investigations when aiming for time-critical applications. As we optimize the continuous text embeddings rather than the discrete text directly, it is hard to decipher what the text embedding after the optimization has converged to. This is a limitation of the text embedder used for SD, as CLIP does not utilize a decoder. We could instead opt for the use
+
+\begin{table}
+\begin{tabular}{cof Imagen (Saharia et al., 2022b), where T-5 with an encoder-decoder architecture is used, where one could easily check the learned text from our prompt-tuning scheme. Moreover, we did not consider the usage of CFG, which would enable flexible control on the degree of sharpening. Extending the prompt tuning idea to jointly optimize the embedding of the conditional and the unconditional model may be an interesting direction of future research. Although we have provided a unified optimization perspective to derive our algorithm, we did not perform convergence analysis in this work. Further analysis of P2L would be an interesting direction of future research, similar to what was done in Rout et al. (2023).
+
+Ethics statementWhile our method can lead to advancements in areas such as computational imaging, medical imaging, and other fields where inverse problems are prevalent, we also recognize the potential for misuse in areas like deepfake generation or unauthorized data reconstruction, naturally leading from the use of generative models. The potential bias within the training dataset of the diffusion model may be potentially amplified with the usage of our method. We have taken care to ensure that our experiments adhere to ethical guidelines, using publicly available datasets or those for which we have obtained explicit permissions. We urge the community to adopt responsible practices when applying our findings and to consider the broader societal implications of the technology.
+
+Reproducibility statementIn order to facilitate reproducibility, We detail our implementation in the form of Algorithms (Alg. 1,2,3), and pseudo-code (Fig. 3). The specific hyper-parameters chosen for the method is detailed in Appendix D.
+
+## References
+
+* (1)
+* Balke et al. (2022) Thilo Balke, Fernando Davis, Cristina Garcia-Cardona, Michael McCann, Luke Pfister, and Brendt Wohlberg. Scientific Computational Imaging COde (SCICO). Software library available from [https://github.com/lanl/scico](https://github.com/lanl/scico), 2022.
+* Bar-Tal et al. (2023) Omer Bar-Tal, Lior Yariv, Yaron Lipman, and Tali Dekel. Multidiffusion: Fusing diffusion paths for controlled image generation. 2023.
+* Baydin et al. (2018) Atilim Gunes Baydin, Barak A Pearlmutter, Alexey Andreyevich Radul, and Jeffrey Mark Siskind. Automatic differentiation in machine learning: a survey. _Journal of Marchine Learning Research_, 18:1-43, 2018.
+* Blau and Michaeli (2018) Yochai Blau and Tomer Michaeli. The perception-distortion tradeoff. In _Proceedings of the IEEE conference on computer vision and pattern recognition_, pp. 6228-6237, 2018.
+* Bora et al. (2017) Ashish Bora, Ajil Jalal, Eric Price, and Alexandros G Dimakis. Compressed sensing using generative models. In _International conference on machine learning_, pp. 537-546. PMLR, 2017.
+* Boyd et al. (2011) Stephen Boyd, Neal Parikh, and Eric Chu. _Distributed optimization and statistical learning via the alternating direction method of multipliers_. Now Publishers Inc, 2011.
+* Brock et al. (2018) Andrew Brock, Jeff Donahue, and Karen Simonyan. Large scale gan training for high fidelity natural image synthesis. _arXiv preprint arXiv:1809.11096_, 2018.
+* Brown et al. (2020) Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. _Advances in neural information processing systems_, 33:1877-1901, 2020.
+* Chen et al. (2022) Xi Chen, Xiao Wang, Soravit Changpinyo, AJ Piergiovanni, Piotr Padlewski, Daniel Salz, Sebastian Goodman, Adam Grycner, Basil Mustafa, Lucas Beyer, et al. Pali: A jointly-scaled multilingual language-image model. _arXiv preprint arXiv:2209.06794_, 2022.
+* Chung and Ye (2022) Hyungjin Chung and Jong Chul Ye. Score-based diffusion models for accelerated mri. _Medical Image Analysis_, pp. 102479, 2022.
+* Chung et al. (2023a) Hyungjin Chung, Jeongsol Kim, Sehui Kim, and Jong Chul Ye. Parallel diffusion models of operator and image for blind inverse problems. _IEEE/CVF Conference on Computer Vision and Pattern Recognition_, 2023a.
+
+* Chung et al. (2023) Hyungjin Chung, Jeongsol Kim, Michael Thompson Mccann, Marc Louis Klasky, and Jong Chul Ye. Diffusion posterior sampling for general noisy inverse problems. In _International Conference on Learning Representations_, 2023b. URL [https://openreview.net/forum?id=OnD9zGAGT@k](https://openreview.net/forum?id=OnD9zGAGT@k).
+* Chung et al. (2023c) Hyungjin Chung, Suhyeon Lee, and Jong Chul Ye. Fast diffusion sampler for inverse problems by geometric decomposition. _arXiv preprint arXiv:2303.05754_, 2023c.
+* Chung et al. (2023d) Hyungjin Chung, Dohoon Ryu, Michael T Mccann, Marc L Klasky, and Jong Chul Ye. Solving 3d inverse problems using pre-trained 2d diffusion models. _IEEE/CVF Conference on Computer Vision and Pattern Recognition_, 2023d.
+* Daras et al. (2022) Giannis Daras, Yuval Dagan, Alexandros G Dimakis, and Constantinos Daskalakis. Score-guided intermediate layer optimization: Fast langevin mixing for inverse problem. _arXiv preprint arXiv:2206.09104_, 2022.
+* Delbracio & Milanfar (2023) Mauricio Delbracio and Peyman Milanfar. Inversion by direct iteration: An alternative to denoising diffusion for image restoration. _arXiv preprint arXiv:2303.11435_, 2023.
+* Deng et al. (2009) Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale hierarchical image database. In _2009 IEEE conference on computer vision and pattern recognition_, pp. 248-255. Ieee, 2009.
+* Dhariwal & Nichol (2021) Prafulla Dhariwal and Alexander Quinn Nichol. Diffusion models beat GANs on image synthesis. In A. Beygelzimer, Y. Dauphin, P. Liang, and J. Wortman Vaughan (eds.), _Advances in Neural Information Processing Systems_, 2021.
+* Efron (2011) Bradley Efron. Tweedie's formula and selection bias. _Journal of the American Statistical Association_, 106(496):1602-1614, 2011.
+* Feng et al. (2023) Berthy T Feng, Jamie Smith, Michael Rubinstein, Huiwen Chang, Katherine L Bouman, and William T Freeman. Score-based diffusion models as principled priors for inverse imaging. _arXiv preprint arXiv:2304.11751_, 2023.
+* Gal et al. (2022) Rinon Gal, Yuval Alaluf, Yuval Atzmon, Or Patashnik, Amit H Bermano, Gal Chechik, and Daniel Cohen-Or. An image is worth one word: Personalizing text-to-image generation using textual inversion. _arXiv preprint arXiv:2208.01618_, 2022.
+* Gonzalez et al. (2022) Mario Gonzalez, Andres Almansa, and Pauline Tan. Solving inverse problems by joint posterior maximization with autoencoding prior. _SIAM Journal on Imaging Sciences_, 15(2):822-859, 2022.
+* He et al. (2023) Linchao He, Hongyu Yan, Mengting Luo, Kunming Luo, Wang Wang, Wenchao Du, Hu Chen, Hongyu Yang, and Yi Zhang. Iterative reconstruction based on latent diffusion model for sparse data reconstruction. _arXiv preprint arXiv:2307.12070_, 2023.
+* Hertz et al. (2022) Amir Hertz, Ron Mokady, Jay Tenenbaum, Kfir Aherman, Yael Pritch, and Daniel Cohen-Or. Prompt-to-prompt image editing with cross attention control. _arXiv preprint arXiv:2208.01626_, 2022.
+* Ho & Salimans (2021) Jonathan Ho and Tim Salimans. Classifier-free diffusion guidance. In _NeurIPS 2021 Workshop on Deep Generative Models and Downstream Applications_, 2021. URL [https://openreview.net/forum?id=qW&Kxfyb1](https://openreview.net/forum?id=qW&Kxfyb1).
+* Ho et al. (2020) Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. _Advances in Neural Information Processing Systems_, 33:6840-6851, 2020.
+* Ho et al. (2022) Jonathan Ho, William Chan, Chitwan Saharia, Jay Whang, Ruiqi Gao, Alexey Gritsenko, Diederik P Kingma, Ben Poole, Mohammad Norouzi, David J Fleet, et al. Imagen video: High definition video generation with diffusion models. _arXiv preprint arXiv:2210.02303_, 2022.
+* Jimenez (2023) Alvaro Barbero Jimenez. Mixture of diffusers for scene composition and high resolution image generation. _arXiv preprint arXiv:2302.02412_, 2023.
+* Kadkhodaie & Simoncelli (2021) Zahra Kadkhodaie and Eero Simoncelli. Stochastic solutions for linear inverse problems using the prior implicit in a denoiser. In _Advances in Neural Information Processing Systems_, volume 34, pp. 13242-13254. Curran Associates, Inc., 2021.
+
+* Kamilov et al. (2023) Ulugbek S Kamilov, Charles A Bouman, Gregery T Buzzard, and Brendt Wohlberg. Plug-and-play methods for integrating physical and learned models in computational imaging: Theory, algorithms, and applications. _IEEE Signal Processing Magazine_, 40(1):85-97, 2023.
+* Karras et al. (2019) Tero Karras, Samuli Laine, and Timo Aila. A style-based generator architecture for generative adversarial networks. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 4401-4410, 2019.
+* Karras et al. (2022) Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-based generative models. In _Proc. NeurIPS_, 2022.
+* Kawar et al. (2021) Bahjat Kawar, Gregory Vaksman, and Michael Elad. Snips: Solving noisy inverse problems stochastically. _Advances in Neural Information Processing Systems_, 34:21757-21769, 2021.
+* Kawar et al. (2022) Bahjat Kawar, Michael Elad, Stefano Ermon, and Jiaming Song. Denoising diffusion restoration models. In Alice H. Oh, Alekh Agarwal, Danielle Belgrave, and Kyunghyun Cho (eds.), _Advances in Neural Information Processing Systems_, 2022. URL [https://openreview.net/forum?id=kxXvopt9pWK](https://openreview.net/forum?id=kxXvopt9pWK).
+* Kingma & Ba (2015) Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In _ICLR_, 2015.
+* Kingma & Welling (2013) Diederik P Kingma and Max Welling. Auto-encoding variational bayes. _arXiv preprint arXiv:1312.6114_, 2013.
+* Kojima et al. (2022) Takeshi Kojima, Shixiang Shane Gu, Machel Reid, Yutaka Matsuo, and Yusuke Iwasawa. Large language models are zero-shot reasoners. _Advances in neural information processing systems_, 35:22199-22213, 2022.
+* Laroche et al. (2023) Charles Laroche, Andres Almansa, and Eva Coupete. Fast diffusion em: a diffusion model for blind inverse problems with application to deconvolution. _arXiv preprint arXiv:2309.00287_, 2023.
+* Lee et al. (2023) Suhyeon Lee, Hyungjin Chung, Minyoung Park, Jonghyuk Park, Wi-Sun Ryu, and Jong Chul Ye. Improving 3D imaging with pre-trained perpendicular 2D diffusion models. _arXiv preprint arXiv:2303.08440_, 2023.
+* Mardani et al. (2023) Morteza Mardani, Jiaming Song, Jan Kautz, and Arash Vahdat. A variational perspective on solving inverse problems with diffusion models. _arXiv preprint arXiv:2305.04391_, 2023.
+* Mokady et al. (2023) Ron Mokady, Amir Hertz, Kfir Aberman, Yael Pritch, and Daniel Cohen-Or. Null-text inversion for editing real images using guided diffusion models. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 6038-6047, 2023.
+* Murata et al. (2023) Naoki Murata, Koichi Saito, Chieh-Hsin Lai, Yuhta Takida, Toshimitsu Uesaka, Yuki Mitsufuji, and Stefano Ermon. Gibbsddrm: A partially collapsed gibbs sampler for solving blind inverse problems with denoising diffusion restoration. _arXiv preprint arXiv:2301.12686_, 2023.
+* Ongie et al. (2020) Gregory Ongie, Ajil Jalal, Christopher A Metzler, Richard G Baraniuk, Alexandros G Dimakis, and Rebecca Willett. Deep learning techniques for inverse problems in imaging. _IEEE Journal on Selected Areas in Information Theory_, 1(1):39-56, 2020.
+* Podell et al. (2023) Dustin Podell, Zion English, Kyle Lacey, Andreas Blattmann, Tim Dockhorn, Jonas Muller, Joe Penna, and Robin Rombach. Sdxl: improving latent diffusion models for high-resolution image synthesis. _arXiv preprint arXiv:2307.01952_, 2023.
+* Poole et al. (2023) Ben Poole, Ajay Jain, Jonathan T. Barron, and Ben Mildenhall. Dreamfusion: Text-to-3d using 2d diffusion. In _The Eleventh International Conference on Learning Representations_, 2023. URL [https://openreview.net/forum?id=FjNys5c7vyY](https://openreview.net/forum?id=FjNys5c7vyY).
+* Radford et al. (2021) Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, et al. Learning transferable visual models from natural language supervision. In _International conference on machine learning_, pp. 8748-8763. PMLR, 2021.
+* Radford et al. (2021)* Ramesh et al. (2022) Aditya Ramesh, Prafulla Dhariwal, Alex Nichol, Casey Chu, and Mark Chen. Hierarchical text-conditional image generation with clip latents. _arXiv preprint arXiv:2204.06125_, 1(2):3, 2022.
+* Romano et al. (2017) Yaniv Romano, Michael Elad, and Peyman Milanfar. The little engine that could: Regularization by denoising (red). _SIAM Journal on Imaging Sciences_, 10(4):1804-1844, 2017.
+* Rombach et al. (2022) Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bjorn Ommer. High-resolution image synthesis with latent diffusion models. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 10684-10695, 2022.
+* Rout et al. (2023) Litu Rout, Negin Raoof, Giannis Daras, Constantine Caramanis, Alexandros G Dimakis, and Sanjay Shakkottai. Solving linear inverse problems provably via posterior sampling with latent diffusion models. _arXiv preprint arXiv:2307.00619_, 2023.
+* Saharia et al. (2022a) Chitwan Saharia, William Chan, Huiwen Chang, Chris Lee, Jonathan Ho, Tim Salimans, David Fleet, and Mohammad Norouzi. Palette: Image-to-image diffusion models. In _ACM SIGGRAPH 2022 Conference Proceedings_, pp. 1-10, 2022a.
+* Saharia et al. (2022b) Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily L Denton, Kamyar Ghasemipour, Raphael Gontijo Lopes, Burcu Karagol Ayan, Tim Salimans, et al. Photorealistic text-to-image diffusion models with deep language understanding. _Advances in Neural Information Processing Systems_, 35:36479-36494, 2022b.
+* Schuhmann et al. (2022) Christoph Schuhmann, Romain Beaumont, Richard Vencu, Cade Gordon, Ross Wightman, Mehdi Cherti, Theo Coombes, Aarush Katta, Clayton Mullis, Mitchell Wortsman, et al. Laion-5b: An open large-scale dataset for training next generation image-text models. _Advances in Neural Information Processing Systems_, 35:25278-25294, 2022.
+* Shin et al. (2020) Taylor Shin, Yasaman Razeghi, Robert L Logan IV, Eric Wallace, and Sameer Singh. Autoprompt: Eliciting knowledge from language models with automatically generated prompts. _arXiv preprint arXiv:2010.15980_, 2020.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In _International Conference on Machine Learning_, pp. 2256-2265. PMLR, 2015.
+* Song et al. (2023a) Bowen Song, Soo Min Kwon, Zecheng Zhang, Xinyu Hu, Qing Qu, and Liyue Shen. Solving inverse problems with latent diffusion models via hard data consistency. _arXiv preprint arXiv:2307.08123_, 2023a.
+* Song et al. (2023b) Jiaming Song, Arash Vahdat, Morteza Mardani, and Jan Kautz. Pseudoinverse-guided diffusion models for inverse problems. In _International Conference on Learning Representations_, 2023b. URL [https://openreview.net/forum?id=9_gsMA8MRQ](https://openreview.net/forum?id=9_gsMA8MRQ).
+* Song et al. (2021) Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. In _9th International Conference on Learning Representations, ICLR_, 2021.
+* Song et al. (2022) Yang Song, Liyue Shen, Lei Xing, and Stefano Ermon. Solving inverse problems in medical imaging with score-based generative models. In _International Conference on Learning Representations_, 2022. URL [https://openreview.net/forum?id=vaRCHVj9uGI](https://openreview.net/forum?id=vaRCHVj9uGI).
+* Venkatakrishnan et al. (2013) Singanallur V Venkatakrishnan, Charles A Bouman, and Brendt Wohlberg. Plug-and-play priors for model based reconstruction. In _2013 IEEE global conference on signal and information processing_, pp. 945-948. IEEE, 2013.
+* Vincent (2011) Pascal Vincent. A connection between score matching and denoising autoencoders. _Neural computation_, 23(7):1661-1674, 2011.
+* Wang et al. (2023a) Jianyi Wang, Zongsheng Yue, Shangchen Zhou, Kelvin CK Chan, and Chen Change Loy. Exploiting diffusion prior for real-world image super-resolution. _arXiv preprint arXiv:2305.07015_, 2023a.
+
+Yinhuai Wang, Jiwen Yu, Runyi Yu, and Jian Zhang. Unlimited-size diffusion restoration. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 1160-1167, 2023b.
+* Wang et al. (2023c) Yinhuai Wang, Jiwen Yu, and Jian Zhang. Zero-shot image restoration using denoising diffusion null-space model. In _The Eleventh International Conference on Learning Representations_, 2023c. URL [https://openreview.net/forum?id=mRieQgMtNTQ](https://openreview.net/forum?id=mRieQgMtNTQ).
+* Wang et al. (2023d) Zhengyi Wang, Cheng Lu, Yikai Wang, Fan Bao, Chongxuan Li, Hang Su, and Jun Zhu. Prolific-dreamer: High-fidelity and diverse text-to-3d generation with variational score distillation. _arXiv preprint arXiv:2305.16213_, 2023d.
+* Whang et al. (2021) Jay Whang, Qi Lei, and Alex Dimakis. Solving inverse problems with a flow-based noise model. In _International Conference on Machine Learning_, pp. 11146-11157. PMLR, 2021.
+* Whang et al. (2022) Jay Whang, Mauricio Delbracio, Hossein Talebi, Chitwan Saharia, Alexandros G Dimakis, and Peyman Milanfar. Deblurring via stochastic refinement. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 16293-16303, 2022.
+* Zhou et al. (2022) Kaiyang Zhou, Jingkang Yang, Chen Change Loy, and Ziwei Liu. Learning to prompt for vision-language models. _International Journal of Computer Vision_, 130(9):2337-2348, 2022.
+* Zhu et al. (2023) Yuanzhi Zhu, Kai Zhang, Jingyun Liang, Jiezhang Cao, Bihan Wen, Radu Timofte, and Luc Van Gool. Denoising diffusion models for plug-and-play image restoration. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 1219-1229, 2023.
+
+## Appendix A Background on diffusion models
+
+**Lemma 1** (Tweedie's formula).: _Given a Gaussian perturbation kernel \(p(\mathbf{x}_{t}|\mathbf{x}_{0})=\mathcal{N}(\mathbf{x}_{t};s_{t}\mathbf{x}_{0},\sigma_{t}^{2} \mathbf{I})\), the posterior mean is given by_
+
+\[\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t}]=\frac{1}{\alpha_{t}}(\mathbf{x}_{t}+\sigma_{t}^{2 }\nabla_{\mathbf{x}_{t}}\log p(\mathbf{x}_{t})) \tag{20}\]
+
+Proof.: \[\nabla_{\mathbf{x}_{t}}\log p(\mathbf{x}_{t}) =\frac{\nabla_{\mathbf{x}_{t}}p(\mathbf{x}_{t})}{p(\mathbf{x}_{t})}\] (21) \[=\frac{1}{p(\mathbf{x}_{t})}\nabla_{\mathbf{x}_{t}}\int p(\mathbf{x}_{t}|\bm {x}_{0})p(\mathbf{x}_{0})\,d\mathbf{x}_{0}\] (22) \[=\frac{1}{p(\mathbf{x}_{t})}\int\nabla_{\mathbf{x}_{t}}p(\mathbf{x}_{t}|\mathbf{ x}_{0})p(\mathbf{x}_{0})\,d\mathbf{x}_{0}\] (23) \[=\frac{1}{p(\mathbf{x}_{t})}\int p(\mathbf{x}_{t}|\mathbf{x}_{0})\nabla_{\mathbf{ x}_{t}}\log p(\mathbf{x}_{t}|\mathbf{x}_{0})p(\mathbf{x}_{0})\,d\mathbf{x}_{0}\] (24) \[=\int p(\mathbf{x}_{0}|\mathbf{x}_{t})\nabla_{\mathbf{x}_{t}}\log p(\mathbf{x}_{t }|\mathbf{x}_{0})\,d\mathbf{x}_{0}\] (25) \[=\int p(\mathbf{x}_{0}|\mathbf{x}_{t})\frac{s_{t}\mathbf{x}_{0}-\mathbf{x}_{t}}{ \sigma_{t}^{2}}\,d\mathbf{x}_{0}\] (26) \[=\frac{s_{t}\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t}]-\mathbf{x}_{t}}{\sigma_ {t}^{2}}.\] (27)
+
+Rearranging the terms, we achieve the conclusion. 
+
+Lemma 1 lets us compute the posterior mean when we have access to the score function. In diffusion models, we parametrize the score function with a neural network and train it through denoising score matching
+
+\[\theta^{*}=\operatorname*{arg\,min}_{\theta}\mathbb{E}_{t\sim U[0,1],\mathbf{x}_{0 }\sim p_{\text{data}},\mathbf{x}\sim\mathcal{N}(0,\mathbf{I})}\|\mathbf{s}_{\mathbf{\theta}}( \mathbf{x}_{t},t)-\nabla_{\mathbf{x}_{t}}\log p(\mathbf{x}_{t}|\mathbf{x}_{0})\|_{2}^{2}. \tag{28}\]
+
+Let us consider the case of DDPM (Ho et al., 2020) with the forward perturbation kernel \(p(\mathbf{x}_{t}|\mathbf{x}_{0})=\mathcal{N}(\mathbf{x}_{t};\sqrt{\alpha_{t}}\mathbf{x}_{0},(1 -\bar{\alpha}_{t})\mathbf{I})\)9. Then, we have the following alternative parametrizations
+
+Footnote 9: In the discrete setup, \(\bar{\alpha}_{t}:=\prod_{i=1}^{t}\alpha_{t}\), and \(\alpha_{t}:=1-\beta_{t}\) with \(q(\mathbf{x}_{t}|\mathbf{x}_{t-1})=\mathcal{N}(\mathbf{x}_{t};\sqrt{1-\beta_{t}}\mathbf{x}_{t- 1},\beta_{t}\mathbf{I})\)
+
+\[\mathbf{s}_{\mathbf{\theta}^{*}}(\mathbf{x}_{t},t)=-\frac{1}{\sqrt{1-\bar{ \alpha}_{t}}}\mathbf{\epsilon}_{\mathbf{\theta}^{*}}(\mathbf{x}_{t},t)=\frac{\sqrt{\bar{ \alpha}_{t}}D_{\mathbf{\theta}^{*}}(\mathbf{x}_{0})-\mathbf{x}_{t}}{\sqrt{1-\bar{\alpha}_ {t}}}, \tag{29}\]
+
+where the second parametrization comes from epsilon-matching (Ho et al., 2020) and is mostly used throughout the work, and the last parametrization directly estimates the posterior mean by regarding the diffusion model as a denoiser.
+
+**Corollary 1** (Conditional Tweedie's formula).: \[\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t},\mathbf{y}]=\frac{1}{s_{t}}(\mathbf{x}_{t}+\sigma_{t} ^{2}\nabla_{\mathbf{x}_{t}}\log p(\mathbf{x}_{t}|\mathbf{y}))\] (30)
+
+The corollary is a simple consequence of conditioning the Tweedie's formula with an additional variable \(\mathbf{y}\). As \(\log p(\mathbf{x}_{t}|\mathbf{y})\) is intractable, we can estimate Eq. (30), with the choices of \(s_{t},\sigma_{t}\) made from DDPM, with Chung et al. (2023b)
+
+\[\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t},\mathbf{y}] =\frac{1}{\sqrt{\bar{\alpha}_{t}}}(\mathbf{x}_{t}+(1-\bar{\alpha}_{t} )\nabla_{\mathbf{x}_{t}}(\log p(\mathbf{x}_{t})+\log p(\mathbf{y}|\mathbf{x}_{t}))) \tag{31}\] \[\stackrel{{\eqref{eq:DDP}\leq}}{{\approx}}\frac{1} {\sqrt{\bar{\alpha}_{t}}}(\mathbf{x}_{t}+(1-\bar{\alpha}_{t})\left(\mathbf{s}_{\mathbf{ \theta}^{*}}(\mathbf{x}_{t},t)+\nabla_{\mathbf{x}_{t}}\log p(\mathbf{y}|\hat{\mathbf{x}}_{0}) \right))\] (32) \[=\hat{\mathbf{x}}_{0}+\frac{1-\bar{\alpha}_{t}}{\sqrt{\bar{\alpha}_{t} }}\nabla_{\mathbf{x}_{t}}\log p(\mathbf{y}|\hat{\mathbf{x}}_{0}) \tag{33}\]where \(\hat{\mathbf{x}}_{0}:=D_{\theta^{*}}(\mathbf{x}_{t},t)\). Further, we can circumvent the need to backpropagate through the diffusion model and save computation by using the DDS approximation (Chung et al., 2023c)
+
+\[\mathbb{E}[\mathbf{x}_{0}|\mathbf{x}_{t},\mathbf{y}]\overset{\text{(DDS)}}{\approx}\hat{\bm {x}}_{0}+\frac{1-\bar{\alpha}_{t}}{\sqrt{\bar{\alpha}_{t}}}\nabla_{\hat{\mathbf{x}} _{0}}\log p(\mathbf{y}|\hat{\mathbf{x}}_{0}), \tag{34}\]
+
+where the difference stems from that we take the gradient w.r.t. \(\hat{\mathbf{x}}_{0}\) rather than \(\mathbf{x}_{t}\). Running Eq. (4) with the approximations Eq. (32) or Eq. (34) amounts to approximately sampling from the posterior distribution.
+
+## Appendix B Proof-of-concept experiment
+
+For the caption generation with PALI, we simply take the captions with the highest score. Examples of the captions generated from PALI are presented in Fig. 8. In our initial experiments, we found that using PALI captions directly did not directly lead to an improvement in the performance, as it only describes the _content_ of the image, and says nothing about the _quality_ of the image. Therefore, we use the following text prompts for the oracle "A high quality photo of a {PALI_prompt}", similar to the general text prompts.
+
+For both inverse problems (SR\(\times 8\), inpainting with \(p=0.8\)), we use the LDPS algorithm with 1000 NFE and \(\eta=0.0\). We apply prompt tuning algorithm per denoising step as indicated in Algorithm 2, with \(K=5\) and learning rate of \(1e-4\). When optimizing for the text embedding, we initialize it with the embedding vector from the token "A high quality photo of a face" for FFHQ, and "A high quality photo" for ImageNet in the case of inpainting. Note that for the latter, we did not find much performance difference when initializing from the null text prompt, or even initializing it with "A high quality photo of a dog". For \(\times 8\) SR, we initialize the text embeddings from PALI captions generated from \(\mathbf{y}\), as we empirically observe that PALI captions from \(\mathbf{y}\) still have a relatively good coarse description about the given image.
+
+## Appendix C Runtime analysis
+
+In Tab. 5, we include the runtime for each algorithm used in the paper when solving inverse problems with diffusion models, measured in wall-clock time [s] with a single RTX 3090 GPU. Note that P2L (\(K=0\)) corresponds to the case where we do not use prompt-tuning, and only apply the idea of leveraging the VAE prior (i.e. encoder range space projection). In this case, the compute time is roughly equivalent to the LDIS baselines. As we increase the number of iterations for prompt embedding optimization, the required computation time approximately linearly increases. In this regard, P2L requires more compute against other LDIS baselines as we additionally optimize for the text prompt, which can be considered a downside of the approach. However, it should be noted that P2L is the first approach that shows the possibility and feasibility of the approach. While it may not be computationally efficient at this point, P2L would be a good comerstone that future works can build upon to devise faster, more efficient solvers.
+
+## Appendix D Implementation details
+
+### \(\mathcal{C}\) update prompt tuning
+
+We consider the following optimization problem
+
+\[\mathcal{C}^{*}=\operatorname*{arg\,min}_{\mathcal{C}}\|\mathbf{y}-\mathbf{AD}\left( \mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t},\mathbf{y},\mathcal{C}]\right)\|_{2}^{2}, \tag{35}\]
+
+\begin{table}
+\begin{tabular}{l c} \hline \hline Method & Time [s] & Type \\ P2L (\(K=5\)) & 1982.7 \\ P2L (\(K=3\)) & 1333.6 \\ P2L (\(K=1\)) & 657.3 \\ P2L (\(K=0\)) & 333.2 \\ \hline LDPS & 313.9 \\ GMLDPS (Rout et al., 2023) & 390.6 \\ PSLD (Rout et al., 2023) & 408.7 \\ LDIR (He et al., 2023) & 317.2 \\ \hline DDS (Chung et al., 2023c) & 20.1 \\ DFS (Chung et al., 2023b) & 291.0 \\ DiffPR (Zhu et al., 2023) & 21.2 \\ HGDM (Song et al., 2023b) & 30.2 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Comparison in compute time for each method using RTX 3090 GPU in wall-clock time [s].
+
+where Eq. (35) is performed for every timestep \(t\) during the inference stage. Here, we approximate the conditional posterior mean as
+
+\[\mathbb{E}[\mathbf{z}_{0}|\mathbf{z}_{t},\mathbf{y},\mathcal{C}] =\frac{1}{\sqrt{\bar{\alpha}_{t}}}\mathbf{z}_{t}+\frac{1-\bar{\alpha}_ {t}}{\sqrt{\bar{\alpha}_{t}}}\left(\nabla_{\mathbf{z}_{t}}\log p(\mathbf{z}_{t}| \mathcal{C})+\nabla_{\mathbf{z}_{t}}\log p(\mathbf{y}|\mathbf{z}_{t},\mathcal{C})\right) \tag{36}\] \[\simeq\hat{\mathbf{z}}_{0}^{(\mathcal{C})}+\frac{1-\bar{\alpha}_{t}}{ \sqrt{\bar{\alpha}_{t}}}\nabla_{\mathbf{z}_{t}}\log p(\mathbf{y}|\hat{\mathbf{z}}_{0}^{( \mathcal{C})})\] (37) \[\simeq\hat{\mathbf{z}}_{0}^{(\mathcal{C})}+\frac{1-\bar{\alpha}_{t}}{ \sqrt{\bar{\alpha}_{t}}}\nabla_{\hat{\mathbf{z}}_{0}^{(\mathcal{C})}}\log p(\mathbf{y} |\hat{\mathbf{z}}_{0}^{(\mathcal{C})}), \tag{38}\]
+
+which is the consequence of the DDS approximation in Eq. (34). Notice that we update our embeddings to improve the fidelity Eq. (35). However, in practice, this also leads to higher quality images in terms of perception. For optimizing Eq. (35), we use Adam with the learning rate and the number of iterations as denoted in Table 6 for every \(t\). In practice, we choose a static step size \(\rho=1.0\) with the gradient of the norm, which was shown to be effective in (Chung et al., 2023b). The resulting prompt tuning algorithm is summarized in Algorithm 2.
+
+```
+1:functionOptimizeEmb(\(\mathbf{z}_{t},\mathbf{y},\mathcal{C}_{t}^{(0)},K\))
+2:for\(k=1\)to\(K\)do
+3:\(\hat{\mathbf{\epsilon}}_{t}\leftarrow\mathbf{\epsilon_{0}}(\mathbf{z}_{t},\mathcal{C}_{t} ^{(k-1)})\)
+4:\(\hat{\mathbf{z}}_{0|t}\leftarrow(\mathbf{z}_{t}-\sqrt{1-\bar{\alpha}_{t}}\hat{\mathbf{ \epsilon}}_{t})/\sqrt{\bar{\alpha}_{t}}\)
+5:\(\hat{\mathbf{z}}_{0|t}\leftarrow\hat{\mathbf{z}}_{0|t}-\rho\nabla_{\mathbf{z}_{0|t}}\|\mathbf{y }-\mathcal{D}_{\mathbf{\varphi}}(\hat{\mathbf{z}}_{0|t})\|\)
+6:\(\hat{\mathbf{x}}_{0|t}\leftarrow\mathcal{D}_{\mathbf{\varphi}}(\hat{\mathbf{z}}_{0|t}^{(k- 1)})\)
+7:\(\mathcal{L}\leftarrow\|\mathbf{A}\hat{\mathbf{x}}_{0|t}(\mathcal{C}_{t}^{(k-1)})-\mathbf{y} \|_{2}^{2}\)
+8:\(\mathcal{C}_{t}^{(k)}\gets\mathcal{C}_{t}^{(k-1)}-\text{AdamGrad}(\mathcal{L }_{t})\)
+9:endfor
+10:return\(\mathcal{C}_{t}^{*}\leftarrow\mathcal{C}_{t}^{(K)}\)
+11:endfunction
+```
+
+**Algorithm 2** Prompt tuning
+
+\begin{table}
+\begin{tabular}{l l l l l l l l l l} \hline \hline  & \multicolumn{4}{c}{**FFHQ**} & \multicolumn{4}{c}{**ImageNet**} \\ \cline{2-11}  & \multicolumn{2}{c}{Deblur (motion)} & \multicolumn{2}{c}{Deblur (gauss)} & \multicolumn{2}{c}{SR\(\times\)8} & \multicolumn{2}{c}{inpaint} & \multicolumn{2}{c}{Deblur (motion)} & \multicolumn{2}{c}{Deblur (gauss)} & \multicolumn{2}{c}{SR\(\times\)8} & \multicolumn{2}{c}{inpaint} \\ \hline Gradient type & Adam & Adam & GD & Adam & Adam & GD & GD & GD \\ \(\rho_{t}\) & 0.05 & 0.05 & 1.0 & 0.05 & 0.1 & \(\alpha_{t}\) & 15\(\alpha_{t}\) & 0.5 \\ \(\gamma\) & 5 & 4 & 4 & 3 & 5 & 4 & 4 & 3 \\ \(\lambda\) & 1.0 & 1.0 & 1.0 & 0.1 & 1.0 & 1.0 & 1.0 & 1.0 & 0.1 \\ \(K\) & 3 & 5 & 5 & 1 & 3 & 3 & 3 & 1 & 1 \\ learning rate & \(5e-4\) & \(1e-4\) & \(1e-4\) & \(1e-4\) & \(1e-5\) & \(1e-4\) & \(1e-5\) & \(1e-4\) & \(1e-5\) & \(1e-4\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Hyper-parameter choice for the proposed method. White shade: hyper-parameters related to gradient updates, blue shade: hyper-parameters related to projecting onto the range space of \(\mathcal{E}\), red shade: hyper-parameters related to prompt tuning.
+
+```
+0:\(\mathbf{\epsilon}_{\mathbf{q}^{*}},\mathbf{z}_{T},\mathbf{y},\mathcal{C},T,K,\gamma,\beta_{1}, \beta_{2},\varepsilon,\mathbf{\Gamma}\)
+1:\(\mathbf{m}_{T}\leftarrow\texttt{np.zeros\_like}(\mathbf{z}_{T})\)
+2:\(\mathbf{v}_{T}\leftarrow\texttt{np.zeros\_like}(\mathbf{z}_{T})\)
+3:for\(t=T\)to\(1\)do
+4:\(\mathcal{C}_{t}^{*}\leftarrow\texttt{OptimizeEmb}(\mathbf{z}_{t},\mathbf{y},\mathcal{C} _{0}^{\dagger},K)\)
+5:\(\hat{\mathbf{\epsilon}}_{t}\leftarrow\mathbf{\epsilon}_{\mathbf{\theta}^{*}}(\mathbf{z}_{t}, \mathcal{C}_{t}^{*})\)
+6:\(\hat{\mathbf{z}}_{0|t}\leftarrow(\mathbf{z}_{t}-\sqrt{1-\hat{\alpha}_{t}}\hat{\mathbf{ \epsilon}}_{t})/\sqrt{\alpha_{t}}\)
+7:if\((t\to\gamma)=0\)then
+8:\(\hat{z}_{0|t}^{\gamma}\leftarrow\mathcal{E}\left(\Gamma\left(\Gamma\left(\hat{ \Sigma}_{0|t}\right)\right)\right)\)
+9:endif
+10:\(\mathbf{z}_{t-1}^{\prime}\leftarrow\sqrt{\alpha_{t-1}}\hat{\mathbf{z}}_{0|t}^{\prime} +\sqrt{1-\hat{\alpha}_{t-1}}\hat{\mathbf{\epsilon}}_{t}\)
+11:\(\mathbf{g}\leftarrow\nabla_{\mathbf{z}_{t}}|\mathcal{AD}(\hat{\mathbf{z}}_{0|t}-\mathbf{y})\)
+12:\(\mathbf{m}_{t-1}\leftarrow\left(\beta_{t}\mathbf{y}_{t}+(1-\beta_{1})\mathbf{g}\right)/(1 -\beta_{1})\)
+13:\(\mathbf{\epsilon}_{t-1}\leftarrow\mathbf{z}_{t-1}^{\prime}-\rho_{t}\frac{\mathbf{m}_{t-1}} {\sqrt{\hat{\mathbf{\epsilon}}_{t-1}+\varepsilon}}\)
+14:\(\mathcal{C}_{t-1}^{(0)}\leftarrow\mathcal{C}_{t}^{*}\)
+15:endfor
+16:return\(\mathbf{x}_{0}\leftarrow\mathcal{D}(\mathbf{z}_{0})\)
+```
+
+**Algorithm 3** P2L: Adam
+
+### \(\mathbf{z}_{t}\) update
+
+In Table 6, there are two gradient types: GD and Adam. For GD, we use standard gradient descent steps as presented in Algorithm 1. For Adam, using the same prompt tuning Algorithm 2, we adopt a history gradient update scheme as proposed in He et al. (2023) to arrive at Algorithm 3. Note that the hyper-parameters of the Adam update were fixed to be \(\beta_{1}=0.9,\beta_{2}=0.999,\varepsilon=1e-8\), which is the default setting. We only search for the optimal step size \(\rho_{t}\) via grid search, which is set to 0.1 for motion deblurring in ImageNet, and 0.05 otherwise.
+
+### Comparison methods
+
+LdpsLdps can be considered a straightforward extension image domain DPS (Chung et al., 2023b). The three works that we review in this section (He et al., 2023; Rout et al., 2023; Song et al., 2023a) all consider LDPS as a baseline. In LDPS, we have the following update scheme
+
+\[\mathbf{z}_{t-1}=\mathrm{DDIM}(\mathbf{z}_{t})-\rho\nabla_{\mathbf{z}_{t}}\|\mathbf{y}-\mathbf{AD} (\hat{\mathbf{z}}_{0})\|_{2}, \tag{39}\]
+
+where \(\rho\) is the step size, and \(\mathrm{DDIM}(\cdot)\) denotes a single step of DDIM sampling. We use a static step size of \(\rho=1\), widely adopted in literature.
+
+LDIR (He et al., 2023)Using Adam-like history gradient update scheme, a single iteration of the algorithm can be summarized as follows
+
+\[\mathbf{g}_{t} =\nabla_{\mathbf{z}_{t}}\|\mathbf{y}-\mathbf{AD}(\hat{\mathbf{z}}_{0})\| \tag{40}\] \[\hat{\mathbf{m}}_{t} =(\beta_{1}\mathbf{m}_{t-1}+(1-\beta_{1})\mathbf{g}_{t})/(1-\beta_{1})\] (41) \[\hat{\mathbf{v}}_{t} =(\beta_{2}\mathbf{v}_{t-1}+(1-\beta_{2})(\mathbf{g}_{t}\circ\mathbf{g}_{t}) )/(1-\beta_{2})\] (42) \[\mathbf{z}_{t-1} =\mathrm{DDIM}(\mathbf{z}_{t})-\rho\frac{\hat{\mathbf{m}}_{t}}{\sqrt{\hat {\mathbf{v}}_{t}}+\varepsilon}, \tag{43}\]
+
+where \(\circ\) denotes element-wise product, and \(\beta_{1},\beta_{2},\varepsilon\) are the hyperparameters of the sampling scheme. As LDIR uses a momentum-based update scheme, we have smoother gradient transitions. We fix \(\beta_{1}=0.9,\beta_{2}=0.999,\varepsilon=1e-8\) to be identical to when using the proposed method. The step size \(\rho\) is chosen to be the optimal value found through grid search: 0.1 for ImageNet motion deblurring, and 0.05 otherwise.
+
+GML-DPS, PSLD (Rout et al., 2023)GML-DPS attempts to regularize the predicted clean latent \(\hat{\mathbf{z}}_{0}\) to be a fixed point after encoding and decoding. Formally, the update step reads
+
+\[\mathbf{z}_{t-1}=\mathrm{DDIM}(\mathbf{z}_{t})-\rho\nabla_{\mathbf{z}_{t}}\left(\|\mathbf{y}- \mathbf{AD}(\hat{\mathbf{z}}_{0})\|_{2}+\gamma\|\hat{\mathbf{z}}_{0}-\mathcal{E}(\mathcal{ D}(\hat{\mathbf{z}}_{0}))\|_{2}\right). \tag{44}\]Further, PSLD applies an orthogonal projection onto the subspace of \(\mathbf{A}\) in between decoding and encoding to enforce fidelity
+
+\[\mathbf{z}_{t-1}=\mathrm{DDIM}(\mathbf{z}_{t})-\rho\nabla_{\mathbf{z}_{t}}\left( \|\mathbf{y}-\mathbf{A}\mathcal{D}(\hat{\mathbf{z}}_{0})\|_{2}+\gamma\|\hat{\mathbf{z}}_{0}- \mathcal{E}(\mathbf{A}^{\top}\mathbf{y}+(\mathbf{I}-\mathbf{A}^{\top}\mathbf{A})\mathcal{D}(\hat{ \mathbf{z}}_{0}))\|_{2}\right). \tag{45}\]
+
+We use the static step size of \(\rho=1\), and choose \(\gamma=0.1\), as advised in Rout et al. (2023). GML-DPS and PSLD are closest to the proposed method in spirit, as these methods attempt to guide the latents to stay closer to the natural manifold by enforcing them to be a fixed point after autoencoding. The difference is that these approaches use gradient guidance while we try to explicitly project the latents into the the natural manifold.
+
+Dps (Chung et al., 2023b)DPS is a DIS that utilizes the following update scheme10
+
+Footnote 10: The original work only considered DDPM sampling. We consider DDIM as a generalization of DDPM as it can be retrieved with \(\eta=1.0\).
+
+\[\mathbf{x}_{t-1}=\mathrm{DDIM}(\mathbf{x}_{t})-\nabla_{\mathbf{x}_{t}}\left( \|\mathbf{y}-\mathbf{A}\hat{\mathbf{x}}_{0}\|_{2}\right). \tag{46}\]
+
+The optimal value of \(\eta\) was found through grid search for each inverse problem: \(\eta=0.0\) for SR\(\times 8\), and \(\eta=1.0\) for others.
+
+\(\Pi\)Gbm (Song et al., 2023b)Similar to DPS, IIGDM considers the following gradient update scheme
+
+\[\mathbf{x}_{t-1}=\mathrm{DDIM}(\mathbf{x}_{t})-\left((\mathbf{y}-\mathbf{A}\hat{ \mathbf{x}}_{0})^{\top}(r_{t}^{2}\mathbf{A}\mathbf{A}^{\top}+\sigma^{2}\mathbf{I})^{-1}\mathbf{A} \frac{\partial\hat{\mathbf{x}}_{0}}{\partial\mathbf{x}_{t}}\right)^{\top}, \tag{47}\]
+
+where \(r_{t}\) is a hyper-parameter and \(\sigma\) is the noise level of the measurement. We take \(r_{t}\) as advised in (Song et al., 2023b), and use 100 step DDIM sampling with \(\eta=1.0\) for all experiments.
+
+Dds (Chung et al., 2023c)The following updates are used
+
+\[\hat{\mathbf{x}}^{\prime}_{0} =\arg\min_{\mathbf{x}}\frac{1}{2}\|\mathbf{y}-\mathbf{A}\mathbf{x}\|_{2}^{2}+ \frac{\gamma}{2}\|\mathbf{x}-\hat{\mathbf{x}}_{0}\|_{2}^{2} \tag{48}\] \[\mathbf{x}_{t-1} =\sqrt{\bar{\alpha}_{t-1}}\hat{\mathbf{x}}^{\prime}_{0}+\sqrt{1-\bar {\alpha}_{t-1}}-\eta^{2}\hat{\bar{\beta}_{t-1}^{2}}\hat{\mathbf{\epsilon}}_{t}+ \eta\tilde{\beta}_{t-1}\mathbf{\epsilon}, \tag{49}\]
+
+where Eq. (48) is solved through CG with 5 iterations, \(\gamma=1.0\). \(\eta=0.0\) is chosen for Gaussian deblurring, and \(\eta=1.0\) for the rest of the inverse problems.
+
+DiffPIR (Zhu et al., 2023)Similar to DDS, the following updates are used
+
+\[\hat{\mathbf{x}}^{\prime}_{0} =\arg\min_{\mathbf{x}}\frac{1}{2}\|\mathbf{y}-\mathbf{A}\mathbf{x}\|_{2}^{2}+ \frac{\lambda\sigma^{2}\bar{\alpha}_{t}}{2(1-\bar{\alpha}_{t})}\|\mathbf{x}-\hat{ \mathbf{x}}_{0}\|_{2}^{2} \tag{50}\] \[\mathbf{x}_{t-1} =\sqrt{\bar{\alpha}_{t-1}}\hat{\mathbf{x}}^{\prime}_{0}+\sqrt{1-\bar {\alpha}_{t-1}}(\sqrt{1-\bar{\zeta}}\hat{\mathbf{\epsilon}}_{t}+\sqrt{\bar{\zeta} }\mathbf{\epsilon}), \tag{51}\]
+
+where \(\sigma\) is the noise level of the measurement, and \(\lambda,\zeta\) are hyper-parameters. Unlike DDS, the solution to Eq. (50) is obtained as a closed-form solution. These hyper-parameters are found through grid search. SR\(\times 8\): \(\zeta=0.35,\lambda=35.0\) / Deblur: \(\zeta=0.3,\lambda=7.0\) / Inpaint: \(\zeta=1.0/\lambda=7.0\).
+
+## Appendix E Efficient implementation in JAX
+
+\begin{table}
+\begin{tabular}{l l l l l l l l l l} \hline steps & 0 & \multicolumn{3}{c}{\(1\)} & \multicolumn{3}{c}{\(3\)} & \multicolumn{3}{c}{\(5\)} \\ \hline lr & - & \(1e-5\) & \(1e-4\) & \(1e-3\) & \(1e-5\) & \(1e-4\) & \(1e-3\) & \(1e-5\) & \(1e-4\) & \(1e-3\) \\ \hline FID & 61.16 & 60.66 & 59.60 & **57.61** & 60.11 & 59.34 & 60.19 & 60.02 & 58.59 & 62.67 \\ PSNR & 26.49 & 26.69 & 26.71 & 26.73 & **26.78** & 26.70 & 26.61 & 26.73 & 26.17 & 26.38 \\ \hline \end{tabular}
+\end{table}
+Table 7: Robustness to hyper-parameters in prompt-tuning. FFHQ SR\(\times 8\) on 256 test images. **Bold**: best, underline: second best.
+
+ones = jnp.ones(x.shape) _,_AT = jax.vjp(A_funcs.A, ones) AT = lambda y:_AT(y)[0] A_funcs.AT = AT def cg_A(x, cg_lamb): return_A_funcs.AT(A_funcs.A(x)) + cg_lamb * x hatxe = D(hat20) cg_y = A_funcs.AT(y) + cg_lamb * hatxe@ hatxe@ hatxe@ _ = jax.scipy.sparse.linalg.cg(cg_A, cg_y, x0=hatxe)
+
+In model-based inverse problem solving, having access to efficient computation of the adjoint \(\mathbf{A}^{\top}\) is a must. Here, we consider a general case of solving linear inverse problems where the computation of SVD is too costly, and hence one has to define the adjoint operator manually (e.g. computed tomography). Furthermore, for cases such as deblurring from circular convolution, one needs to carefully design the operator, as there are many potential pitfalls (e.g. boundary, size mismatch). These are more often than not the limiting factors of the applicability of the model-based approaches for solving inverse problems. We show in Fig. 3 that this can be much alleviated by using jax, as we can implicitly define a transpose operator with reverse-mode automatic differentiation (Baydin et al., 2018). We note this design was also established in (Balke et al., 2022).
+
+Figure 4: Results on \(\times 8\) SR on DIV2K validation set of 768\(\times\)768 resolution. [Diffusion NFE per denoising step]. Vanilla and proposed process the latent as a whole.
+
+Figure 3: Defining \(\mathbf{A}^{\top}\) can be automatically achieved through jax.vjp given that \(\mathbf{A}\) is differentiable.
+
+Figure 2: Close-up of the progress of \(\mathcal{D}(\hat{\mathbf{z}}_{0})\) through time \(t\) when solving \(\times 8\) SR on FFHQ.
+
+Targetting arbitrary resolution
+
+For SD, using an encoder to convert from the image to the latent space reduces the dimension by \(\times 8\). When training SD, the diffusion model that operates on the latent space was trained with 64\(\times\)64 latents, obtained from 512\(\times\)512 images. When the image that we wish to restore (or generate) is larger than 512\(\times\)512, the latents will also be larger than 64\(\times\)64. In this case, due to the train-test time discrepancy, the results that we get will be suboptimal if one processes the larger latent as a whole (Fig. 5 (a)). A natural way to counteract this discrepancy is to process the latents in patches11. When processing in patches of size 64\(\times\)64 with stride 32 on both directions, it requires us 4 score function NFEs per denoising step (Fig. 5 (c),(d)). Bar-Tal et al. (2023) uniformly weights the overlapping patches, and Jimenez (2023) weights the patches with Gaussian weights with variance 0.01. The downside of these methods is that the number NFEs required for inference scales quadratically with the size of the image.
+
+Footnote 11: For all the experiments considered in this paper, we consider 768\(\times\)768 images (96\(\times\)96 latents).
+
+Notice that all methods that aim for high-resolution synthesis using latent diffusion models only focus on better dealing with the latents and use the decoding part as-is. This is due to the fact that the diffusion models that act in the latent space is more sensitive to the change in the input resolution, and hence the error could easily accumulate if we operate on larger latents directly. On the other hand, VAE is much more robust to the change in the input resolution. When given a latent that stays within the range space of the encoder, the decoder is able to produce a high-quality image directly even when the input size is larger than 64\(\times\) 64. In this regard, we can project this latent to the range space of \(\mathcal{E}\) by setting \(\hat{z}^{\prime}_{0}=\mathcal{D}(\mathbf{\Gamma}(\mathcal{E}(\hat{z}_{0})))\) for every few steps, as illustrated in Fig. 5 (b). Even though the proposed method is considerably faster than patch-based methods (Bar-Tal et al., 2023; Jimenez, 2023), we see that one can achieve a comparable, or superior performance, as presented in Fig. 4. Furthermore, in Fig. 6, we show that we can use both patching method and the projection method simultaneously, achieving the best results.
+
+## Appendix G Further experimental results
+
+Figure 5: Method comparison for processing higher resolution images in the latent space.
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c c c} \hline \hline  & \multicolumn{3}{c}{**SR (\(\times\)S)**} & \multicolumn{3}{c}{**Deblur (motion)**} & \multicolumn{3}{c}{**Deblur (gauss)**} & \multicolumn{3}{c}{**Inpaint**} \\ \cline{2-11}
+**Method** & FID\(\downarrow\) & LPIPS\(\downarrow\) & PSNR\(\uparrow\) & FID\(\downarrow\) & LPIPS\(\downarrow\) & PSNR\(\uparrow\) & FID\(\downarrow\) & LPIPS\(\downarrow\) & PSNR\(\uparrow\) \\ \hline P2L (ours) & **31.23** & **0.290** & 28.55 & 28.34 & **0.302** & **27.23** & **30.62** & **0.299** & 26.97 & **26.27** & **0.168** & 25.29 \\ \hline LDPS & 36.81 & 0.292 & **28.78** & 58.66 & 0.382 & 26.19 & 45.89 & 0.334 & 27.82 & 46.10 & 0.311 & 23.07 \\ GML-DPS (Rout et al., 2023) & 41.65 & 0.318 & 28.50 & 47.96 & 3.252 & 21.66 & 42.60 & 0.320 & **28.93** & 36.31 & 0.208 & 23.10 \\ PSL (D Rout et al., 2023) & 36.93 & 0.335 & 26.62 & 47.71 & 0.348 & 27.05 & 41.01 & 0.320 & **28.47** & 35.01 & 20.07 & 23.10 \\ LDIR (He et al., 2023) & 36.04 & 0.345 & 25.79 & **24.40** & 0.376 & 24.40 & 35.61 & 0.341 & 25.75 & 37.23 & 0.250 & **25.47** \\ \hline DDS (Chung et al., 2023c) & 262.0 & 1.278 & 13.01 & 88.70 & 1.014 & 14.68 & 74.02 & 0.932 & 17.03 & 113.6 & 0.421 & 17.92 \\ DPS (Chung et al., 2023c) & 47.65 & 0.340 & 21.81 & 65.91 & 0.601 & 21.11 & 10.02 & 0.983 & 15.71 & 13.77 & 0.692 & 15.35 \\ DiffPHR (Zhu et al., 2023c) & 141.1 & 1.266 & 13.80 & 27.02 & 0.664 & 20.13 & 69.15 & 0.751 & 22.27 & 33.92 & 0.238 & 24.91 \\ HIGDM (Song et al., 2023c) & 42.07 & 0.311 & 22.05 & 60.08 & 0.531 & 21.08 & 70.32 & 0.788 & 21.99 & 140.6 & 0.738 & 16.83 \\ \hline \hline \end{tabular}
+\end{table}
+Table 8: Quantitative evaluation (PSNR, LPIPS, FID) of inverse problem solving on FFHQ 512\(\times\)512-1k validation dataset. **Bold**: best, underline: second best. Methods that are not LDM-based are shaded in gray.
+
+Figure 6: Further results on \(\times\)8 SR on DIV2K validation set of 768\(\times\)768 resolution. Comparison between with and without using our projection approach on various baseline methods.
+
+Figure 7: Full image results of \(\times 8\) SR on DIV2K validation set of 768\(\times\)768 resolution. Left: measurement, Right: P2L
+
+Figure 8: Captions generated by PALI (Chen et al., 2022) from ground-truth ImageNet 512\(\times\)512 clean images, and the degraded images. The rightmost column contains images that are from the same ground truth. Captions in in orange box completely fail to describe the underlying image. Purple captions wrongly identify the image. Captions generated from degraded measurements often contain negative words such as blurry.
+
+Figure 9: ImageNet restoration results. Row 1-2: SR\(\times 8\), row 3-4: gaussian deblurring, row 5-6: motion deblurring, row 7-8: freeform inpainting; All with \(\sigma=0.01\) noise.
+
+Figure 10: Close-up comparison on diverse inverse problem tasks. Ground truth, measurement, DPS (Chung et al., 2023b), LDPS, PSLD (Rout et al., 2023), LDIR (He et al., 2023), and the proposed method.

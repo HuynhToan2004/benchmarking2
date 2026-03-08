@@ -1,0 +1,709 @@
+# Hessian-Aware Bayesian Optimization
+
+for Decision Making Systems
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Many approaches for optimizing decision making systems rely on gradient based methods requiring informative feedback from the environment. However, in the case where such feedback is sparse or uninformative, such approaches may result in poor performance. Derivative-free approaches such as Bayesian Optimization mitigate the dependency on the quality of gradient feedback, but are known to scale poorly in the high-dimension setting of complex decision making systems. This problem is exacerbated if the system requires interactions between several agents cooperating to accomplish a shared goal. To address the dimensionality challenge, we propose a compact multi-layered architecture modeling the dynamics of actor interactions through the concept of role. Additionally, we introduce Hessian-aware Bayesian Optimization to efficiently optimize the multi-layered architecture parameterized by a large number of parameters. Experimental results demonstrate that our method (ha-gp-ucb) works effectively on several benchmarks under resource constraints and malformed feedback settings.
+
+## 1 Introduction
+
+Decision Making Systems choose sequences of actions to accomplish a goal. Multi-Agent Decision Making Systems choose actions for multiple agents working together towards a shared goal. Multi-Agent Reinforcement Learning (marl) has emerged as a competitive approach for optimizing Decision Making Systems in the multi-agent setting.1Marl optimizes a _policy_ under the partially observable Markov Decision Process (pomdp) framework, where decision making happens in an _environment_ determined by a set of possible states and actions, and the _reward_ for an action is conditioned upon the partially observable state of the environment. A policy forms a set of decision-making rules capturing the most rewarding actions in a given state. marl utilizes gradient-based methods requiring a differentiable policy and informative gradients to make progress. This restriction requires the usage of large gradient-friendly policy representations (e.g., neural networks) and informative reward feedback from the environment (Pathak et al., 2017; Qian & Yu, 2021) which may not always be present. In addition, gradient-based methods are susceptible to falling into local maxima.
+
+Footnote 1: We include an overview of approaches in Decision Making Systems in Section 3.
+
+The confluence of computationally expensive policy representations (e.g., large neural networks), uninformative reward, and susceptibility to local maxima motivate this work. In the context of memory-constrained devices such as Internet of Things (IoT) devices (Merenda et al., 2020), utilizing large neural networks is infeasible. Secondly, in environments with sparse reward feedback, training these networks with rl presents significant challenges due to unhelpful policy gradients. Finally, the possibility of _globally optimizing_ a compact policy for memory-constrained systems is appealing due to its strong performance guarantees.
+
+We propose the usage of Bayesian Optimization (bo) for multi-agent policy search (maps) that makes progress on overcoming these issues in Decision Making Systems. Since bo is a gradient-free optimizer capable of searching globally, applying bo to maps both ensures global searching of the policy, and overcomes poor gradient behavior in the reward function (Qian & Yu, 2021). The chief challenge in bo for maps is the high dimensionality of complex multi-agent interactions. However, our proposed setting of optimizing compact policies suitable for _memory-constrained_ devices enables the possibility of overcoming this limitation.
+
+A significant degree of high-dimensional multi-agent interactions exist in maps. For example, considering an autonomous drone delivery system, several agents (i.e., drones) must work together to maximize the throughput of deliveries. In doing so, these agents may separate themselves into different roles, for example, long-distance or short-distance deliveries. The optimal policy for each role may be significantly different due to distances to recharging base stations (e.g., drones must conserve battery). In forming the optimal policy, the _interaction_ between agents must be considered to both optimally divide the task between the drones, as well as coordinate actions between drones (e.g., collision avoidance). These interactions may change over time. For example, a drone must avoid collision with nearby drones, which changes as it moves through the environment. With many agents, these interactions become more complex.
+
+To tackle the high-dimensional complexity, we utilize specific multi-agent abstractions of _role_ and _role interaction_. In role-based multi-agent interactions, an agent's policy depends on its current role and sparse interactions with other agents. By simplifying the policy space with these abstractions, we increase its tractability for global optimization by bo and inherit the strong empirical performance demonstrated by these approaches. We realize this simplification of the policy space by expressing the role abstraction and role interaction abstractions as immutable portions of the policy space, which are not searched over during policy optimization. To achieve this, we use a higher-order model (hom) which _generates_ a policy model. The hom is divided into immutable instructions (i.e., algorithms) corresponding to the abstractions of the role and role interaction and mutable parameters that are used to generate (gen) a policy model during evaluation.
+
+To optimize the hom, we specialize bo by exploiting task-specific structures. A promising avenue of High-dimensional Bayesian Optimization (hdbo) is through additive decomposition. Additive decomposition separates a high-dimensional optimization problem into several independent low-dimensional sub-problems (Duvenaud et al., 2011; Kandasamy et al., 2015). These sub-problems are independently solved thus reducing the complexity of high dimensional optimization. However, a significant challenge in additive decomposition is _learning the independence structure_ which is unknown a-priori. Learning the additive decomposition is accomplished using stochastic sampling such as Gibbs sampling (Kandasamy et al., 2015; Rolland et al., 2018; Han et al., 2020) which is known to have poor performance in high dimensions (Johnson et al., 2013; Barbos et al., 2017).
+
+In our work, we overcome this shortcoming by observing the gen process of the hom. In particular, we can measure a surrogate Hessian during the gen process which significantly simplifies the task of learning the additive structure. We term this approach Hessian-Aware GP-UCB (ha-gp-ucb) and visualize our approach in Fig. 1. Our proposed approach is also applicable to policy-search in the single-agent setting, showing its general-purpose applicability in Decision Making Systems. In this work, we make the following contributions:
+
+* We propose a parameter-efficient hom for maps which is both expressive and compact. Our approach is made feasible by using specific abstractions of _roles_ and _role interactions_.
+* We propose ha-gp-ucb, a variant of bo that simplifies the learning of dependency structure and thus provides strong regret guarantees under reasonable assumptions.
+* We validate our approach on several multi-agent benchmarks and show our approach outperforms related works for compact models fit for memory-constrained scenarios. Our ha-gp-ucb also overcomes poor gradient behavior in the reward function in multiple settings showing its effectiveness in Decision Making Systems both in the single-agent and multi-agent settings.
+
+## 2 Background
+
+Bayesian Optimization:Bayesian optimization (bo) involves sequentially maximizing an unknown objective function \(v:\Theta\rightarrow\mathbb{R}\). In each iteration \(t=1,\ldots,T\), an input query \(\theta_{t}\) is evaluated to yield
+
+Figure 1: Left, above, plot of \(f(x,y)=x^{y}\); below, plot of \(f(x,y)=x+y\). The curvature of _additively constructed functions_ is zero; _non-zero curvature_ indicates dependency among input variables. Right, examining the Hessian learns the dependency structure which decomposes complex problems into simpler problems solved by GP-UCB.
+
+a noisy observation \(y_{t}\triangleq v(\theta_{t})+\epsilon\) with i. i. d. Gaussian noise \(\epsilon\sim\mathcal{N}(0,\sigma^{2})\). bo selects input queries to approach the global maximizer \(\theta^{*}\triangleq\arg\max_{\theta\in\Theta}v(\theta)\) as rapidly as possible. This is achieved by minimizing _cumulative_ regret \(R_{T}\triangleq\sum_{t=1}^{T}r(\theta_{t})\), where \(r(\theta_{t})\triangleq v(\theta^{*})-v(\theta_{t})\).
+
+The belief of \(v\) is modeled by a _Gaussian process_ (GP), denoted GP \((\mu(\theta),k(\theta,\theta^{\prime}))\), that is, every finite subset of \(\{v(\theta)\}_{\theta\in\Theta}\) follows a multivariate Gaussian distribution (Rasmussen and Williams, 2006). A GP is fully specified by its _prior_ mean \(\mu(\theta)\) and covariance \(k(\theta,\theta^{\prime})\) for all \(\theta,\theta^{\prime}\in\Theta\), which are, respectively, assumed w.l.o.g. to be \(\mu(\theta)=0\) and \(k(\theta,\theta^{\prime})\leq 1\). Given a vector \(\mathbf{y}_{T}\triangleq\left[y_{t}\right]_{t=1,\ldots,T}^{\top}\) of noisy observations from evaluating \(v\) at input queries \(\theta_{1},\ldots,\theta_{T}\in\Theta\) after \(T\) iterations, the GP posterior belief of \(v\) at some input \(\theta\in\Theta\) is a Gaussian with the following _posterior_ mean \(\mu_{T}^{k}(\theta)\) and variance \([\sigma_{T}^{k}]^{2}(\theta)\):
+
+\[\mu_{T}^{k}(\theta)\triangleq\mathbf{k}_{T}^{k}(\theta)^{\top}(\mathbf{K}_{T}^ {k}+\sigma^{2}\mathbf{I})^{-1}\mathbf{y}_{T},\ \ \left[\sigma_{T}^{k}\right]^{2}( \theta)\triangleq k(\theta,\theta)-\mathbf{k}_{T}^{k}(\theta)^{\top}(\mathbf{K}_ {T}^{k}+\sigma^{2}\mathbf{I})^{-1}\mathbf{k}_{T}^{k}(\theta) \tag{1}\]
+
+where \(\mathbf{K}_{T}^{k}\triangleq[k(\theta_{t},\theta_{t^{\prime}})]_{t,t=1,\ldots,T}\) and \(\mathbf{k}_{T}^{k}(\theta)\triangleq[k(\theta,\theta)]_{t=1,\ldots,T}^{\top}\). In each iteration \(t\) of bo, an input query \(\theta_{t}\in\Theta\) is selected to maximize the GP-UCB acquisition function, \(\theta_{t}\triangleq\arg\max_{\theta\in\Theta}\mu_{t-1}(\theta)+\sqrt{\beta_{t }}\sigma_{t-1}(\theta)\)(Srinivas et al., 2010) where \(\beta_{t}\) follows a well defined pattern.
+
+## 3 Related work
+
+Decision Making Systems:Decision Making Systems (Rizk et al., 2018; Roijers et al., 2013) determine actions taken by an agent or agents in order to achieve a goal. Decision Making Systems span broad fields of study such as Game Theory (Condon, 1992; Hu and Wellman, 2003) and Swarm Intelligence (Barca and Sekercioglu, 2013; Karaboga and Akay, 2009). We focus on the pomdp setting and optimizing a policy to accumulate maximum reward while interacting with a partially observable environment (Shani et al., 2013). Many approaches exist which can be broadly categorized into direct policy search and reinforcement learning methods. Direct policy search (Heidrich-Meisner and Igel, 2008; Lizotte et al., 2007; Martinez-Cantin, 2017; Papavasileiou et al., 2021; Wierstra et al., 2008) searches the policy space in some efficient manner. Reinforcement learning (Arulkumaran et al., 2017; Fujimoto et al., 2018; Haarnoja et al., 2018; Li et al., 2021; Lillicrap et al., 2015; Lowe et al., 2017; Mnih et al., 2015; Peng et al., 2021; Schulman et al., 2017; Sutton et al., 1999; Wang et al., 2021a,b; Watkins and Dayan, 1992) starts with a randomly initialized policy and _reinforces_ rewarding behavior patterns to improve the policy.
+
+Bayesian Optimization for Decision Making Systems:bo has been utilized for direct policy search in the low dimensional setting (Lizotte et al., 2007; Wilson et al., 2014; Marco et al., 2016; Martinez-Cantin, 2017; von Rohr et al., 2018). However, these approaches have not scaled to the high dimensional setting. In more recent works, bo has been utilized to aid in local search methods similar to reinforcement learning (Akrour et al., 2017; Eriksson et al., 2019; Wang et al., 2020a; Frohlich et al., 2021; Muller et al., 2021). However, these approaches require evaluation of an inordinate number of policies typical of local search methods and do not provide regret guarantees. Recently, combinations of local and global search methods have been proposed (McLeod et al., 2018; Shekhar and Javidi, 2021). However, these approaches rely on informative and useful gradient information and have not been shown to scale to the high dimensional setting.
+
+marl for multi-agent decision making:A well-known approach for cooperative marl is a combination of centralized training and decentralized execution (CTDE) (Oliehoek et al., 2008). The multi-agent interactions of CTDE methods can be implicitly captured by learning approximate models of other agents (Lowe et al., 2017; Foerster et al., 2018) or decomposing global rewards (Sunehag et al., 2017; Rashid et al., 2018; Son et al., 2019). However, these methods do not focus on how interactions are performed between agents. In marl, the concept of _role_ is often leveraged to enhance the flexibility of behavioral representation while controlling the complexity of the design of agents (Lhaksmana et al., 2018; Wang et al., 2020b, 2021b; Li et al., 2021). Our approach is related to the study of (Le et al., 2017a) where the interactions are also captured by role assignment. However, the approach operates on an imitation learning scenario, and the role assignment depends on the heuristic from domain knowledge. Another related field is Comm-marl(Zhu et al., 2022; Shao et al., 2022; Liu et al., 2020; Foerster et al., 2016; Sukhbaatar et al., 2016; Peng et al., 2017; Das et al., 2019; Singh et al., 2019), where agents are allowed to communicate during policy execution to jointly decide on an action. In contrast, our approach utilizes both abstractions of role and role interaction in a hom for decision making system.
+
+## 4 Design
+
+We consider the problem of learning the joint policy of a set of \(n\) agents working cooperatively to solve a common task.2 Each agent \(i\) is associated with a state \(\mathbf{s}^{i}\in\mathcal{S}^{i}\) with the global state represented as \(\mathbf{s}\triangleq[\mathbf{s}^{i}]_{i=1,\ldots,n}\). Each agent \(i\) cooperatively chooses an action \(\mathbf{a}^{i}\in\mathcal{A}^{i}\) with the global action represented by \(\mathbf{a}\triangleq[\mathbf{a}^{i}]_{i=1,\ldots,n}\). Each state, action pair is associated with a _reward_ function: \(r(\mathbf{s},\mathbf{a})\). In order to achieve the common task, a policy parameterized by \(\theta\): \(\pi^{\theta}\triangleq\mathcal{S}\rightarrow\mathcal{A}\) governs the action taken by the agents, after observing state \(\mathbf{s}\in\mathcal{S}\). The goal of RL is to learn the optimal policy parameters that maximizes the accumulation of rewards, \(v(\theta)\), while acting in an unknown environment and receiving feedback through the resultant states and rewards.3 We treat \(v(\theta)\) as a black box function measuring the _value_ of a policy and utilize bo to optimize \(\theta\).
+
+Footnote 2: We provide a Table of notations in Appendix B.
+
+Footnote 3: Further lr. overview can be found in Arulkumaran et al. (2017).
+
+### Architectural design
+
+To achieve a compact and tractable policy space, we consider policies under the useful abstractions of _role_ and _role interaction_. These abstractions have consistently shown strong performance in multi-agent tasks. Therefore we can simplify the policy space by limiting it to only policies using these abstractions.
+
+As role and role interaction are immutable abstractions within our policy space, we express them as _static algorithms_ which are not searched over during policy optimization. These algorithms take as input parameters which are mutable and searched over during policy optimization. This combination of immutable instructions, and mutable parameters reduces the size of the search space,4 yet is still able to express policies which conform to the role and role interaction abstractions.
+
+Footnote 4: This approach to efficiency is similar in spirit to the work of Lee et al. (1986).
+
+We term this approach a _higher-order model_ (hom) which generates (gen) the model using instructions and parameters into a policy model during evaluation. This hom is separated into role assignment, and role interaction stages. We visualize an overview of this approach in Fig. 2, left. These parameters are interpreted in context of the current state by the instructions (Alg. 1, Alg. 2) of the hom to form the policy model which dictates the resultant action.
+
+### Role assignment
+
+Following the success of role based collaboration in multi-agent systems, we assume the interaction and decision making of each agent is governed by its assigned role. Although role based collaboration comes in many forms, we assume5 that an optimal policy can be decomposed as follows:
+
+Footnote 5: This is a common assumption in multi-agent systems, see, e.g., Le et al. (2017b).
+
+\[\pi(\mathbf{a}^{1},\ldots,\mathbf{a}^{n}\mid\mathbf{s}^{1},\ldots,\mathbf{s}^ {n})\triangleq\pi_{r}(\mathbf{a}^{\alpha(1)},\ldots,\mathbf{a}^{\alpha(n)}\mid \mathbf{s}^{\alpha(1)},\ldots\mathbf{s}^{\alpha(n)}) \tag{2}\]
+
+where \(\alpha\) is a permutation function dependent on the state, \(\mathbf{s}^{1},\ldots,\mathbf{s}^{n}\). The above assumption requires a permutation of agents into roles. For example, in drone delivery, roles could be short-distance deliveries, and long-distance deliveries. In filling these roles, the state of each of the agents are considered. E.g., a drone with low battery may be limited to only performing short-distance deliveries.
+
+To capture this behavior, we define a per role affinity function: \(\Lambda^{\theta_{r,i}}(\cdot)\) which is the affinity to take on role \(i\) and is parameterized by \(\theta_{r,i}\). This function evaluates the affinity of agent \(\ell\) taking on role \(i\) using the state of agent: \(\mathbf{s}^{\ell}\). The optimal permutation maximizes the total affinity of an assignment:\(\sum_{i=1}^{n}\Lambda^{\theta_{r,i}}(\mathbf{s}^{\alpha(i)})\) where \(\alpha\) represents a permutation. This problem can be efficiently solved using the Hungarian algorithm. We integrate the Hungarian algorithm in our hom approach during the gen process. We formalize this in Algorithm 1 which forms the instructions in the role assignment hom.
+
+Figure 2: Left: hom architecture. “Alg. 1/Alg. 2” are Algorithms 1 and 2 respectively. gen uses \(\theta_{r}\) and \(\theta_{g}\) during evaluation to yield a model which represents the policy. \(\theta_{r}\) and \(\theta_{g}\) are optimized by bo. Right: Inferring \(\mathbf{a}^{\alpha}\) given \(\mathbf{s}^{\alpha}\).
+
+```
+1:\(\mathbf{s}^{1},\ldots,\mathbf{s}^{n}\)
+2:return\(\arg\max_{\alpha}\sum_{i=1}^{n}\Lambda^{\theta_{r,i}}(\mathbf{s}^{\alpha(i)})\)
+```
+
+**Algorithm 1**\(RoleAssignment\)
+
+```
+1:\(v,H,k\)
+2:for\(t+1,\ldots,T_{0}\)do
+3:\(\theta_{t,h}\gets\mathcal{U}(\Theta)\)
+4:for\(\ell\gets 1,\ldots,C_{1}\)do\(h_{t,\ell}\gets H(\theta_{t,h})\)
+5:\(\widetilde{E}_{d}\leftarrow\left\lceil\sum h\right\rceil>c_{1};\widetilde{ \mathcal{G}}_{d}\leftarrow\left(\{\Theta^{1},\ldots,\Theta^{D}\},\widetilde{E}_ {d}\right)\)
+6:\([\Theta^{(i)}]_{t=1,\ldots,M}\leftarrow\text{Max-Cliques}(\widetilde{\mathcal{G}} _{d});k\gets\sum_{i=1}^{M}k^{\Theta^{i}}\)
+7:for\(t\gets T_{0},\ldots,T\)do
+8:\(\theta_{t}\leftarrow\arg\max_{\theta}\mu_{t-1}^{k}(\theta)+\sqrt{\gamma} \theta_{t}\sigma_{t-1}^{k}(\theta)\)
+9: Query \(\theta_{t}\) to observe \(y_{t}=v(\theta_{t})+\mathcal{N}(0,\epsilon^{2})\)
+10: Update posterior, \(\mu\), \(\sigma\), with \(\theta_{t},y_{t}\)
+```
+
+**Algorithm 2**\(RoleInteraction\)
+
+Given Algorithm 1, during gen process, the agents' state, \(\mathbf{s}^{1},\ldots,\mathbf{s}^{n}\) is contextually interpreted to yield a permutation model: \(\alpha\). Going forward, we consider the problem of determining the joint policy \(\pi_{r}\big{(}\mathbf{a}^{\alpha(1)},\ldots,\mathbf{a}^{\alpha(n)}\mid\mathbf{ s}^{\alpha(1)},\ldots\mathbf{s}^{\alpha(n)}\big{)}\) which enables collaborative interactions.
+
+### Role interaction
+
+Capturing multiple roles working together is an important part of an effective multi-agent policy. For example in drone delivery, drones must both divide the available task among themselves, as well as use collision avoidance while executing deliveries. Modeling role interactions must accomplish two goals. Firstly, agent interactions may change over time. For example collision avoidance strategies involve the closest drones which change as the drone moves within the environment. Secondly, efficient parameterization is needed as the number of interactions scales _quadratically_ due to considering interaction between _all pairs of agents_.
+
+To overcome these challenges, we propose a hom which generates (gen) a graphical model. The gen process is conditioned on the agents' state, thus capturing dynamic role interactions; in addition the gen process allows for a more compact policy space with far fewer parameters. The resultant generated graphical model captures the state-dependent interaction between roles and yields the resultant actions for each role. After gen, the interaction between roles are captured by the resultant conditional random field. This is presented in Fig. 2, right. The MRF (Markov Random Field) represents arbitrary undirected connectivity between nodes \(\mathbf{a}^{\alpha(1)},\ldots,\mathbf{a}^{\alpha(n)}\), which is denoted by \(\mathcal{G}\). This connectivity allows different roles to collaborate together to determine the joint action.6
+
+Footnote 6: We refer readers to Wang et al. (2013) for additional overview.
+
+We perform inference over the graphical model presented in Fig. 2 using Message Passing Neural Networks (Gilmer et al., 2017) (MPNN). We present iterative message passing rules to map from \(\mathbf{s}^{\alpha}\) to \(a^{\alpha}\):
+
+\[m_{t+1}^{\alpha(i)}\mathop{\triangleq}\limits_{\alpha(\ell)\in N ^{\alpha(i)}}\hskip-14.226378ptM^{\theta_{g,\gamma}}\left(h_{t}^{\alpha(i)},h _{t}^{\alpha(\ell)},i,\ell\right)h_{t+1}^{\alpha(i)}\triangleq U^{\theta_{g, \kappa}}\left(\mathbf{s}^{\alpha(i)},h_{t}^{\alpha(i)},m_{t+1}^{\alpha(i)} \right);\mathbf{a}^{\alpha}\triangleq\left[h_{\tau}^{\alpha(i)}\right]_{i=1, \ldots,n} \tag{3}\]
+
+where \(M\) is the message function parameterized by \(\theta_{g,\eta}\), \(U\) is the action update function parameterized by \(\theta_{g,\eta}\), \(N^{\alpha(i)}\) denotes the neighbors of \(\alpha(i)\). This procedure concludes after \(\tau\) iterations of message passing with the policy actions indicated by the hidden states, \(\left[h_{\tau}^{\alpha(i)}\right]_{i=1,\ldots,n}\).
+
+To generate graphical models of the above form, our hom uses edge affinity functions. This approach overcomes the quadratic scaling in modeling all pairs of interaction. Edge affinity functions \(\Lambda^{\theta_{g,\kappa}}(\cdot)\) determine whether an edge exists between node \(\mathbf{a}^{\alpha(i)}\), and \(\mathbf{a}^{\alpha(\ell)}\). The graphical model gen process is presented in Algorithm 2. Finally, Algorithm 3 drives the gen process.
+
+### Additive decomposition
+
+Although our hom policy representation is compact, it is still of significant dimensionality which makes optimization with bo difficult. hdbo is challenging due to the curse of dimensionality with common kernels such as Matern or RBF.7 A common technique to overcome this is through assuming additive structural decomposition on \(v\): \(v(\theta)\triangleq\sum_{i=1}^{M}v^{(i)}(\theta^{(i)})\) where \(v^{(i)}\) are independent functions, and \(\theta^{(i)}\in\Theta^{(i)}\)(Duvenaud et al., 2011). Specifically \(\Theta\triangleq\Theta^{1}\times\ldots\times\Theta^{D}\) for some dimensionality \(D\), and \(\Theta^{(i)}\subseteq\{\Theta^{1},\ldots,\Theta^{D}\}\) and is of low dimensionality. This structural assumption is combined with the assumption that each \(v^{(i)}\) is sampled from a GP. If \(v^{(i)}\sim\text{GP}\big{(}0,k^{\Theta^{(i)}}(\theta^{(i)},\theta^{(i)^{\prime }})\big{)}\) then \(v\sim\text{GP}\big{(}0,\sum_{i}k^{\Theta^{(i)}}(\theta^{(i)},\theta^{(i)^{ \prime}})\big{)}\)(Rasmussen and Williams, 2006). This assumption decomposes a high dimensional GP surrogate model of \(v\) into a set of many low dimensional GPs, which is easier to jointly learn and optimize.
+
+Footnote 7: A parallel area in hdbo is of computational efficiency of acquisition which is outside the scope of this work. We refer readers to the works of Mutny and Krause (2018), Wilson et al. (2020), and Ament and Gomes (2022).
+
+An additive decomposition can be represented by a dependency graph between the dimensions: \(\mathcal{G}_{d}\triangleq(V_{d},E_{d})\) where \(V_{d}\triangleq\{\Theta^{1},\ldots,\Theta^{D}\}\) and \(E_{d}\triangleq\{(\Theta^{a},\Theta^{b})\mid a,b\in\Theta^{(i)}\text{ for some }i\}\). _We highlight that this graph is between the dimensions of the policy parameters, \(\Theta\), and is unrelated to the graphical model of role interactions presented in earlier sections._ It is possible to accurately model \(v\) by a kernel \(k\triangleq\sum_{i}k^{\Theta^{(i)}}\) where each \(\Theta^{(i)}\) corresponds to a _maximal clique_ of the dependency graph (Rolland et al., 2018). Knowing the dependency graph greatly simplifies the complexity of optimizing \(v\).
+
+However, learning the dependency graph in additive decomposition remains challenging as there are \(O(D^{2})\) possible edges each of which may be present or absent yielding \(2^{O(D^{2})}\) possible dependency structures. This difficult problem is often approached using inefficient stochastic sampling methods such as Gibbs sampling.
+
+### Hessian-Aware Bayesian Optimization
+
+We propose learning the dependency structure during the gen process. Our approach is based on the following observation which is illustrated in Fig. 1:
+
+**Proposition 1**.: _Let \(\mathcal{G}_{d}=(V_{d},E_{d})\) represent an additive dependency structure with respect to \(v(\theta)\), then the following holds true: \(\forall a,b\ \frac{\partial^{2}v}{\partial\theta^{0}\partial\theta^{0}}\neq 0 \implies(\Theta^{a},\Theta^{b})\in E_{d}\) which is a consequence of \(v\) formed through addition of independent sub-functions \(v^{(i)}\), at least one of which must contain \(\theta^{a},\theta^{b}\) as parameters for \(\frac{\partial^{2}v}{\partial\theta^{a}\partial\theta^{b}}\neq 0\) which implies their connectivity within \(E_{d}\)._
+
+Following this, we consider algorithms with noisy query access to the Hessian, \(\mathbf{H}_{v}\).
+
+**Assumption 1**.: _Let \(\mathcal{G}_{d}=(V_{d},E_{d})\) be sampled from an Erdos-Renyi model with probability \(p_{g}<1\): \(\mathcal{G}_{d}\sim G(D,p_{g})\). That is, each edge \((\Theta^{a},\Theta^{b})\) is i.i.d. sampled from a binomial distribution with probability, \(p_{g}\). With \([\Theta^{(i)}]_{i=1,\ldots,M}\) representing the maximal cliques of \(\mathcal{G}_{d}\), we assume that \(v\sim\text{GP}\left(0,\sum_{i}k^{\Theta^{(i)}}(\theta^{(i)},\theta^{(i)^{ \prime}})\right)\) for some kernel \(k\) taking an arbitrary number of arguments (e.g., RBF)._
+
+_Noisy queries can be made to the Hessian of \(v\), \(\mathbf{H}_{v}\). We define \(H(\theta)\triangleq[\frac{\partial^{2}v}{\partial\theta^{0}\partial\theta^{0 }}+\epsilon_{h}^{(a,b)}]_{a,b=1,\ldots,D}\) where \(\epsilon_{h}^{(a,b)}\sim\mathcal{N}(0,\sigma_{n}^{2})\) i.i.d. Each query to \(H\) has corresponding regret of \(r(\theta)\)._
+
+Under this set of assumptions, we present ha-gp-ucb in Algorithm 4. ha-gp-ucb follows the overall structure of GP-UCB with two additions. We perform \(C_{1}\) queries to the Hessian if \(t\leq T_{0}\). These Hessian queries are then averaged and compared to a cutoff constant \(c_{h}\) to determine the dependency structure \(\widetilde{E}_{d}\). After extraction of maximal cliques depending on \(\widetilde{E}_{d}\) we construct \(k=\sum_{i}k^{\Theta^{(i)}}\), the sum of the aforementioned kernels and inference and acquisition proceeds same as GP-UCB.
+
+To bound the cumulative regret, \(R_{t}\triangleq\sum_{t=1}^{T_{0}}C_{1}r(\theta_{t,h})+\sum_{t=T_{0}}^{T}r( \theta_{t})\), we show that after \(C_{1}T_{0}\) queries to the Hessian, with high probability we have \(\widetilde{E}_{d}=E_{d}\), where \(E_{d}\) is the unknown ground truth dependency structure for \(v\).
+
+**Theorem 1**.: _Suppose8 there exists \(\sigma_{h}^{2},p_{h}\) s.t. \(\forall i,j\)\(\mathbb{P}_{\theta\sim\mathcal{U}(\Theta)}\left[k^{\partial i\partial j}(\theta, \theta)\geq\sigma_{h}^{2}\right]\geq p_{h}\) and \(\forall i,j,\theta,\theta^{\prime}\)\(k^{\partial i\partial j}(\theta,\theta^{\prime})\geq 0\). Then for any \(\delta_{1},\delta_{2}\in(0,1)\) after \(t\geq T_{0}\) steps of ha-gp-ucb we have: \(\bigcap_{i,j}P(\widetilde{E}_{d}^{i,j}=E_{d}^{i,j})\geq 1-\delta_{1}-\delta_{2}\) when \(T_{0}=C_{1}>\frac{\delta D^{2}}{\delta_{1}^{4}}\log\frac{2D^{2}}{\delta_{1}^{ 2}}\frac{\sigma_{h}^{2}}{\sigma_{h}^{2}}+\frac{D^{2}}{p_{h}\delta_{2}^{2}}\), \(c_{h}\triangleq T_{0}\sigma_{n}\sqrt{2\log\frac{2D^{2}}{\delta_{1}}}\)._
+
+Footnote 8: RBF kernel satisfies these assumptions when \(\Theta=[0,1]^{D}\).
+
+Our Theorem 1 relies on repeatedly sampling the Hessian to determine whether an edge exists between \(\Theta^{a}\), and \(\Theta^{b}\) in the sampled additive decomposition. The key challenge is determining this connectivity under a very noisy setting, and for extremely low values of \(\sigma_{h}^{2}\ll\sigma_{n}^{2}\) where the Hessian is zero with high probability. We are able to overcome this challenge using a Bienayme's identity, a key tool in our analysis. We defer all proofs to the Appendix.
+
+Utilizing the above theorem we are able to provide a regret bound for ha-gp-ucb. Providing this regret bound requires several key tools. First, we are able to bound the number and size of cliques of graphs sampled from the Erdos-Renyi model with high probability. Secondly, we are able to bound the _mutual information_ of an additive decomposition given the mutual information of its constituent kernels using Weyl's inequality. Lastly, we use similar analysis as Srinivas et al. (2010) to complete the regret bound.
+
+**Theorem 2**.: _Let \(k\) be the kernel as in Assumption 1, and Theorem 1. Let \(\gamma_{T}^{k}(d):\mathbb{N}\rightarrow\mathbb{R}\) be a monotonically increasing upper bound function on the mutual information of kernel \(k\) taking \(d\) arguments. The cumulative regret of ha-gp-ucb is bounded with high probability as follows:_
+
+\[R_{T}=\widetilde{\mathcal{O}}\Big{(}D^{4.5}\log^{2}D+\sqrt{T\beta_{T}D^{ \mathcal{O}(\log D)}\gamma_{T}^{k}(\mathcal{O}(\log D))}\Big{)}. \tag{4}\]
+
+Whereas for typical kernels such as Matern and RBF, cumulative regret of GP-UCB scales exponentially with \(D\), our regret bounds scale with exponent \(\mathcal{O}(\log D)\). This improved regret bound shows our approach is a theoretically grounded approach to hdbo.
+
+In practice, observing the hessian \(\mathbf{H}_{v}\) is not possible due to \(v\) being a black box function. However, during the gen process we can observe a surrogate Hessian, \(\mathbf{H}_{\pi}\). This surrogate Hessian is closely related to the \(\mathbf{H}_{v}\) as \(v(\theta)\) is determined through interaction of the policy with an unknown environment. Because the _value_ of a policy is a function of the policy; it follows by the chain rule9\(\mathbf{H}_{\pi}\) is an important sub-component of \(\mathbf{H}_{v}\). We utilize the surrogate Hessian in our work and demonstrate its strong empirical performance in validation.
+
+Footnote 9: We revisit this argument in Appendix H.
+
+## 5 Validation
+
+We compare our work against recent algorithms in marl on several multi-agent coordination tasks and rl algorithms for policy search in novel settings. We also perform ablation and investigation of our proposed hom at learning roles and multi-agent interactions. We defer experimental details to Appendix A.
+
+_All presented figures are average of \(5\) runs with shading representing \(\pm\) Standard Error, the y-axis represents cumulative reward, the x-axis displayed above represents interactions with the environment in rl, x-axis displayed below represents iterations of bo. Commensurate with our focus on memory-constrained devices, all policy models consist of \(<500\) parameters._
+
+### Ablation
+
+We investigate the impact of Role Assignment (RA) and Role Interaction (RI) as well as model capacity on training progress. We conduct ablation experiments on Multiagent Ant with 6 agents, PredPrey with 3 agents, and Heterogenous PredPrey with 3 agents. Multiagent Ant is a MuJoCo locomotion task where each agent controls an individual appendage. PredPrey is a task where predators must work together to catch faster, more agile prey. Het. PredPrey is similar, except the predators have different capabilities of speed and acceleration. In ablation experiments, our default configuration is _Med - RA - RI_ which employs components of RA and RI parameterized by neural networks with three layers and four neurons on each layer. We present our ablation in Fig. 3.
+
+For a simpler coordination task such as Multiagent Ant, we observe limited improvement through RA or RI. In contrast, RI shows strong improvement in PredPrey and Het. PredPrey. It is because,in PredPrey, predators must work together to catch the faster prey. Since the agents in PredPrey are _homogeneous_, _ablating RA_ makes the optimization simpler and more compact without losing expressiveness. Thus, ablating RA leads to a performance increase. In Het. PredPrey, the predator agents have heterogeneous capabilities in speed and acceleration. Thus, RA plays a critical role in delivering strong performance. We also show that overly shrinking the model size (_Sm - RA - RI_) can hurt performance as the policy model is no longer sufficiently expressive. This is evidenced in the Multiagent Ant task. We observed that using neural networks of three layers with four neurons each to be sufficiently balanced across a wide variety of tasks.
+
+In Fig. 3, we present the detected Hessian structure by ha-gp-ucb in the respective tasks. The detected Hessian structures generally show strong block-diagonal associativity in the hom parameters, i.e., \([\theta_{r,i},\theta_{g,v},\theta_{g,\eta},\theta_{g,e}]\). This shows that our approach can detect the interdependence _within_ the sub-parameters, but relative independence between the sub-parameters. We observe more off-diagonal connectivity in the complex coordination tasks of PredPrey and Het. PredPrey. The visualization of Hessian structure on PredPrey shows that our approach can detect the importance of _jointly optimizing_ role assignment and interaction to deliver a strong policy in this complex coordination task. We investigate the learning behavior of the hom further in Appendix C.
+
+### Comparison with marl
+
+We compare our method with competing marl algorithms on several multi-agent tasks where the number of agents is increased. We validate both the hom with ha-gp-ucb (ha-gp-ucb (MM)) and neural network policies trained in the CTDE paradigm (ha-gp-ucb (CTDE)). We observe that on complex coordination tasks such as PredPrey and Het. PredPrey our approach delivers more performant policies when coordination is required between _a large number of agents_. This is presented10 in Fig. 5. Although SOG (Shao et al., 2022), a Comm-marl approach shows compelling performance with a small number of agents, with 15 agents, both ha-gp-ucb (CTDE) and ha-gp-ucb (MM) outperform this strategy. We highlight that ha-gp-ucb (CTDE) outperforms Comm-marl approaches without communication during execution. We also note that ha-gp-ucb (MM) outperforms ha-gp-ucb (CTDE) showing the value of our hom approach in complex coordination tasks. We defer further experimental results in this setting to Appendix C.
+
+Figure 4: Left: Sparse reward drone delivery 6, 9, and 15 agents. The right column shows Het, task. Right: Comparison with hdbo approaches. PredPrey with 6, 9, and 15 agents.
+
+Figure 5: Scaling analysis. Training curves of ha-gp-ucb and competitors with increasing number of agents. The left column shows PredPrey with 6, 9, and 15 agents. The right column shows Het, task. Right: Comparison with hdbo approaches. PredPrey with 6, 9, and 15 agents.
+
+### Policy optimization under malformed reward
+
+We compare against several competing rl and marl algorithms under malformed reward scenarios. We train neural network policies with ha-gp-ucb and competing algorithms. We consider a sparse reward scenario where reward feedback is given every \(S\) environment interactions for varying \(S\). Table 1 shows that the performance of competing algorithms is severely degraded with sparse reward and ha-gp-ucb outperforms competing approaches on most tasks with moderate or higher sparsity. Although intrinsic motivation (Singh et al., 2004; Zheng et al., 2018) has shown evidence in overcoming this limitation, we find that our approach outperforms competing approaches supported by intrinsic motivations at higher sparsity. This improvement is important as sparse and malformed reward structure scenarios can occur in real-world tasks (Aubret et al., 2019). We repeat this validation in Appendix C with marl algorithms in multi-agent settings and consider a delayed feedback setting with similar results.
+
+### Comparison with hdbo algorithms
+
+We compare with several related work in hdbo. This is presented in Fig. 4. We compare against these algorithms at optimizing our hom policy. For more complex tasks that require role based interaction and coordination, our approach outperforms related work. TreeBO (Han et al., 2021) is also an additive decomposition approach to hdbo, but uses Gibbs sampling to learn the dependency structure. However, our approach of learning the structure through _Hessian-Awareness_ outperforms this approach. Additional experimental results are deferred to Appendix C.
+
+### Drone delivery task
+
+We design a drone delivery task that is well aligned with our motivation of considering policy search in _memory-constrained devices_ on tasks with _unhelpful or noisy gradient information_. In this task, drones must maximize the throughput of deliveries while avoiding collisions and conserving fuel. This task is challenging as a positive reward through completing deliveries is rarely encountered (i.e., sparse rewards). However, agents often receive negative rewards due to collisions or running out of fuel. Thus, gradient-based approaches can easily fall into local minima and fail to find policies that complete deliveries.11 We compare ha-gp-ucb against competing approaches in Fig. 4. We observe that marl based approaches fail to find a meaningfully rewarding policy in this setting, whereas our approach shows strong and compelling performance. Furthermore, ha-gp-ucb (MM) outperforms ha-gp-ucb (CTDE) through leveraging roles and role interactions.
+
+Footnote 11: Further details on this task can be found in Appendix I.
+
+## 6 Conclusion
+
+We have proposed a hom policy along with an effective optimization algorithm, ha-gp-ucb. Our hom and ha-gp-ucb are designed to offer strong performance in high coordination multi-agent tasks under sparse or malformed reward on memory-constrained devices. ha-gp-ucb is a theoretically grounded approach to bo offering good regret bounds under reasonable assumptions. Our validation shows ha-gp-ucb outperforms rl and marl at optimizing neural network policies in malformed reward scenarios. Our hom optimized with ha-gp-ucb outperforms marl approaches in high coordination multi-agent scenarios by leveraging the concepts of _role_ and _role interaction_. Furthermore, we show through our drone delivery task, our approach outperforms marl approaches in multi-agent coordination tasks with sparse reward. We make significant progress on high coordination multi-agent policy search by overcoming challenges posed by malformed reward and memory-constrained settings.
+
+\begin{table}
+\begin{tabular}{l c c c c c c c c c c c c c c c c c c c} \hline \hline  & \multicolumn{4}{c}{Max-0} & \multicolumn{4}{c}{Happy-0} & \multicolumn{4}{c}{Success-0} & \multicolumn{4}{c}{Walk-0-1} \\ \cline{2-15}  & EMDG & PPD & SAC & TDS & Intermediate & EMDG & PPD & SAC & TDS & Intermediate & EMDG & PPD & SAC & TDS & Intermediate & EMDG & PPD & SAC & TDS & Intermediate \\ \hline \hline \multirow{2}{*}{Baseline} & -99.75 & 1100.00 & 29.53 & 29.09 & 27.14 & 24.00 & 29.09 & 10.00 & 27.14 & 26.00 & 10.00 & 27.14 & 26.00 & 10.00 & 27.14 & 27.19 & 10.00 & 22.00 & 28.00 & 14.00 & 27.19 & 10.00 & 26.00 & 27.19 & 10.00 \\ \cline{2-15}  & -99.75 & 1100.00 & 29.53 & 29.09 & 27.14 & 24.00 & 29.09 & 10.00 & 27.16 & 26.00 & 10.00 & 27.14 & 26.00 & 10.00 & 27.14 & 27.19 & 10.00 & 27.19 & 10.00 & 26.00 & 27.19 & 27.19 & 27.19 & 27.19 & 27.19 & 27.19 \\ \hline \multirow{2}{*}{Baseline} & -3.000 & -3.
+
+## References
+
+* Abadi et al. (2015) Martin Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen, Craig Citro, Greg S. Corrado, Andy Davis, Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Ian Goodfellow, Andrew Harp, Geoffrey Irving, Michael Isard, Yangqing Jia, Rafal Jozefowicz, Lukasz Kaiser, Manjunath Kudlur, Josh Levenberg, Dandelion Mane, Rajat Monga, Sherry Moore, Derek Murray, Chris Olah, Mike Schuster, Jonathon Shlens, Benoit Steiner, Ilya Sutskever, Kunal Talwar, Paul Tucker, Vincent Vanhoucke, Vijay Vasudevan, Fernanda Viegas, Oriol Vinyals, Pete Warden, Martin Wattenberg, Martin Wicke, Yuan Yu, and Xiaoqiang Zheng. TensorFlow: Large-scale machine learning on heterogeneous systems, 2015. URL [https://www.tensorflow.org/](https://www.tensorflow.org/). Software available from tensorflow.org.
+* Akrour et al. (2017) Riad Akrour, Dmitry Sorokin, Jan Peters, and Gerhard Neumann. Local bayesian optimization of motor skills. In _Proc. ICML_, 2017.
+* Ament and Gomes (2022) Sebastian E. Ament and Carla P. Gomes. Scalable first-order bayesian optimization via structured automatic differentiation. In _Proc. ICML_, pp. 500-516, 2022.
+* Arulkumaran et al. (2017) Kai Arulkumaran, Marc Peter Deisenroth, Miles Brundage, and Anil Anthony Bharath. Deep reinforcement learning: A brief survey. _IEEE Signal Process. Mag._, 34(6):26-38, 2017.
+* Aubret et al. (2019) Arthur Aubret, Laetitia Matignon, and Salima Hassas. A survey on intrinsic motivation in reinforcement learning. _CoRR_, abs/1908.06976, 2019.
+* Barbos et al. (2017) Andrei-Cristian Barbos, Francois Caron, Jean-Francois Giovannelli, and Arnaud Doucet. Clone MCMC: parallel high-dimensional gaussian gibbs sampling. In _Proc. NeurIPS_, 2017.
+* Barca and Sekercioglu (2013) Jan Carlo Barca and Y Ahmet Sekercioglu. Swarm robotics reviewed. _Robotica_, 31(3):345-359, 2013.
+* Berkeley et al. (2022) Joel Berkeley, Henry B. Moss, Artem Artemev, Sergio Pascual-Diaz, Uri Granta, Hrvoje Stojic, Ivo Couckuyt, Jixiang Qing, Nasrulloh Loka, Andrei Paleyes, Sebastian W. Ober, and Victor Picheny. Trieste, 7 2022. URL [https://github.com/secondmind-labs/trieste](https://github.com/secondmind-labs/trieste).
+* Bollobas and Erdos (1976) Bela Bollobas and Paul Erdos. Cliques in random graphs. In _Proc. Cambridge Philosophical Society_, 1976.
+* Brockman et al. (2016) Greg Brockman, Vicki Cheung, Ludwig Pettersson, Jonas Schneider, John Schulman, Jie Tang, and Wojciech Zaremba. Openai gym, 2016.
+* Cheng et al. (2021) Shuyu Cheng, Guoqiang Wu, and Jun Zhu. On the convergence of prior-guided zeroth-order optimization algorithms. In _Proc. NeurIPS_, pp. 14620-14631, 2021.
+* Chu (1955) John T Chu. On bounds for the normal integral. _Biometrika_, 42:263-265, 1955.
+* Condon (1992) Anne Condon. The complexity of stochastic games. _Information and Computation_, 96(2):203-224, 1992.
+* Das et al. (2019) Abhishek Das, Theophile Gervet, Joshua Romoff, Dhruv Batra, Devi Parikh, Mike Rabbat, and Joelle Pineau. Tarmac: Targeted multi-agent communication. In _Proc. ICML_, pp. 1538-1546, 2019.
+* de Witt et al. (2020) Christian Schroeder de Witt, Bei Peng, Pierre-Alexandre Kamienny, Philip Torr, Wendelin Bohmer, and Shimon Whiteson. Deep multi-agent reinforcement learning for decentralized continuous cooperative control. _arXiv preprint arXiv:2003.06709_, 2020.
+* D'Eramo et al. (2021) Carlo D'Eramo, Davide Tateo, Andrea Bonarini, Marcello Restelli, and Jan Peters. Mushroomrl: Simplifying reinforcement learning research. 2021.
+* Dorling et al. (2017) Kevin Dorling, Jordan Heinrichs, Geoffrey G. Messier, and Sebastian Magierowski. Vehicle routing problems for drone delivery. _IEEE Trans. Syst. Man Cybern. Syst._, 47(1):70-85, 2017.
+* Duvenaud et al. (2011) David Duvenaud, Hannes Nickisch, and Carl Edward Rasmussen. Additive gaussian processes. In _Proc. NeurIPS_, pp. 226-234, 2011.
+
+* Eriksson et al. (2019a) David Eriksson, Michael Pearce, Jacob R. Gardner, Ryan Turner, and Matthias Poloczek. Scalable global optimization via local bayesian optimization. In _Proc. NeurIPS_, 2019a.
+* Eriksson et al. (2019b) David Eriksson, Michael Pearce, Jacob R. Gardner, Ryan Turner, and Matthias Poloczek. Scalable global optimization via local Bayesian optimization. In _Proc. NeurIPS_, pp. 5497-5508, 2019b.
+* Ermolova & Haggman (2004) Natalia Y. Ermolova and Sven-Gustav Haggman. Simplified bounds for the complementary error function. In _Proc. Eurasip_, pp. 1087-1090, 2004.
+* Foerster et al. (2016) Jakob Foerster, Ioannis Alexandros Assael, Nando De Freitas, and Shimon Whiteson. Learning to communicate with deep multi-agent reinforcement learning. _Proc. NeurIPS_, 2016.
+* Foerster et al. (2018) Jakob Foerster, Gregory Farquhar, Triantafyllos Afouras, Nantas Nardelli, and Shimon Whiteson. Counterfactual multi-agent policy gradients. In _Proceedings of the AAAI conference on artificial intelligence_, volume 32, 2018.
+* Frohlich et al. (2021) Lukas P. Frohlich, Melanie N. Zeilinger, and Edgar D. Klenske. Cautious bayesian optimization for efficient and scalable policy search. In _Proc. L4DC_, 2021.
+* Fujimoto et al. (2018) Scott Fujimoto, Herke Hoof, and David Meger. Addressing function approximation error in actor-critic methods. In _International conference on machine learning_, pp. 1587-1596. PMLR, 2018.
+* Gilmer et al. (2017) Justin Gilmer, Samuel S. Schoenholz, Patrick F. Riley, Oriol Vinyals, and George E. Dahl. Neural message passing for quantum chemistry. In _Proc. ICML_, pp. 1263-1272, 2017.
+* Haarnoja et al. (2018) Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine. Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor. In _International conference on machine learning_, pp. 1861-1870. PMLR, 2018.
+* Han et al. (2020) Eric Han, Ishank Arora, and Jonathan Scarlett. High-dimensional bayesian optimization via tree-structured additive models. _arXiv preprint arXiv:2012.13088_, 2020.
+* Han et al. (2021) Eric Han, Ishank Arora, and Jonathan Scarlett. High-dimensional Bayesian optimization via tree-structured additive models. In _Proc. AAAI_, pp. 7630-7638, 2021.
+* Heidrich-Meisner & Igel (2008) Verena Heidrich-Meisner and Christian Igel. Evolution strategies for direct policy search. In _Proc. PPSN_, pp. 428-437, 2008.
+* Hu & Wellman (2003) Junling Hu and Michael P Wellman. Nash Q-learning for general-sum stochastic games. _JMLR_, 4(Nov):1039-1069, 2003.
+* Johnson et al. (2013) Matthew J. Johnson, James Saunderson, and Alan S. Willsky. Analyzing hogwild parallel gaussian gibbs sampling. In _Proc. NeurIPS_, 2013.
+* Kandasamy et al. (2015) Kirthevasan Kandasamy, Jeff G. Schneider, and Barnabas Poczos. High dimensional bayesian optimisation and bandits via additive models. In _Proc. ICML_, pp. 295-304, 2015.
+* Karaboga & Akay (2009) Dervis Karaboga and Bahriye Akay. A survey: Algorithms simulating bee swarm intelligence. _Artificial intelligence review_, 31:61-85, 2009.
+* Kirschner et al. (2019) Johannes Kirschner, Mojmir Mutny, Nicole Hiller, Rasmus Ischebeck, and Andreas Krause. Adaptive and safe Bayesian optimization in high dimensions via one-dimensional subspaces. In _Proc. ICML_, pp. 3429-3438, 2019.
+* Le et al. (2017a) Hoang M Le, Yisong Yue, Peter Carr, and Patrick Lucey. Coordinated multi-agent imitation learning. In _International Conference on Machine Learning_, pp. 1995-2003. PMLR, 2017a.
+* Le et al. (2017b) Hoang Minh Le, Yisong Yue, Peter Carr, and Patrick Lucey. Coordinated multi-agent imitation learning. In _Proc. ICML_, pp. 1995-2003, 2017b.
+* Lee et al. (1986) YC Lee, Gary Doolen, HH Chen, GZ Sun, Tom Maxwell, and HY Lee. Machine learning using a higher order correlation network. Technical report, Los Alamos National Lab (LANL), Los Alamos, NM (United States); Univ. of Maryland, College Park, MD (United States), 1986.
+
+* Letham et al. (2020) Benjamin Letham, Roberto Calandra, Akshara Rai, and Eytan Bakshy. Re-examining linear embeddings for high-dimensional Bayesian optimization. In _Proc. NeurIPS_, 2020.
+* Lhaksmana et al. (2018) Kemas M Lhaksmana, Yohei Murakami, and Toru Ishida. Role-based modeling for designing agent behavior in self-organizing multi-agent systems. _International Journal of Software Engineering and Knowledge Engineering_, 28(01):79-96, 2018.
+* Li et al. (2021) Chenghao Li, Tonghan Wang, Chengjie Wu, Qianchuan Zhao, Jun Yang, and Chongjie Zhang. Celebrating diversity in shared multi-agent reinforcement learning. In _Proc. NeurIPS_, pp. 3991-4002, 2021.
+* Lillicrap et al. (2015) Timothy P Lillicrap, Jonathan J Hunt, Alexander Pritzel, Nicolas Heess, Tom Erez, Yuval Tassa, David Silver, and Daan Wierstra. Continuous control with deep reinforcement learning. _arXiv preprint arXiv:1509.02971_, 2015.
+* Liu et al. (2020) Yong Liu, Weixun Wang, Yujing Hu, Jianye Hao, Xingguo Chen, and Yang Gao. Multi-agent game abstraction via graph attention neural network. In _Proc. AAAI_, pp. 7211-7218, 2020.
+* Lizotte et al. (2007) Daniel J. Lizotte, Tao Wang, Michael H. Bowling, and Dale Schuurmans. Automatic gait optimization with gaussian process regression. In _Proc. IJCAI_, 2007.
+* Lowe et al. (2017) Ryan Lowe, Yi I Wu, Aviv Tamar, Jean Harb, OpenAI Pieter Abbeel, and Igor Mordatch. Multi-agent actor-critic for mixed cooperative-competitive environments. _Advances in neural information processing systems_, 30, 2017.
+* Magalhaes (2020) Eduardo Magalhaes. On the properties of the hessian tensor for vector functions. _viXra preprint viXra:2005.0044_, 2020.
+* Marco et al. (2016) Alonso Marco, Philipp Hennig, Jeannette Bohg, Stefan Schaal, and Sebastian Trimpe. Automatic LQR tuning based on gaussian process global optimization. In _Proc. ICRA_, 2016.
+* Martinez-Cantin (2017) Ruben Martinez-Cantin. Bayesian optimization with adaptive kernels for robot control. In _Proc. ICRA_, 2017.
+* de G. Matthews et al. (2017) Alexander G. de G. Matthews, Mark van der Wilk, Tom Nickson, Keisuke. Fujii, Alexis Boukouvalas, Pablo Leon-Villagra, Zoubin Ghahramani, and James Hensman. GPflow: A Gaussian process library using TensorFlow. _Journal of Machine Learning Research_, 18(40):1-6, apr 2017. URL [http://jmlr.org/papers/v18/16-537.html](http://jmlr.org/papers/v18/16-537.html).
+* Matula (1976) David W Matula. _The largest clique size in a random graph_. Department of Computer Science, Southern Methodist University Dallas, Texas, 1976.
+* McLeod et al. (2018) Mark McLeod, Stephen J. Roberts, and Michael A. Osborne. Optimization, fast and slow: optimally switching between local and bayesian optimization. In _Proc. ICML_, 2018.
+* Merenda et al. (2020) Massimo Merenda, Carlo Porcaro, and Demetrio Iero. Edge machine learning for AI-Enabled IoT devices: A review. _Sensors_, 20(9):2533, 2020.
+* Mnih et al. (2015) Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei A Rusu, Joel Veness, Marc G Bellemare, Alex Graves, Martin Riedmiller, Andreas K Fidjeland, Georg Ostrovski, et al. Human-level control through deep reinforcement learning. _nature_, 518(7540):529-533, 2015.
+* Muller et al. (2021) Sarah Muller, Alexander von Rohr, and Sebastian Trimpe. Local policy search with Bayesian optimization. In _Proc. NeurIPS_, pp. 20708-20720, 2021.
+* Mutny and Krause (2018) Mojmir Mutny and Andreas Krause. Efficient high dimensional Bayesian optimization with additivity and quadrature Fourier features. In _Proc. NeurIPS_, pp. 9019-9030, 2018.
+* Oliehoek et al. (2008) Frans A Oliehoek, Matthijs TJ Spaan, and Nikos Vlassis. Optimal and approximate q-value functions for decentralized pomdps. _Journal of Artificial Intelligence Research_, 32:289-353, 2008.
+* Papavasileiou et al. (2021) Evgenia Papavasileiou, Jan Cornelis, and Bart Jansen. A systematic literature review of the successors of "neuroevolution of augmenting topologies". _Evolutionary Computation_, 29(1):1-73, 2021.
+
+* Pathak et al. (2017) Deepak Pathak, Pulkit Agrawal, Alexei A Efros, and Trevor Darrell. Curiosity-driven exploration by self-supervised prediction. In _International conference on machine learning_, pp. 2778-2787. PMLR, 2017.
+* Peng et al. (2021) Bei Peng, Tabish Rashid, Christian Schroeder de Witt, Pierre-Alexandre Kamienny, Philip Torr, Wendelin Bohmer, and Shimon Whiteson. Facmac: Factored multi-agent centralised policy gradients. _Advances in Neural Information Processing Systems_, 34:12208-12221, 2021.
+* Peng et al. (2017) Peng Peng, Ying Wen, Yaodong Yang, Quan Yuan, Zhenkun Tang, Haitao Long, and Jun Wang. Multiagent bidirectionally-coordinated nets: Emergence of human-level coordination in learning to play starcraft combat games. _arXiv preprint arXiv:1703.10069_, 2017.
+* Picheny et al. (2022) Victor Picheny, Henry B. Moss, Leonard Torossian, and Nicolas Durrande. Bayesian quantile and expectile optimisation. In _Proc. UAI_, pp. 1623-1633, 2022.
+* Qian & Yu (2021) Hong Qian and Yang Yu. Derivative-free reinforcement learning: a review. _Frontiers of Computer Science_, 15(6):1-19, 2021.
+* Rashid et al. (2018) Tabish Rashid, Mikayel Samvelyan, Christian Schroeder, Gregory Farquhar, Jakob Foerster, and Shimon Whiteson. Qmix: Monotonic value function factorisation for deep multi-agent reinforcement learning. In _International Conference on Machine Learning_, pp. 4295-4304. PMLR, 2018.
+* Rasmussen & Williams (2006) Carl Edward Rasmussen and Christopher K. I. Williams. _Gaussian processes for machine learning_. MIT Press, 2006.
+* Rizk et al. (2018) Yara Rizk, Mariette Awad, and Edward W Tunstel. Decision making in multiagent systems: A survey. _IEEE Transactions on Cognitive and Developmental Systems_, 10(3):514-529, 2018.
+* Roijers et al. (2013) Diederik M Roijers, Peter Vamplew, Shimon Whiteson, and Richard Dazeley. A survey of multi-objective sequential decision-making. _Journal of Artificial Intelligence Research_, 48:67-113, 2013.
+* Rolland et al. (2018) Paul Rolland, Jonathan Scarlett, Ilija Bogunovic, and Volkan Cevher. High-dimensional bayesian optimization via additive models with overlapping groups. In _Proc. AISTATS_, pp. 298-307, 2018.
+* Schulman et al. (2017) John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy optimization algorithms. _arXiv preprint arXiv:1707.06347_, 2017.
+* Shani et al. (2013) Guy Shani, Joelle Pineau, and Robert Kaplow. A survey of point-based POMDP solvers. _Autonomous Agents and Multi-Agent Systems_, 27:1-51, 2013.
+* Shao et al. (2022) Jianzhan Shao, Zhiqiang Lou, Hongchang Zhang, Yuhang Jiang, Shuncheng He, and Xiangyang Ji. Self-organized group for cooperative multi-agent reinforcement learning. _Proc. NeurIPS_, pp. 5711-5723, 2022.
+* Shekhar & Javidi (2021) Shubhanshu Shekhar and Tara Javidi. Significance of gradient information in bayesian optimization. In _Proc. AISTATS_, 2021.
+* Singh et al. (2019) Amanpreet Singh, Tushar Jain, and Sainbayar Sukhbaatar. Learning when to communicate at scale in multiagent cooperative and competitive tasks. In _Proc. ICLR_, 2019.
+* Singh et al. (2004) Satinder Singh, Andrew G. Barto, and Nuttapong Chentanez. Intrinsically motivated reinforcement learning. In _Proc. NeurIPS_, pp. 1281-1288, 2004.
+* Skorski (2019) Maciej Skorski. Chain rules for hessian and higher derivatives made easy by tensor calculus. _arXiv preprint arXiv:1911.13292_, 2019.
+* Son et al. (2019) Kyunghwan Son, Daewoo Kim, Wan Ju Kang, David Earl Hostallero, and Yung Yi. Qtran: Learning to factorize with transformation for cooperative multi-agent reinforcement learning. In _International Conference on Machine Learning_, pp. 5887-5896. PMLR, 2019.
+* Srinivas et al. (2010) Niranjan Srinivas, Andreas Krause, Sham M. Kakade, and Matthias W. Seeger. Gaussian process optimization in the bandit setting: No regret and experimental design. In _Proc. ICML_, 2010.
+
+* Sukhbaatar et al. (2016) Sainbayar Sukhbaatar, Arthur Szlam, and Rob Fergus. Learning multiagent communication with backpropagation. In _Proc. NeurIPS_, pp. 2244-2252, 2016.
+* Sunehag et al. (2017) Peter Sunehag, Guy Lever, Audrunas Gruslys, Wojciech Marian Czarnecki, Vinicius Zambaldi, Max Jaderberg, Marc Lanctot, Nicolas Sonnerat, Joel Z Leibo, Karl Tuyls, et al. Value-decomposition networks for cooperative multi-agent learning. _arXiv preprint arXiv:1706.05296_, 2017.
+* Sutton et al. (1999) Richard S Sutton, David McAllester, Satinder Singh, and Yishay Mansour. Policy gradient methods for reinforcement learning with function approximation. _Proc. NeurIPS_, 12, 1999.
+* von Rohr et al. (2018) Alexander von Rohr, Sebastian Trimpe, Alonso Marco, Peer Fischer, and Stefano Palagi. Gait learning for soft microrobots controlled by light fields. In _Proc. IROS_, 2018.
+* Wang et al. (2013) Chaohui Wang, Nikos Komodakis, and Nikos Paragios. Markov random field modeling, inference & learning in computer vision & image understanding: A survey. _Comput. Vis. Image Underst._, 117(11):1610-1627, 2013.
+* Wang et al. (2021a) Jianhao Wang, Zhizhou Ren, Terry Liu, Yang Yu, and Chongjie Zhang. QPLEX: Duplex dueling multi-agent Q-Learning. In _Proc. ICLR_, 2021a.
+* Wang et al. (2020a) Linnan Wang, Rodrigo Fonseca, and Yuandong Tian. Learning search space partition for black-box optimization using monte carlo tree search. In _Proc. NeurIPS_, 2020a.
+* Wang et al. (2020b) Tonghan Wang, Heng Dong, Victor Lesser, and Chongjie Zhang. Roma: Multi-agent reinforcement learning with emergent roles. _arXiv preprint arXiv:2003.08039_, 2020b.
+* Wang et al. (2021b) Tonghan Wang, Tarun Gupta, Anuj Mahajan, Bei Peng, Shimon Whiteson, and Chongjie Zhang. RODE: Learning roles to decompose multi-agent tasks. In _Proc. ICLR_, 2021b.
+* Watkins & Dayan (1992) Christopher JCH Watkins and Peter Dayan. Q-learning. _Machine learning_, 8:279-292, 1992.
+* Wierstra et al. (2008) Daan Wierstra, Tom Schaul, Jan Peters, and Jurgen Schmidhuber. Fitness expectation maximization. In _Proc. PPSN_, pp. 337-346, 2008.
+* Wilson et al. (2014) Aaron Wilson, Alan Fern, and Prasad Tadepalli. Using trajectory data to improve bayesian optimization for reinforcement learning. _JMLR_, 15(1), 2014.
+* Wilson et al. (2020) James T. Wilson, Viacheslav Borovitskiy, Alexander Terenin, Peter Mostowsky, and Marc Peter Deisenroth. Efficiently sampling functions from Gaussian process posteriors. In _Proc. ICML_, pp. 10292-10302, 2020.
+* Zheng et al. (2018) Zeyu Zheng, Junhyuk Oh, and Satinder Singh. On learning intrinsic rewards for policy gradient methods. In _Proc. NeurIPS_, pp. 4649-4659, 2018.
+* Zhu et al. (2022) Changxi Zhu, Mehdi Dastani, and Shihan Wang. A survey of multi-agent reinforcement learning with communication. _arXiv preprint arXiv:2203.08975_, 2022.
+
+## Appendix A Experimental Details
+
+We used Trieste (Berkeley et al., 2022), Tensorflow (Abadi et al., 2015), and GPFLow (Matthews et al., 2017) to build our work and perform comparisons using MushroomRL (D'Eramo et al., 2021), MultiagentMuJoCo (de Witt et al., 2020), OpenAI Gym (Brockman et al., 2016), and Multi-agent Particle environment (Lowe et al., 2017). When comparing with related work, we used neural network policies of equivalent size. All of our tested policies are \(<500\) parameters, however the XL models are constructed using 3 layers of 400 neurons each.
+
+To estimate the Hessian, we used the Hessian-Vector product approximation. We relaxed the discrete portions of our hom policy into differentiable continuous approximation for this phase using the Sinkhorn-Knopp algorithm for the Role Assignment phase. For role interaction network connectivity, we used a sigmoid to create differentiable "soft" edges between each role. We pragmatically kept all detected edges in the Hessian while maintaining computational feasibility. We observed that our approach could support up to \(1500\) edges in the dependency graph prior to experiencing computational intractability. We used the Matern-\(\frac{5}{2}\) as the base kernel in all our models.
+
+### Ablation and Investigation
+
+In the ablation, we perform experiments on MultiagentMuJoCo with environments Multiagent Ant with 6 segments, Multiagent Swimmer with 6 segments, Predator Prey with 3 predators, and Heterogeneous Predator Prey with 3 predators. In the Predator Prey environment, multiple predators must work together to capture faster and more agile prey. In Heterogeneous Predator Prey, each Predator has differing capabilities of speed and acceleration. This modification is challenging as a policy must not only coordinate between the Predators, but roles based specialization must be considered given the heterogeneous nature of each predator's capabilities.
+
+To generate Fig. 7, we examined policy for Multiagent Ant with 6 agents for the role based policy specialization. The policy modulation plots were generated by examining the PredPrey and Het. PredPrey environments respectively.
+
+### Comparison with marl
+
+For the marl setting, we compare against MADDPG (Lowe et al., 2017), FACMAC (Peng et al., 2021), COMIX (Peng et al., 2021), RODE (Wang et al., 2021) and CDS (Li et al., 2021) using QPLEX (Wang et al., 2021) as a base algorithm. We also compare against Comm-marl approaches SOG (Shao et al., 2022), and G2ANet (Liu et al., 2020). RODE and QPLEX are limited to discrete environments, thus we are unable to provide comparisons on continuous action space tasks such as Multiagent Ant or Multiagent Swimmer. All marl environments were trained for \(2,000,000\) timesteps. The neural network policies were \(3\)-layers each with \(15\) neurons per layer, and were greater than or equal to the size of the compared hom policy. For Actor-Critic approaches, we did not reduce the size or expressivity of the critic. All used hyperparameters and Algorithmic configurations were as advised by the authors of the work.
+
+In the marl setting we use Multiagent Ant, Multiagent Swimmer, Predator-Prey, Heterogeneous Predator-Prey. Multiagent Ant, and Multiagent Swimmer are MuJoCo locomotion tasks where each agent controls a segment of an Ant or Swimmer. Predator-Prey (PredPrey N) environment is a cooperative environment where N of agents work together to chase and capture prey agents. In Heterogeneous Predator Prey, each Predator has differing capabilities of speed and acceleration. This modification is challenging as a policy must not only coordinate between the Predators, but roles based specialization must be considered given the heterogeneous nature of each predator's capabilities. We also validated related work on the drone delivery task under which a drone swarm of N agents (Drone Delivery-N) must complete deliveries of varying distances while avoiding collisions and conserving fuel. The code of which is available in supplementary materials and will be open sourced.
+
+We used batching (Picheny et al., 2022) in our comparisons with marl to allow for a large number of iterations of bo. We used a batch size of \(15\) in our comparison experiments. In this setting, all MuJoCo environments use the default epoch (total number of interactions with the environment for computing reward) length of \(1000\), for Predator-Prey environments, epoch length was \(25\), for Drone Delivery environment, epoch length was \(150\).
+
+### rl and marl under Malformed Reward
+
+For single agent rl we compared against SAC (Haarnoja et al., 2018), PPO (Schulman et al., 2017), TD3 (Fujimoto et al., 2018), and DDPG (Lillicrap et al., 2015) as well as an algorithm using intrinsic motivation (Zheng et al., 2018). In single agent setting, we trained related work for \(200,000\) timesteps. In the marl setting, we trained for \(2,000,000\) timesteps. In both single-agent setting and multi-agent setting all policy networks for both ha-gp-ucb and related work was \(3\) layers of \(10\) neurons each. The tested environments were standard OpenAI Gym benchmarks of Ant, Hopper, Swimmer, and Walker2D.
+
+In the marl setting we compared against COVDN (Peng et al., 2021), COMIX, FACMAC, and MADDPG. Comparisons were not possible against other approaches as these do not support continuous action environments and are restricted to discrete action spaces.
+
+For all environments and algorithms, we used the recommended hyperparameter settings as defined by the authors.
+
+### Comparison with hdbo Algorithms
+
+For this comparison, we compared with several related works in hdbo. We compared with TurBO (Eriksson et al., 2019), Alebo (Letham et al., 2020), TreeBO (Han et al., 2021), LineBO (Kirschner et al., 2019), and a recent variant of bo for policy search, GIBO (Muller et al., 2021).
+
+For computational efficiency, the epoch length for MuJoCo environments was reduced to \(500\).
+
+### Drone Delivery Task
+
+The experimental details follow that of comparisons with marl.
+
+### Compute
+
+All experiments were performed on commodity CPU and GPUs. Each experimental setting took no more than 2 days to complete on a single GPU.
+
+### Policy Sizes
+
+We list the policy sizes of our models in Table 2 and 3.
+
+Of note is in each environment, the compared against policy of lr or marl is greater than or equal to in size vs. the policy optimized by ha-gp-ucb.
+
+## Appendix B Table of Notations
+
+Table 4 provides a summary of notations that are used frequently in paper.
+
+\begin{table}
+\begin{tabular}{|c|l|} \hline Notation & Description \\ \hline \(v\) & The objective function being optimized by Bayesian optimization \\ \(\Theta\) & The domain for the objective function \(v\) \\ \(\theta_{t}\) & A point in the domain \(\Theta\) that is picked at time \(t\) \\ \(\mu_{T}^{\pi}\) & The posterior mean (inferred and observations up to time \(T-1\)) at time \(T\) using the kernel \(k\) \\ \(\{\mu_{t}^{\pi}\}^{2}\) & The posterior variance at time \(T\) using the kernel \(k\) \\ \(r(\theta_{t})\) & The difference between the maxima of the function \(v\) in domain \(\Theta\), \(v(\theta^{\pi})\), and \(v(\theta_{t})\) \\ \(R_{T}\) & The cumulative regret, \(\sum_{t=1}^{T}r(\theta_{t})\) \\ \(\Theta^{\pi}\) & Dimension of the domain \(D\) \\ \(\bar{\mathcal{G}}_{d}\) & A graph showing the dependencies between dimensions whose edges exist between two dimensions if they are dependent \\ \(V_{d}\) & In the graph induced by \(\bar{\mathcal{G}}_{d}\) the set of dimensions corresponding to \(\Theta\) \\ \(E_{d}\) & In the graph induced by \(\bar{\mathcal{G}}_{d}\) the set of edges corresponding to the dependencies between \(\Theta\) \\ \(\Theta^{(1)}\) & Collection of dimensions indicated by \((i)\) corresponding to a maximal clique in the graph \(\bar{\mathcal{G}}_{d}\) \\ \(k^{(0)}\) & A Gaussian process kernel compared to the maximal clique \((i)\) \\ \(k\) & The Gaussian process kernel for inference corresponding to the sum of \(k^{(0)}:k\triangleq\sum_{i}k^{(i)}\Theta^{(i)}\) \\ \(v^{(1)}\) & Under the additive assumption, it is assumed that \(v=\sum_{i}v^{(i)}\) where each \(v^{(1)}\) is sampled from \(k^{(0)}\) \\ \(\mathcal{U}(\Theta)\) & A uniform random distribution over the domain \(\Theta\) \\ \(H(\ell_{0,h})\) & A query to the Hessian at \(\theta_{t,h}\) \\ \(\bar{\mathcal{G}}_{d}\) & The graph corresponding to the derived dependency structure by querying the Hessian \\ \(\mathbf{Max}_{\text{Cliques}}(\bar{\mathcal{G}}_{d})\) & A function computing the maximal cliques in the graph \(\bar{\mathcal{G}}_{d}\) \\ \(\mathbf{s}\) & The set of states of the cooperative multi-agent system where \(\mathbf{s}\triangleq[\mathbf{s}^{1}]_{i=1,\ldots,n}\) and \(i\) denotes the index of the agent \\ \(\mathbf{a}\) & The set of states taken by each agent where \(\mathbf{a}=[\mathbf{a}^{1}]_{i=1,\ldots,n}\) and \(i\) denotes the index of the agent \\ \(\mathbf{a}^{(0)}\) & The state for agent a mixing on the role \((i)\) \\ \(\mathbf{a}^{(i)}\) & The action taken by agent a mixing on the role \(\alpha(i)\) \\ \(\Delta^{\Theta_{t},i}\) & An affinity function for taking on role \(i\) where \(r\) denotes its belonging to the part of the host for role assignment \\ \(\Delta^{\Theta_{t},i}\) & An affinity function determining whether an edge exists during the interaction of roles in the host policy \\ \(\Delta^{\Theta_{t},i}\) & The message passing function parametrized by \(\theta_{t}\), for the role interaction message passing agent network \\ \(U^{\Theta_{t},i}\) & The action update function parameterized by \(\theta_{t}\), for the role interaction message passing agent network \\ \hline \end{tabular}
+\end{table}
+Table 4: Summary of key notations.
+
+## Appendix C Additional Experiments
+
+### Ablation
+
+We present an expanded version of Fig. 3 in Fig. 6 including the ablation for Multiagent Swimmer Multiagent Swimmer shows similar behavior as the simpler task Multiagent Ant, with stronger block-diagonal Hessian structure.
+
+Figure 6: Ablation study. Training curves of ha-gp-ucb and its ablated variants on different multiagent environments.
+
+Figure 7: Left: Action distributions of different roles showing diversity in the Multiagent Ant environment with 6 agents. Right above: Policy modulation with role interaction in PredPrey and Het. PredPrey environment with 3 agents. Arrows represent change after message passing. Right below: Mean connectivity and standard deviation in role interaction in Multiagent Ant with 6 agents, PredPrey with 3 agents, and Het. PredPrey with 3 agents.
+
+### Higher-order model Investigation
+
+We examined policy for Multiagent Ant with 6 agents for the role based policy specialization. The policy modulation plots were generated by examining the PredPrey and Het. PredPrey environments respectively.
+
+In Fig. 7 we investigate the learned hom policies. Our investigation shows that _role_ is used to specialize agent policies while maintaining a common theme. _Role interaction_ modulates the policy through graphical model inferences. Finally, role interactions are sparse, however noticeably higher for complex coordination tasks such as PredPrey.
+
+### Comparison with marl
+
+We present an expanded version of Fig. 5 in Fig. 8 including the results for Multiagent-Ant and Multiagent-Swimmer. We observe that in this relatively uncomplicated task not well-suited for our approach with dense reward, our hom approach shows comparable performance to marl approaches and far outperforms ha-gp-ucb (CTDE). This shows the overall value of our hom approach.
+
+### rl and marl under Malformed Reward
+
+We present additional experiments under malformed reward for both rl and marl. We formally define the Sparse reward scenario. Let \(v(\theta)\triangleq\sum_{\Gamma=1}^{\Gamma}r_{\Gamma}\) where the value of the policy is determined through \(\hat{\Gamma}\) interactions with some unknown environment and each interaction is associated with the reward, \(r_{\Gamma}\). Typically, rl algorithms observe the reward, \(r_{\Gamma}\) after every interaction with the environment. We consider a sparse reward scenario where reward feedback is given every \(S\) steps: \(r_{\Gamma}^{S}\triangleq\sum_{\Gamma=S}^{\Gamma}r_{\Gamma}\) if \(\Gamma\equiv 0\mod S\) and \(0\) o.w. In addition to the sparse reward setting described earlier,
+
+Figure 8: Comparison with marl approaches with varying number of agents.
+
+we also consider the setting of delayed reward. The delayed reward scenario is defined: \(\hat{r}_{\Gamma}^{\mathcal{D}}\triangleq r_{\Gamma-D}\) if \(\Gamma>D\) and \(0\) o.w. Thus in the delayed reward scenario, feedback on an action taken is _delayed_. This scenario is important as it arises in long term planning tasks where the value of an action is not immediately clear, but rather is ascertained after significant delays. We present the complete table comparing related works in lr with ha-gp-ucb in Table 5. As can be seen, similar to the Sparse reward scenarios, significant degradation can be observed across all tested lr algorithms with ha-gp-ucb outperforming lr algorithms with moderate to severe amount of sparsity or delay. This degradation cannot be overcome by increasing the size of the policy, as we verify with the "XL" models which are orders of magnitude larger with \(3\) layers of \(400\) neurons.
+
+We repeat these experimental scenarios in the marl setting with similar results in Table 6 where marl approaches are compared against ha-gp-ucb in the CTDE setting. Thus our validation shows that in both lr and marl strong performance requires dense, informative feedback which may not be present outside of simulator settings. In these settings, our approach of optimizing small compact policies using ha-gp-ucb outperforms related work in both lr and marl.
+
+### Comparison with hdbo Algorithms
+
+We compare with several related work in High-dimensional bo including TurBO (Eriksson et al., 2019b), AleBO (Letham et al., 2020), LineBO (Kirschner et al., 2019), TreeBO (Han et al., 2021), and GIBO (Muller et al., 2021). This is presented in Fig. 9. We experienced out-of-memory issues with AleBO after approximately \(100\) iterations, hence the AleBO plots are truncated. We compare against these algorithms at optimizing our hom policy for solving various multi-agent policy search tasks. We validated on Multiagent Ant with 6 agents, PredPrey with 3 agents, Het. PredPrey with 3 agents, Drone Delivery with 3 agents, and also Het. PredPrey with 6 agents. We observe that these competing works offer competitive performance for simpler tasks such as Multiagent Ant and PredPrey with 3 agents. However for more complex tasks that require role based interaction and coordination, our approach outperforms related work. This is evidenced in Het. PredPrey 3, Het. PredPrey 6 as well as the Drone Delivery task with 3 agents.
+
+Thus our validation shows that for simpler task, competing related works are able to optimize for simple policies of low underlying dimensionality. However, for more complex tasks which require sophisticated interaction using both Role and Role Interaction, related work is less capable of optimizing for strong policies _due to the complexity of the high-dimensional bo task_. In contrast, our work offers the capability of finding stronger policies for these complex tasks and scenarios.
+
+Figure 9: Comparison with bo algorithms. ha-gp-ucb outperforms on complex multi-agent coordination tasks.
+
+On the Applicability of Our Assumptions to RBF and Matern Kernel
+
+We show that our assumption is satisfied by the RBF Kernel when \(\Theta=[0,1]^{D}\), and is quasi-satisfied by the Matern\(-\frac{5}{2}\) kernel. We also show that in the setting where \(\Theta=[0,r]^{D}\) for some bounded \(r\), our assumptions are quasi-satisfied as although these kernels may take on small negative values, these values decay exponentially with respect to the distance. These Lemmas show that our assumptions are reasonable.
+
+**Lemma 1**.: _Let \(k\left(\theta,\theta^{\prime}\right)\triangleq\exp(\frac{-d^{2}}{2})\) be the RBF kernel with \(d\triangleq||\theta-\theta^{\prime}||\), then_
+
+\[k^{\partial i\partial j}(\theta,\theta^{\prime})=k\left(\theta,\theta^{\prime} \right)\left(1-(\theta^{i}-\theta^{\prime i})^{2}\right)\left(1-(\theta^{j}- \theta^{\prime j})^{2}\right).\]
+
+Proof.: As shown in (Rasmussen and Williams, 2006) Section 9.4, the derivative of a Gaussian Process is also a Gaussian Process. Let \(GP(0,k\left(\theta,\theta^{\prime}\right))\) be the GP from which \(f\) is sampled. This implies:
+
+\[\frac{\partial f}{\partial\theta^{a}}\sim GP\left(0,\frac{\partial^{2}k\left( \theta,\theta^{\prime}\right)}{\partial\theta^{a}\partial\theta^{\prime a}} \right).\]
+
+Applying this rule once more for the Hessian, we have:
+
+\[\frac{\partial^{2}f}{\partial\theta^{b}\theta^{a}}\sim GP\left(0,\frac{ \partial^{4}k\left(\theta,\theta^{\prime}\right)}{\partial\theta^{b}\partial \theta^{\prime b}\partial\theta^{a}\partial\theta^{\prime a}}\right).\]
+
+Given the above identities, we compute the partial derivatives for the RBF kernel:
+
+\[\frac{\partial^{2}k\left(\theta,\theta^{\prime}\right)}{\partial\theta^{a} \partial\theta^{\prime a}}=\exp\left(-\frac{||\theta-\theta^{\prime}||^{2}}{2} \right)\left(1-(\theta^{a}-\theta^{\prime a})^{2}\right).\]
+
+Deriving once more we have:
+
+\[\frac{\partial^{4}k\left(\theta,\theta^{\prime}\right)}{\partial\theta^{b} \partial\theta^{b}\partial\theta^{a}\partial\theta^{\prime a}}=\exp\left(- \frac{||\theta-\theta^{\prime}||^{2}}{2}\right)\left(1-(\theta^{a}-\theta^{ \prime a})^{2}\right)\left(1-(\theta^{b}-\theta^{\prime b})^{2}\right).\]
+
+This completes the proof noting that \(k\left(\theta,\theta^{\prime}\right)\triangleq\exp(\frac{-d^{2}}{2})\) with \(d\triangleq||\theta-\theta^{\prime}||\). 
+
+**Corollary 1**.: _Let \(k\left(\theta,\theta^{\prime}\right)\triangleq\exp(\frac{-d^{2}}{2})\), and \(\theta,\theta^{\prime}\in[0,1]^{D}\), then \(k^{\partial i\partial j}(\theta,\theta^{\prime})\geq 0\)._
+
+Proof.: The above is straightforward to see as \(\exp\left(\cdot\right)\geq 0\) and with \(\theta,\theta^{\prime}\in[0,1]^{D}\) we have \(\left(1-(\theta^{a}-\theta^{\prime a})^{2}\right)\geq 0\)\(\left(1-(\theta^{b}-\theta^{\prime b})^{2}\right)\geq 0\). 
+
+**Corollary 2**.: _Let \(k\left(\theta,\theta^{\prime}\right)\triangleq\exp(\frac{-d^{2}}{2})\), and \(\theta,\theta^{\prime}\in[0,r]^{d}\), then \(k^{\partial i\partial j}(\theta,\theta^{\prime})\geq c\exp(-d^{2})\) for some constant \(c\) dependent on \(r\)._
+
+Proof.: The above is straightforward given the above Lemma. We note that although the RBF kernel may take on negative values in the domain \(\Theta=[0,r]^{d}\), this values experience strong tail decay showing the quasi-satisfaction of our assumptions. 
+
+The above Lemma and Corollary shows that our assumptions are satisfied by the RBF Kernel when \(\Theta=[0,1]^{D}\), and quasi satisfied when \(\Theta=[0,r]^{D}\) after choosing a suitable \(p_{h}\) and \(\sigma_{h}^{2}\). We show how these assumptions are quasi-satisfied by the Matern-\(\frac{5}{2}\) kernel.
+
+**Lemma 2**.: _Let \(k\left(\theta,\theta^{\prime}\right)\triangleq(1+\sqrt{5}d+\frac{5}{3}d^{2})\exp(- \sqrt{5}d)\) be the Matern-\(\frac{5}{2}\) kernel with \(d\triangleq||\theta-\theta^{\prime}||\), then with \(d_{i}\triangleq\theta^{i}-\theta^{\prime i}\) we have_
+
+\[k^{\partial i\partial j}(\theta,\theta^{\prime})=\exp(-\sqrt{5}d)\left(\frac{5 \sqrt{5}}{3}-\frac{25}{3d}d_{i}^{2}-\frac{25}{3d}d_{j}^{2}+\frac{25\sqrt{5}}{3 d^{2}}d_{i}^{2}d_{j}^{2}+\frac{25}{3d^{3}}d_{i}^{3}d_{j}^{3}\right).\]
+
+Proof.: Following the proof of Lemma 1, we state the partial derivatives of the Matern-\(\frac{5}{2}\) kernel:
+
+\[\frac{\partial^{2}k\left(\theta,\theta^{\prime}\right)}{\partial\theta^{a} \partial\theta^{\prime a}}=\exp\left(-\sqrt{5}||\theta-\theta^{\prime}||\right) \left(\frac{5}{3}+\frac{5\sqrt{5}}{3}||\theta-\theta^{\prime}||-\frac{25}{3}( \theta^{a}-\theta^{\prime a})^{2}\right).\]
+
+Differentiating one more we have
+
+\[\frac{\partial^{4}k\left(\theta,\theta^{\prime}\right)}{\partial \theta^{b}\partial\theta^{b}\partial\theta^{a}\partial\theta^{\prime a}}=\exp \left(-\sqrt{5}||\theta-\theta^{\prime}||\right)\] \[\left(\frac{5\sqrt{5}}{3}-\frac{25}{3d}(\theta^{a}-\theta^{\prime a })^{2}-\frac{25}{3d}(\theta^{b}-\theta^{\prime b})^{2}+\frac{25\sqrt{5}}{3d^{2 }}(\theta^{a}-\theta^{\prime a})^{2}(\theta^{b}-\theta^{\prime b})^{2}\right.\] \[\left.+\frac{25}{3d^{3}}(\theta^{a}-\theta^{\prime a})^{3}(\theta ^{b}-\theta^{\prime b})^{3}\right).\]
+
+This completes the proof noting that \(d_{i}\triangleq\theta^{i}-\theta^{\prime i}\) and \(d\triangleq||\theta-\theta^{\prime}||\). 
+
+**Corollary 3**.: _Let \(k\left(\theta,\theta^{\prime}\right)\triangleq(1+\sqrt{5}d+\frac{5}{3}d^{2}) \exp(-\sqrt{5}d)\) and \(\theta,\theta^{\prime}\in[0,1]^{D}\). Then \(k^{\partial i\partial j}(\theta,\theta^{\prime})\geq\exp(-\sqrt{5}d)\left( \frac{5\sqrt{5}}{3}-\frac{25}{3d}-\frac{25}{3d^{3}}\right)\)._
+
+Proof.: The above is an immediate consequence of Lemma 2 and noting that \(||d_{i}||\leq 1\). 
+
+**Corollary 4**.: _Let \(k\left(\theta,\theta^{\prime}\right)\triangleq(1+\sqrt{5}d+\frac{5}{3}d^{2}) \exp(-\sqrt{5}d)\) and \(\theta,\theta^{\prime}\in[0,r]^{d}\). Then \(k^{\partial i\partial j}(\theta,\theta^{\prime})\geq c\exp(-d)\) for some \(c\) dependent on \(r\)._
+
+Proof.: The above is an immediate consequence of Lemma 2 and noting that \(||d_{i}||\leq r\). 
+
+Although the above corollary shows that the Matern-\(\frac{5}{2}\) kernel may take on negative values, we note that these values experience strong tail decay due to the presence of the \(\exp\left(-\sqrt{5}d\right)\) term. Thus, the negative values are likely to be extremely small, thus quasi-satisfying our assumptions. In our experiments, we observed no shortcoming in using the Matern-\(\frac{5}{2}\) kernel in ha-gp-ucb.
+
+Proof of Proposition 1
+
+We restate Proposition 1 for clarity.
+
+**Proposition 1**.: _Let \(\mathcal{G}_{d}=(V_{d},E_{d})\) represent an additive dependency structure with respect to \(v(\theta)\), then the following holds true: \(\forall a,b\ \frac{\partial^{2}v}{\partial\theta^{a}\partial\theta^{b}}\neq 0\implies( \Theta^{a},\Theta^{b})\in E_{d}\) which is a consequence of \(v\) formed through addition of independent sub-functions \(v^{(i)}\), at least one of which must contain \(\theta^{a},\theta^{b}\) as parameters for \(\frac{\partial^{2}v}{\partial\theta^{a}\partial\theta^{b}}\neq 0\) which implies their connectivity within \(E_{d}\)._
+
+Proof.: The above follows from the linearity of addition, which naturally implies a lack of curvature. In the multivariate case, this corresponds to zero or non-zero entries in the Hessian.
+
+To be precise, we prove the contrapositive:
+
+\[(\Theta^{a},\Theta^{b})\notin E_{d}\implies\frac{\partial^{2}v}{\partial\theta ^{a}\partial\theta^{b}}=0.\]
+
+Let \(a,b\) be arbitrary dimensions with \((\Theta^{a},\Theta^{b})\notin E_{d}\). As a consequence of the definition of the dependency graph, \(\nexists\Theta^{(i)}\) s.t. \(\{\Theta^{a},\Theta^{b}\}\subseteq\Theta^{(i)}\). That is, no subfunction \(v^{(i)}\) takes both \(\theta^{a}\) and \(\theta^{b}\) as arguments.
+
+By the linearity of the partial derivative, we see that:
+
+\[\frac{\partial^{2}}{\partial\theta^{a}\partial\theta^{b}}v(\theta)=\frac{ \partial^{2}}{\partial\theta^{a}\partial\theta^{b}}\sum_{i=1}^{M}v^{(i)}( \theta^{(i)})=\sum_{i=1}^{M}\frac{\partial^{2}}{\partial\theta^{a}\partial \theta^{b}}v^{(i)}(\theta^{(i)})=0\]
+
+where the last equality follows from no subfunction \(v^{(i)}\) taking both \(\theta^{a}\) and \(\theta^{b}\) as arguments.
+
+Proof of Theorem 1
+
+Our proof of Theorem 1 relies in being able to determine whether an edge does or does not exist in the dependency graph. To be able to do this, we examine the Hessian. As we have shown in Proposition 1, examining the Hessian answers this question. The challenge of Theorem 1 is detecting this dependency under noisy observations of the Hessian, as well as in domains where the variance of the second partial derivative is often zero, i.e., \(k^{\partial i\partial j}(\theta,\theta^{\prime})=0\) with high probability. To overcome this challenge, we sample the Hessian multiple times to both find portions of the domain where \(k^{\partial i\partial j}(\theta,\theta^{\prime})\geq\sigma_{h}^{2}\), and also reduce the effect of the noise on learning the dependency structure. To proceed with the analysis, we first prove a helper lemma showing that if we can construct two Normal variables of sufficiently different variances, then it's possible to accurately determine which Normal variable has low, and high variance by taking a singular sample from each. This helper lemma will be used later to help determine edges in the dependency graph. As we shall soon show, if an edge exists, we are able to construct a Normal variable with high variance. Correspondingly, if an edge does not exist, we are able to construct a Normal variable with low variance.
+
+**Lemma 3**.: _Let \(X_{l}\sim\mathcal{N}(0,\sigma_{l}^{2})\) and \(X_{h}\sim\mathcal{N}(0,\sigma_{h}^{2})\) be two random univariate gaussian variables. For any \(\delta\in(0,1)\), \(\exists\,c_{h}\text{ s.t. }|X_{l}|\leq c_{h}\leq|X_{h}|\) with probability \(1-\delta\) when \(\frac{\sigma_{h}^{2}}{\sigma_{l}^{2}}>\frac{8}{\delta^{2}}\log\frac{2}{\delta}\) and precisely when \(\frac{\sigma_{h}\delta}{2}>c_{h}>\sigma_{l}\sqrt{2\log\frac{2}{\delta}}\)._
+
+Proof.: First we note that \(|X_{l}|\) and \(|X_{h}|\) are Half-Normal random variables, with cumulative distribution function of \(F_{l}(x)=\operatorname{erf}\frac{x}{\sigma_{l}\sqrt{2}}\) and \(F_{h}(x)=\operatorname{erf}\frac{x}{\sigma_{h}\sqrt{2}}\) respectively. Thus to show that \(|X_{l}|\leq\sigma_{l}\sqrt{2\log\frac{2}{\delta}}\) and \(|X_{h}|\geq\frac{\sigma_{h}\delta}{2}\) with high probability, we utilize well known bounds on the erf and erfc function. The proofs of the below can be found in several places, e.g., Chu (1955) and Ermolova & Haggman (2004) respectively.
+
+\[\operatorname{erf}x\leq\sqrt{1-\exp{-2x^{2}}}\,;\,\,\operatorname{erfc}x\leq \exp{-x^{2}}.\]
+
+Given the above, we show that \(p(c_{h}\leq|X_{l}|)\leq\frac{\delta}{2}\) and \(p(c_{h}\geq|X_{h}|)\leq\frac{\delta}{2}\) and utilizing the union bound completes the proof.
+
+\[c_{h}>\sigma_{l}\sqrt{2\log\frac{2}{\delta}}\implies c_{h}^{2}>2 \sigma_{l}^{2}\log\frac{2}{\delta}\implies\frac{c_{h}^{2}}{2\sigma_{l}^{2}}>- \log\frac{\delta}{2}\implies-\frac{c_{h}^{2}}{2\sigma_{l}^{2}}<\log\frac{\delta }{2}\] \[\implies\exp{-\frac{c_{h}^{2}}{2\sigma_{l}^{2}}}\leq\frac{\delta}{ 2}\implies\operatorname{erfc}\frac{c_{h}}{\sqrt{2}\sigma_{l}}<\frac{\delta}{2} \implies 1-\operatorname{erf}\frac{c_{h}}{\sqrt{2}\sigma_{l}}\geq 1-\frac{\delta}{2} \implies F_{l}(c_{h})\geq 1-\frac{\delta}{2}\] \[\implies p\,(c_{h}\leq|X_{l}|)<\frac{\delta}{2}.\]
+
+Following a similar line of reasoning we have:
+
+\[c_{h}<\frac{\sigma_{h}\delta}{2}\implies\frac{c_{h}^{2}}{\sigma_ {h}^{2}}<\frac{\delta^{2}}{4}\implies\frac{-c_{h}^{2}}{\sigma_{h}^{2}}>-\frac{ \delta^{2}}{4}\implies\frac{-c_{h}^{2}}{\sigma_{h}^{2}}>\log 1-\frac{\epsilon^{2}}{4} \implies\exp{-\frac{c_{h}^{2}}{\sigma_{h}^{2}}}>1-\frac{\delta^{2}}{4}\] \[\implies 1-\exp{-\frac{c_{h}^{2}}{\sigma_{h}^{2}}}<\frac{\delta^{2}}{4} \implies\sqrt{1-\exp{-\frac{c_{h}^{2}}{\sigma_{h}^{2}}}}<\frac{\delta}{2} \implies\operatorname{erf}\frac{c_{h}}{\sigma_{h}\sqrt{2}}<\frac{\delta}{2} \implies F_{h}(c_{h})<\frac{\delta}{2}\] \[\implies p(c_{h}\geq|X_{h}|)<\frac{\delta}{2}.\]
+
+Finally, to complete the proof, we show that the interval \((\sigma_{l}\sqrt{2\log\frac{2}{\delta}},\frac{\sigma_{h}\delta}{2})\) is not the empty set when \(\frac{\sigma_{h}^{2}}{\sigma_{l}^{2}}>\frac{8}{\delta^{2}}\log\frac{2}{\delta}\).
+
+\[\frac{\sigma_{h}^{2}}{\sigma_{l}^{2}}>\frac{8}{\delta^{2}}\log\frac{2}{\delta}\implies \frac{\sigma_{h}}{\sigma_{l}}>\frac{2\sqrt{2}}{\delta}\sqrt{\log\frac{2}{\delta} }\implies\frac{\sigma_{h}\delta}{2}>\sigma_{l}\sqrt{2\log\frac{2}{\delta}}.\]
+
+We are now ready to prove Theorem 1.
+
+**Theorem 1**.: _Suppose12 there exists \(\sigma_{h}^{2},p_{h}\). s.t. \(\forall i,j\)\(\mathbb{P}_{\theta\sim\mathcal{U}(\Theta)}\left[k^{\partial i\partial j}( \theta,\theta)\geq\sigma_{h}^{2}\right]\geq p_{h}\) and \(\forall i,j,\theta,\theta^{\prime}\)\(k^{\partial i\partial j}(\theta,\theta^{\prime})\geq 0\). Then for any \(\delta_{1},\delta_{2}\in(0,1)\) after \(t\geq T_{0}\) steps of ha-gp-ucb we have: \(\bigcap_{i,j}P(\widetilde{E}_{d}^{i,j}=E_{d}^{i,j})\geq 1-\delta_{1}-\delta_{2}\) when \(T_{0}=C_{1}>\frac{8D^{2}}{\delta_{1}^{4}}\log\frac{2D^{2}}{\delta_{1}^{4}} \frac{\sigma_{h}^{2}}{\sigma_{h}^{4}}+\frac{D^{2}}{p_{h}\delta_{2}}\), \(c_{h}\triangleq T_{0}\sigma_{n}\sqrt{2\log\frac{2D^{2}}{\delta_{1}}}\)._
+
+Footnote 12: RBF kernel satisfies these assumptions when \(\Theta=[0,1]^{D}\).
+
+Proof.: We prove the above for a single pair of variables, i.e., \(k^{\partial i\partial j}\) and utilize the union bound to complete the proof. The first challenge to overcome is to sufficiently sample enough points in the domain such that we are able to find enough points \(\theta\in\Theta\) where \(k^{\partial i\partial j}(\theta,\theta)\geq\sigma_{h}^{2}\). To achieve this we sample \(T_{0}\) different \(\theta\) in the domain. After sampling \(T_{0}\) points if there exists an edge between \(\Theta^{a}\), and \(\Theta^{b}\), then with probability \(1-\frac{\delta_{2}}{D^{2}}\) we have sampled \(T_{0}-\frac{D^{2}}{p_{h}\delta_{2}}\) points where \(k^{\partial i\partial j}(\theta,\theta)\geq\sigma_{h}^{2}\). To show the above we use bounds on the cumulative distribution of the Binomial theorem. A well known bound is given \(T_{0}\) trials, with \(p_{h}\) probability of success, the probability of having fewer than \(s\) successes is upper bounded as follows:
+
+\[\frac{p_{h}}{T_{0}-s}.\]
+
+Given the above, we use \(\delta_{2}\) and derive:
+
+\[\frac{p_{h}}{T_{0}-(T_{0}-\frac{D^{2}}{p_{h}\delta_{2}})}\leq\frac{\delta_{2}} {D^{2}}.\]
+
+Given the above, with at least \((T_{0}-\frac{D^{2}}{p_{h}\delta_{2}})\) points where \(k^{\partial i\partial j}(\cdot,\cdot)\geq\sigma_{h}^{2}\), as well as our assumption \(k^{\partial i\partial j}(\theta,\theta)\geq 0\), we apply Bienayme's identity which we restate for convenience:
+
+\[\mathrm{Var}\left[\sum_{\ell=1}^{C_{1}}h_{t,\ell}\right]=\sum_{\ell=1}^{C_{1} }\sum_{\ell^{\prime}=1}^{C_{1}}\mathrm{Cov}\left(h_{t,\ell},h_{t,\ell^{\prime }}\right).\]
+
+Noting each of the \((T_{0}-\frac{D^{2}}{p_{h}\delta_{2}})\) successes is sampled \(C_{1}=T_{0}\) times with \(\mathrm{Cov}\left(h_{t,\ell},h_{t,\ell^{\prime}}\right)\geq\sigma_{h}^{2}\) for each of the successes and \(\mathrm{Cov}\left(h_{t,\ell},h_{t,\ell^{\prime}}\right)\geq 0\) for all samples by our assumption. Applying Bienayme's identity and the sum of (correlated) Normal variables is also a normal variable, we have \(\mathrm{Var}\left[\sum_{t=1}^{C_{1}}\sum_{\ell=1}^{C_{1}}h_{t,\ell}\right] \geq(T_{0}-\frac{D^{2}}{p\delta_{2}})T_{0}^{2}\sigma_{h}^{2}\). Compare this quantity with the variance if no edge exists between \(\Theta^{a}\), and \(\Theta^{b}\), where the variance results from i.i.d. noise: \(\mathrm{Var}\left[\sum_{t=1}^{T_{0}}\sum_{\ell=1}^{T_{0}}h_{t,\ell}\right]=T_{ 0}^{2}\sigma_{n}^{2}\). Comparing these two quantities, with an appropriately picked \(c_{h}\) determines the edge between \(\Theta^{a}\) and \(\Theta^{b}\) using Lemma 3. By Lemma 3, letting \(c_{h}\triangleq T_{0}\sigma_{n}\sqrt{2\log\frac{2D^{2}}{\delta_{1}}}\) ensures that \(p(h^{i,j}<c_{h})<\frac{\delta_{1}}{D^{2}}\) if edge \(E_{d}^{i,j}\) exists, and \(p(h^{i,j}>c_{h})<\frac{\delta_{1}}{D^{2}}\) if edge \(E_{d}^{i,j}\) does not exist. Applying the union bound over \(D^{2}\) pairs of variables completes the proof with \(\bigcap_{i,j}P(\widetilde{E}_{d}^{i,j}=E_{d}^{i,j})\geq 1-\delta_{1}-\delta_{2}\).
+
+Proof of Theorem 2
+
+Our proof of Theorem 2 is presented under the same setting and assumptions as the work of Srinivas et al. (2010).
+
+To prove Theorem 2, we rely on several helper lemmas. The high-level sketch of the proof is to use the properties of Erdos-Renyi graph to bound both the _size of the maximal clique_ as well as _the number of maximal cliques_ with high probability. Once these two quantities are bounded, we are able to analyze the mutual information of the kernel constructed by _summing the kernels corresponding to the maximal cliques_ of the sampled Erdos-Renyi graph as indicated in Assumption 1. Finally, once this mutual information is bounded, we use similar analysis as Srinivas et al. (2010) to complete the regret bound.
+
+We begin by bounding the size of the maximal cliques.
+
+**Lemma 4**.: _Let \(\mathcal{G}_{d}=(V_{d},E_{d})\) be sampled from a Erdos-Renyi model with probability \(p_{g}\): \(\mathcal{G}_{d}\sim G(D,p_{g})\), then \(\forall\delta\in(0,1)\) the largest clique of \(\mathcal{G}_{d}\) is bounded above by_
+
+\[|\text{Max-Clique}(\mathcal{G}_{d})|\leq 2\log_{\frac{1}{p_{g}}}|V_{d}|+2 \sqrt{\log_{\frac{1}{p_{g}}}\frac{|V_{d}|}{\delta}+1}\]
+
+with probability at least \(1-\delta\).
+
+Proof.: The above relies on well known upper bounds on the maximal clique size on a graph sampled from an Erdos-Renyi model. As shown in (Bollobas and Erdos, 1976) and (Matula, 1976) the expected number of Cliques of size \(k\), \(\mathbb{E}\left[C_{k}\right]\) is given by:
+
+\[\mathbb{E}\left[C_{k}\right]=\binom{|V_{d}|}{k}\frac{1}{p_{g}}^{- \binom{k}{2}}\leq|V_{d}|^{k}\frac{1}{p_{g}}^{-\frac{k(k-1)}{2}}=\frac{1}{p_{g} }^{\frac{k}{2}\left(2\log_{\frac{1}{p_{g}}}|V_{d}|-k+1\right)}.\]
+
+In the sequel, we omit the base of the \(\log\): \(\frac{1}{p_{g}}\) for clarity. To bound the size of the maximal clique, we find a suitable \(k\) such that \(\mathbb{E}\left[C_{k}\right]\leq\frac{\delta}{n}\) and utilize the union bound over \([C_{i}]_{i=k,\ldots,n}\) where we have \(|[C_{i}]_{i=k,\ldots,n}|\leq n\). Finally, we utilize Markov's inequality to complete the proof.
+
+\[\text{Let }k=2\log|V_{d}|+2\sqrt{\log\frac{|V_{d}|}{\delta}+1}.\]
+
+We utilize the above bound on \(\mathbb{E}\left[C_{k}\right]\).
+
+\[\implies\frac{k}{2}\left(2\log_{\frac{1}{p_{g}}}|V_{d}|-k+1 \right)=\\ \left(\log|V_{d}|+\sqrt{\log\frac{n}{\delta}}\right)\left(2\log| V_{d}|-2\log|V_{d}|-2\sqrt{\log\frac{n}{\delta}+1}+1\right)\\ \leq-\log|V_{d}|-\log\frac{n}{\delta}+1\leq\log\frac{\delta}{n}\]
+
+\[\implies\mathbb{E}\left[C_{k}\right]\leq\frac{1}{p_{g}}^{\log\frac{\delta}{n}} =\frac{\delta}{n}.\]
+
+The proof is complete by noting that by Markov inequality, \(p(C_{k}\geq 1)\leq\mathbb{E}\left[C_{k}\right]\) and taking the union bound over at most \(n\) members of \([C_{i}]_{i=k,\ldots,n}\)Next, we bound the total number of maximal cliques:
+
+**Lemma 5**.: _Let \(\mathcal{G}_{d}=(V_{d},E_{d})\) be sampled from a Erdos-Renyi model with probability \(p\): \(\mathcal{G}_{d}\sim G(D,p_{g})\), then \(\forall\delta\in(0,1)\) the number of total maximal cliques in \(\mathcal{G}_{d}\) is bounded above by_
+
+\[\frac{1}{\delta}\sqrt{|V_{d}|^{\log_{\frac{1}{p_{g}}}|V_{d}|+5}}\]
+
+_with probability at least \(1-\delta\)._
+
+Proof.: We prove the above by bounding \(\max_{k}C_{k}\) with high probability and noting that the number of maximal cliques is bounded by \(\sum_{k}C_{k}\leq n\max_{k}C_{k}\) with high probability. To bound \(\max C_{k}\), we first consider \(\max_{k}\mathbb{E}\left[C_{k}\right]\).
+
+\[\max_{k}\mathbb{E}\left[C_{k}\right]=\max_{k}\frac{1}{p_{g}}\frac{\sfrac{k}{p _{g}}\left(2\log_{\frac{1}{p_{g}}}|V_{d}|-k+1\right)}{\left(2\log_{\frac{1}{p_ {g}}}|V_{d}|-k+1\right)}.\]
+
+Taking the partial derivative of \(\frac{k}{2}\left(2\log_{\frac{1}{p_{g}}}|V_{d}|-k+1\right)\) with respect to \(k\) we determine the maximum:
+
+\[\arg\max_{k}\frac{k}{2}\left(2\log_{\frac{1}{p_{g}}}|V_{d}|-k+1\right)=\log_{ \frac{1}{p_{g}}}|V_{d}|+1.\]
+
+Thus we are able to bound:
+
+\[\frac{\log_{\frac{1}{p_{g}}}|V_{d}|+1}{2}\left(2\log_{\frac{1}{p_ {g}}}|V_{d}|-\log_{\frac{1}{p_{g}}}|V_{d}|-1+1\right)=\\ \frac{\log_{\frac{1}{p_{g}}}|V_{d}|+1}{2}\left(\log_{\frac{1}{p_ {g}}}|V_{d}|\right)=\frac{1}{2}\log_{\frac{1}{p_{g}}}^{2}|V_{d}|+\frac{1}{2} \log_{\frac{1}{p_{g}}}|V_{d}|\]
+
+Which yields the bound:
+
+\[\mathbb{E}\left[C_{k}\right]\leq\frac{1}{p_{g}}\frac{\sfrac{1}{2}\log_{\frac{1 }{p_{g}}}^{2}|V_{d}|+\frac{1}{2}\log_{\frac{1}{p_{g}}}|V_{d}|}{\left(2\log_{ \frac{1}{p_{g}}}|V_{d}|\right)}=\sqrt{|V_{d}|^{\log_{\frac{1}{p_{g}}}|V_{d}|+ 1}}.\]
+
+To complete the proof, we utilize Markov's inequality with \(p\left(C_{k}\geq\frac{|V_{d}|}{\delta}\sqrt{|V_{d}|^{\log_{\frac{1}{p_{g}}}|V_ {d}|+1}}\right)\leq\frac{\delta}{|V_{d}|}\) and utilize the union bound over \(n\) choices of \(k\):
+
+\[\sum_{k}C_{k}\leq\sum_{k}\frac{|V_{d}|}{\delta}\sqrt{|V_{d}|^{\log_{\frac{1}{p _{g}}}|V_{d}|+1}}=\frac{1}{\delta}\sqrt{|V_{d}|^{\log_{\frac{1}{p_{g}}}|V_{d}| +5}}\]
+
+with probability \(1-\delta\). 
+
+Now that we have bounded both the number of cliques, as well as the sizes of the maximal cliques with high probability, we now consider the mutual information of the kernel constructed by summing the kernels corresponding to the maximal cliques of the dependency graph.
+
+**Lemma 6**.: _Define \(I(\mathbf{y}_{A};v)\triangleq\mathrm{H}(\mathbf{y}_{A})-\mathrm{H}(\mathbf{y}_ {A}\mid v)\) as the mutual information between \(\mathbf{y}_{A}\) and \(v\) with \(\mathrm{H}(\mathcal{N}(\mu,\Sigma))\triangleq\frac{1}{2}\log[2\pi e\Sigma]\) as the entropy function. Define \(\gamma_{T}^{k}\geq\max_{A\subset\Theta:|A|=T}I\left(\mathbf{y}_{A};v\right)\) when \(v\sim GP(0,k\left(\theta,\theta^{\prime}\right))\). Let \([k_{i}]_{i=1,\ldots,M}\) be arbitrary kernels defined on the domain \(\Theta\) with upper bounds on mutual information \([\gamma_{T}^{k_{i}}]_{i=1,\ldots,M}\), then the following holds true:_
+
+\[\gamma_{T}^{\sum_{k}k_{i}}\leq M^{2}\max{[\gamma_{T}^{k_{i}}]_{i=1,\ldots,M}}.\]To prove the above, we first state Weyl's inequality for convenience:
+
+**Lemma 7**.: _Let \(H,P\in\mathbb{R}^{n\times n}\) be two Hermitian matrices and consider the matrix \(M=H+P\). Let \(\mu_{i},\nu_{i},\rho_{i},i=1,\ldots,n\) be the eigenvalues of M, H, and P respectively in decreasing order. Then, for all \(i\geq r+s-1\) we have_
+
+\[\mu_{i}\leq\nu_{r}+\rho_{s}.\]
+
+The above has an immediate Corollary as noted by Rolland et al. (2018):
+
+**Corollary 5**.: _Let \(K_{i}\in\mathbb{R}^{n\times n}\) be Hermitian matrices for \(i=1,\ldots,M\) with \(K\triangleq\sum_{i}^{M}K_{i}\). Let \([\lambda_{\ell}^{K_{i}}]_{\ell=1,\ldots,n}\) denote the eigenvalues of \(K_{i}\) in decreasing order. Then for all \(\ell\in\mathbb{N}_{0}\) such that \(\ell M+1\leq n\) we have_
+
+\[\lambda_{\ell M+1}^{K}\leq\sum_{i=1}^{M}\lambda_{\ell+1}^{K_{i}}.\]
+
+We are now ready to prove Lemma 6 using Weyl's inequality and its corollary as a key tool.
+
+Proof.: Given the definition of \(I(\mathbf{y}_{A};v)\triangleq\frac{1}{2}\log[\mathbf{I}+\sigma^{-2}\mathbf{K} _{A}^{k}]\)(Srinivas et al., 2010) we bound the eigenvalues of \(M\mathbf{I}+\sigma^{-2}\sum_{i}^{M}\mathbf{K}_{A}^{k_{i}}\) using the eigenvalues of \([I+\sigma^{-2}\mathbf{K}_{A}^{k_{i}}]_{i=1,\ldots,M}\) where \(k\triangleq\sum_{i=1}^{M}k_{i}\). Using the above Corollary we see that:
+
+\[\lambda_{\ell}^{M\mathbf{I}+\sigma^{-2}K}\leq\sum_{i=1}^{M}\lambda_{\lceil\frac {M}{T}\rceil}^{I+\sigma^{-2}K_{i}}.\]
+
+Given the above, we see that \(M^{2}\max[\gamma_{T}^{k_{i}}]_{i=1,\ldots,M}\geq\frac{1}{2}\log[\mathbf{I}+ \sigma^{-2}\mathbf{K}_{A}^{k}]\) as \(\sum_{i}^{M}M\gamma_{T}^{k_{i}}\geq\frac{1}{2}\log[M\mathbf{I}+\sigma^{-2}\sum _{i}^{M}\mathbf{K}_{A}^{k_{i}}]\). 
+
+Finally, we require an additional helper lemma to bound the supremum and infimum of a function sampled from a GP. This helper lemma helps bound the regret during the first phase of ha-gp-ucb where we randomly sample the Hessian over the domain.
+
+**Lemma 8**.: _Let \(k\left(\theta,\theta^{\prime}\right)\) be four times differentiable on the continuous domain \(\Theta\triangleq[0,r]^{D}\) for some bounded \(r\) (i.e., compact and convex) with \(f\sim GP(0,k\left(\theta,\theta^{\prime}\right))\) then for all \(\delta\in(0,1)\) the following holds true:_
+
+\[\sup_{\theta\in[0,r]^{D}}f\leq c_{b}\sqrt{D\log\delta^{-1}}=\mathcal{O}\left( \sqrt{D\log\delta^{-1}}\right).\]
+
+\[\inf_{\theta\in[0,r]^{D}}f\geq-c_{b}\sqrt{D\log\delta^{-1}}=\Omega\left(-\sqrt{ D\log\delta^{-1}}\right).\]
+
+_for some constant \(c_{b}\) dependent on \(\delta\) and \(r\), with probability \(1-\delta\)._
+
+Proof.: We refer readers to Srinivas et al. (2010) Lemma 5.8 for the proof of the above. 
+
+We are now ready to prove Theorem 2.
+
+**Theorem 2**.: _Let \(k\) be the kernel as in Assumption 1, and Theorem 1. Let \(\gamma_{T}^{k}(d):\mathbb{N}\rightarrow\mathbb{R}\) be a monotonically increasing upper bound function on the mutual information of kernel \(k\) taking \(d\) arguments. The cumulative regret of ha-gp-ucb is bounded with high probability as follows:_
+
+\[R_{T}=\widetilde{\mathcal{O}}\Big{(}D^{4.5}\!\log^{2}\!D\!+\!\sqrt{T\beta_{T}D ^{\mathcal{O}(\log D)}\gamma_{T}^{k}(\mathcal{O}(\log D))}\Big{)}. \tag{4}\]We restate the above theorem with more precision:
+
+**Theorem 2**.: _Let \(k\) be the kernel as in Assumption 1, and Theorem 1 and for some constants \(a,b\),_
+
+\[P\left[\sup_{\theta\in\Theta}\left|\frac{\partial v}{\partial\theta_{i}}\right|>L \right]\leq ae^{-(L/b)^{2}},i=1,\ldots,D.\]
+
+_Let \(\gamma_{T}^{k}(d):\mathbb{N}\rightarrow\mathbb{R}\) be a monotonically increasing upper bound function on the mutual information of kernel \(k\) taking \(d\) arguments. Let \(k\left(\theta,\theta^{\prime}\right)\) be four times differentiable on the continuous domain \(\Theta\triangleq[0,r]^{d}\) for some bounded \(r\) (i.e., compact and convex). For any \(\delta_{1},\delta_{2},\delta_{3},\delta_{4},\delta_{5},\delta_{6}\in(0,1)\). Let \(\tilde{t}\triangleq t-T_{0}C_{1}\) and let_
+
+\[\beta_{t}=2\log(\overline{t}^{2}2\pi^{2}/3\delta_{6}^{2})+2D\log(\overline{t} ^{2}Dbr\sqrt{\log(4Da/\delta_{6})})\]
+
+_The cumulative regret of ha-gp-ucb is bounded:_
+
+\[P\left[R_{T}\leq 2C_{1}^{2}c_{b}\sqrt{D\log\delta_{5}^{-1}}+\sqrt{C_{2}T \beta_{T}\gamma_{T}}+2\ \ \ \forall T\geq 1\right]\geq 1-\delta_{1}-\delta_{2}- \delta_{3}-\delta_{4}-\delta_{5}-\delta_{6}\]
+
+_when \(C_{1}=\frac{8D^{2}}{\delta_{1}^{2}}\log\frac{2D^{2}}{\delta_{1}}\frac{\sigma_{ 1}^{2}}{\sigma_{b}^{2}}+\frac{D^{2}}{p_{h}\delta_{2}}+1\), \(C_{2}=8/\log(1+\sigma^{-2})\), and \(\gamma_{T}=\frac{1}{\delta_{1}^{2}}D^{\log_{1/p_{g}}D+5}\gamma_{T}^{k}\left(2 \log_{1/p_{g}}D+2\sqrt{\log_{1/p_{g}}D/\delta_{3}+1}\right)\) where \(c_{b}\) is some constant dependent on \(\delta_{5}\)._
+
+Proof.: The proof is a consequence of the helper lemmas and theorems we have proved. First we consider Phase 1 of ha-gp-ucb where \(t\leq T_{0}\). By Theorem 1, at most \(T_{0}C_{1}=C_{1}^{2}\) queries will be made during Phase 1, and Lemma 8 indicates the maximum regret for any query. Consulting the respective Theorem and Lemma, we are able to bound the cumulative regret during Phase 1 by:
+
+\[2C_{1}^{2}c_{b}\sqrt{D\log\delta_{5}^{-1}}=\mathcal{O}(D^{4.5}\log^{2}D).\]
+
+Considering Phase 2, we utilize Lemma 4, Lemma 5, Lemma 6 to bound the mutual information of the sampled kernel with high probability. The number of cliques is given by:
+
+\[\frac{1}{\delta_{4}}\sqrt{D^{\log_{1/p_{g}}D+5}}=D^{\mathcal{O}(\log D)}.\]
+
+The size of the largest clique is given by:
+
+\[2\log_{1/p_{g}}D+2\sqrt{\log_{1/p_{g}}D/\delta_{3}+1}=\mathcal{O}(\log D).\]
+
+Following Lemma 6, we may bound the mutual information by:
+
+\[\mathcal{O}(D^{\mathcal{O}(\log D)}\gamma_{T}^{k}(\mathcal{O}(\log D)).\]
+
+The proof is complete by leveraging the connection between mutual information and cumulative regret as shown by Srinivas et al. (2010) where \(\widetilde{\mathcal{O}}\) is the same as \(\mathcal{O}\) with the \(\log\) factors suppressed.
+
+## Appendix H On the Surrogate Hessian, \(\mathbf{H}_{\pi}\)
+
+In Section 4.5 we remarked that although we cannot observe \(\mathbf{H}_{v}\), we can observe a surrogate hessian, \(\mathbf{H}_{\pi}\) which is related to \(\mathbf{H}_{v}\) by the chain rule. We justify our choice here with showing how \(\mathbf{H}_{\pi}\) is an important sub-component of \(\mathbf{H}_{v}\)(Skorski, 2019). Although the reasoning we give is in one dimension, an analogous argument can be made in arbitrary dimensions using the chain rule for vector-valued functions yielding the Hessian tensor (Magalhaes, 2020). We have \(v:\Theta\rightarrow\mathbb{R}\) is a function of the policy \(\pi\) and can be expressed as a composition of functions:
+
+\[v:\Theta\rightarrow\mathbb{R}=\hat{v}\left(\pi\left(\theta\right)\right). \tag{5}\]
+
+In the above we use \(\pi\left(\theta\right)\) as shorthand for \(\pi\left(\mathbf{s}^{\alpha},\mathbf{a}^{\alpha};\theta\right)\) with \(\hat{v}\) representing some unknown function. Using the definition of the Hessian we have:
+
+\[\mathbf{H}_{v}\triangleq\left[\frac{\partial^{2}v}{\partial\theta^{\alpha} \partial\theta^{b}}\right]_{a,b=1,...,D}=\left[\frac{\partial^{2}}{\partial \theta^{\alpha}\partial\theta^{b}}\ \hat{v}\left(\pi\left(\theta\right)\right)\right]_{a,b=1,...,D}\]
+
+Where the above identity follows from the definition of \(v\) in Eq. 5. We can now apply chain rule to express:
+
+\[\frac{\partial^{2}}{\partial\theta^{\alpha}\partial\theta^{b}}\ \hat{v} \left(\pi\left(\theta\right)\right)=\underbrace{\left[\mathbf{H}_{\hat{v}}( \pi(\theta))\frac{\partial\pi}{\partial\theta^{a}}(\theta)\right]\cdot\frac{ \partial\pi}{\partial\theta^{b}}(\theta)}_{r(\theta)}+\underbrace{\frac{ \partial^{2}\pi}{\partial\theta^{a}\partial\theta^{b}}\left(\theta\right)}_{ \mathbf{H}_{\pi}(\theta)}\cdot\underbrace{\nabla\hat{v}(\pi(\theta))}_{g( \theta)} \tag{6}\]
+
+As we see in the above as a consequence of the chain rule, \(\frac{\partial^{2}\pi}{\partial\theta^{a}\partial\theta^{b}}\) forms an important sub-component \(\frac{\partial^{2}v}{\partial\theta^{a}\partial\theta^{b}}\). Given the above, we can simplify the above in the following manner:
+
+\[\mathbf{H}_{v}=r+\mathbf{H}_{\pi}\circ g\]
+
+where \(r,g\), and \(\mathbf{H}_{\pi}\) arise from the corresponding highlighted terms in Eq. 6 with \(r\) representing some unknown remainder term and \(\circ\) representing the Hadamard product. Given the above, it is straightforward to see how \(\mathbf{H}_{\pi}\) serves as a surrogate hessian for \(\mathbf{H}_{v}\). Indeed if \(r\neq-\mathbf{H}_{\pi}\circ g\) and \(g\) has no zero entries then \(\mathbf{H}_{\pi}\neq 0\implies\mathbf{H}_{v}\neq 0\). In our use case, we are most concerned with non-zero entries in the Hessian, \(\mathbf{H}_{v}\), and the surrogate Hessian, \(\mathbf{H}_{\pi}\) is well served for determining \(\mathbf{H}_{v}\neq 0\) due to the above.
+
+Since \(\pi\left(\theta\right)\) is shorthand for \(\pi\left(\mathbf{s}^{\alpha},\mathbf{a}^{\alpha};\theta\right)\), to approximate \(\mathbf{H}_{\pi}\) we average \(\mathbf{H}_{\pi(\mathbf{s}^{\alpha},\mathbf{a}^{\alpha};\theta)}\) over state action pairs, \((\mathbf{s}^{\alpha},\mathbf{a}^{\alpha})\) formed through interaction of the policy with the unknown task environment.
+
+A possible avenue of overcoming this limitation is considering Hessian estimation through zero'th order queries. Several works along this direction have recently appeared using Finite Differences (Cheng et al., 2021), as well as Gaussian Processes (Muller et al., 2021). We consider removing this dependency on the surrogate Hessian for future work.
+
+## Appendix I Drone Delivery Task
+
+Our drone delivery task was inspired by recent research work in studying unique problems in drone delivery vehicle routing problems (Dorling et al., 2017).
+
+Drones fly from delivery point to delivery point where completing a delivery gives a large amount of reward, but running out of fuel and collisions give a small amount of negative reward. After completing a delivery, the delivery point is randomly removed within the environment. A collision gives a small amount of negative reward and momentarily stops the drone. Completing a delivery refills the drone fuel and allows it to continue to make more deliveries. The amount of reward given increases quadratically with the distance of the delivery to highly reward long distance deliveries which require long term planning. To compound this requirement for long term planning, fuel consumption also dramatically increases at high velocities to encourage long-term fuel efficiency planning. In this complex scenario requiring long term planning, rl approaches can easily fall into local minima of completing short distance, low reward deliveries and fail to sufficiently explore (under sparse reward) policies which complete long distance deliveries with careful planning.
+
+Implementation code of this task can be found in supplementary materials.
+
+## Appendix J Replot With Timesteps
+
+We replot the relevant figures in Fig. 12 and Fig. 13 while maintaining total environment interactions as the singular independent variable. We note that there is no significant change to our conclusions as a consequence of this replotting. We also highlight that although total environment interactions is considered the important independent variable in lr and marl, in do typically the total evaluated policies is considered the more important independent variable as each evaluation is assumed to be costly.
+
+Figure 11: Comparison with marl approaches on the drone delivery task.
+
+Figure 10: Comparison with marl approaches with varying number of agents.
+
+## Appendix K Replot With "best found policy so far" in RL
+
+We replot the relevant figures in Fig. 12 and Fig. 13 where both bo and marl approaches show the value of the "best found policy so far." We note that there is no significant change to our conclusions as a consequence of this replotting.
+
+Tables With "best found policy so far" in RL
+
+We generate new tables investigating RL and MARL under sparse or malformed reward. In Table 7 and 8 we show the value of the best found policy during the training process for RL and MARL. Our observations and conclusions remain the same where RL and MARL performance severely degrades under sparse and malformed reward and is often outperformed by our HA-GP-UCB approach.

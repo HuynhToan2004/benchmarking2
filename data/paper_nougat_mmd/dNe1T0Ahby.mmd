@@ -1,0 +1,827 @@
+# Efficacy of Dual-Encoders for Extreme Multi-Label Classification
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Dual-encoder models have demonstrated significant success in dense retrieval tasks for open-domain question answering that mostly involves zero-shot and few-shot scenarios. However, their performance in many-shot retrieval problems where training data is abundant, such as extreme multi-label classification (XMC), remains under-explored. Existing empirical evidence suggests that, for such problems, the dual-encoder method's accuracies lag behind the performance of state-of-the-art (SOTA) extreme classification methods that grow the number of learnable parameters linearly with the number of classes. As a result, some recent extreme classification techniques like (Dahiya et al., 2023; b) use a combination of dual-encoders and a learnable classification head for each class to excel on these tasks. In this paper, we investigate the potential of "pure" DE models in XMC tasks. Our findings reveal that when trained correctly standard dual-encoders can match or outperform SOTA extreme classification methods by up to 2% at Precision@1 even on the largest XMC datasets while being \(20\times\) smaller in terms of the number of trainable parameters. We further propose a differentiable top-k error-based loss function, which can be used to specifically optimize for Recall@k metrics. We include our PyTorch implementation along with other resources for reproducing the results in the supplementary material.
+
+## 1 Introduction
+
+Dual-encoder (DE) models have been highly successful in dense retrieval tasks for open-domain question answering (openQA) systems (Lee et al., 2019; Karpukhin et al., 2020; Qu et al., 2021), where they efficiently retrieve relevant passages or documents from a large corpus given a user's query. These models excel at leveraging their learned representations to identify and rank pertinent documents, by mapping both queries and documents into a shared embedding space, enabling efficient and effective retrieval using _fast similarity search methods_(Guo et al., 2020; Johnson et al., 2021). So far, DE models have been primarily explored in the zero-shot and the few-shot scenarios, where the models are required to _generalize_ and retrieve relevant documents even though they might not have appeared in the training set.
+
+An important retrieval scenario that frequently arises in real-world applications such as search engines (Mitra and Craswell, 2018) and recommendation systems (Covington et al., 2016; Zhang et al., 2019) is where we want to perform retrieval for documents/items from a large collection based on a significant number of seen examples per document/item, i.e., a _many-shot scenario_. Such tasks are often formulated as extreme multi-label classification (XMC) task, where each document/item to be retrieved is considered as a separate label (Bhatia et al., 2016). In the context of Retrieval Augmented Generation (RAG), for scenarios where multiple documents could contain the desired answer, the retrieval task in RAG can also be considered as an XMC problem. Typically, XMC algorithms need to both "memorize" and "generalize". That is, for each label they need to memorize the type of queries that are relevant, e.g., for a product to product recommendation scenario, the algorithm should memorize which products can lead to click on a particular product using the provided product-product co-click data. At the same time, the algorithm should generalize on unseen queries.
+
+It is a prevailing belief in the XMC community that due to the semantic gap and knowledge-intensive nature of XMC benchmarks, DE by themselves are not sufficient to attain good performance (Daihya et al., 2023). As a measure to overcome the semantic gap and enable memorization, SOTA XMCmethods augment DE with either per-label classifiers (Daihya et al., 2023a; Mittal et al., 2021a) or extra auxiliary parameters (Daihya et al., 2023b). We explore this belief by performing a simple experiment on a synthetic dataset where a random query text is associated with a random document text, and the task is to memorize these random correlations during retrieval. As shown in Section C.1, DE models are able to perform this task with perfect accuracy at least on up to 1M scale datasets, disputing the previously held belief in the literature.
+
+In light of the aforementioned synthetic experiment, this work aims to answer the following question: "Are pure DE models sufficient for XMC tasks?" A Pure DE model is desirable because: 1). For XMC methods, unlike DE, the model size and consequently the number of trainable parameters scales _linearly_ with the number of labels (see Figure 1). 2). XMC methods require re-training or model updates on encountering new labels. In contrast, DE methods can generalize to new labels based on their features. Interestingly, our work shows that pure DE models can indeed match or even outperform SOTA XMC methods by up to 2% even on the largest public XMC benchmarks while being \(20\times\) smaller in model size. The key to the improved performance is the right loss formulation for the underlying task and the use of extensive negatives to give consistent and unbiased loss feedback.
+
+We begin by analyzing existing multi-label and contrastive training losses like One-versus-All Binary Cross-Entropy (OvA-BCE) and InfoNCE, highlighting how they may be inadequate for training dual-encoder models in XMC. Specifically, we note that OvA-BCE does not train effectively and InfoNCE disincentivizes confident predictions. To overcome these limitations, we propose a simple modification to the InfoNCE loss as the DecoupledSoftmax loss which removes the undesirable correlation between positive labels during training. We further extend our loss design to SoftTop-k loss which is tailored to optimize prediction accuracy within a specific prediction budget size (k). This can be particularly relevant to XMC applications where the goal is to make a fixed number of highly accurate predictions from a vast set of possible labels. Moreover, we note that XMC problems involve a long tail of labels, which at the query level manifests as a large number of highly relevant negatives. To this end, in order to establish the full potential of DE methods, we first study our proposed loss using _all_ the negatives in the loss term. Naturally, including all negatives is challenging for million-label scale datasets. To this end, we provide a memory-efficient distributed implementation that can use multiple GPUs and a modified gradient cache (Gao et al., 2021) approach to scale DE training to largest public XMC benchmarks even with a modest GPU setup (see Table 1, 9). We further study the performances and implications of approximations of the proposed loss functions using standard hard negative mining approaches. In summary, the contributions of this work include:
+
+* We demonstrate that dual-encoder methods alone can achieve state-of-the-art performance on XMC tasks leading to a more parameter-efficient and generalizable approach for XMC. This also unifies the approaches for XMC and retrieval problems, paving the way for universally applicable and simplified solutions for these problems.
+* We analyze and show existing multi-label and contrastive training losses are not appropriate for training dual-encoder models in XMC. Specifically, we note that OvA-BCE does not train effectively and InfoNCE disincentivizes confident predictions.
+* We propose a simple modification to the InfoNCE loss as the DecoupledSoftmax loss that overcomes the limitations and further extend our loss design to SoftTop-k loss which is tailored to optimize prediction accuracy within a specific prediction budget size.
+
+Before providing a detailed account of our contributions in Section 4 and 5, we begin by discussing relevant literature in Section 2 and introducing necessary background in Section 3.
+
+## 2 Related work
+
+**Extreme classification methods.** There is a large body of literature on utilizing sparse features or dense pre-trained dense features to develop XMC methods (Babbar and Scholkopf, 2017; Prabhu et al., 2018; Prabhu and Varma, 2014; Joulin et al., 2017; Yen et al., 2016; 2017; Gupta et al., 2021; Yu et al.,
+
+Figure 1: Number of trainable parameters used by different models and their P@1 performance on LF-AmazonTitles-1.3M dataset
+
+2022). Lately, task-specific dense features, e.g., based on BERT (Devlin et al., 2019), have been also utilized to design solutions for XMC problems (see, e.g., Zhang et al., 2018; You et al., 2019; Gupta et al., 2019; Guo et al., 2019; Medini et al., 2019; Chang et al., 2020; Jiang et al., 2021; Ye et al., 2020; Zhang et al., 2021; Gupta et al., 2022, and references therein). However, these approaches treat labels as featureless ids and employ classification networks that assign a unique classification vector to each label. Given their increasingly popularity in information retrieval literature (Lee et al., 2019; Karpukhin et al., 2020; Luan et al., 2021; Qu et al., 2021; Xiong et al., 2021), DE methods that employ two encoders to embed query and items into a common space have been increasingly explored for XMC settings as well. By leveraging the label features such as label text (Mittal et al., 2021; Dahiya et al., 2021), images (Mittal et al., 2022), and label (correlation) graph (Mittal et al., 2021; Saini et al., 2021), such methods have already shown improved performance for the settings involving tail labels. That said, the current SOTA methods such as NGAME (Dahiya et al., 2023a), do not solely rely on a DE model. For instance, NGAME's two-stage approach involves first training query representations via a DE approach, and then utilizing a classification network in the second stage. DEXA (Dahiya et al., 2023b), is a recently proposed approach which builds on NGAME to improve the encoder embeddings by augmenting them with auxiliary parameters.
+
+**Loss functions for multi-label classification problems.** One of the prevalent approaches to solve multi-label classification problem involves reducing it to multiple (independent) binary (Dembczynski et al., 2010) or multiclass (Joulin et al., 2017; Jernite et al., 2017) classification problems. Subsequently, one can rely on a wide range of loss functions designed for the resulting problems, aimed at minimizing the top-\(k\) classification error (Lapin et al., 2016; Berrada et al., 2018; Yang and Koyejo, 2020; Petersen et al., 2022). Since different queries have varying number of relevant documents, Lapin et al. (2016); Yang and Koyejo (2020) identified desirable loss functions that are simultaneously calibrated (Bartlett et al., 2006; Zhang, 2004) for multiple values of \(k\). Another popular approach to solve a multi-label classification problem relies on (contextual) _learning to rank_ framework (Liu et al., 2009) where (given a query) the main objective is to rank relevant documents above irrelevant ones. Various surrogate ranking loss functions, aimed at optimizing the specific ranking metrics such as Precision@k and NDCG@k, have been considered in the literature (see e.g., Usunier et al., 2009; Kar et al., 2015; Li et al., 2017; Jagerman et al., 2022; Su et al., 2022, and references therein).
+
+**Negative sampling.** Modern retrieval systems increasingly deal with a large number of items, leading to increased training complexity. _Negative sampling_(Bengio and Senecal, 2008; Mikolov et al., 2013; Mnih and Teh, 2012; Mnih and Kavukcuoglu, 2013) helps mitigate this via employing a loss function restricted to the given relevant documents and a subset of negatives or irrelevant documents. Selection of informative negatives is critical for training high-quality models. For classification networks, Bengio and Senecal (2008) studied negative sampling for softmax cross entropy loss by relying on importance sampling. Recently, many works have extended this line of work, e.g., by leveraging quadratic kernels (Blanc and Rendle, 2018) and random Fourier features (Rawat et al., 2019). As for the generic loss function and model architecture, it is common to employ sparse retrieval mechanism, e.g., BM25 (Robertson et al., 1995; Robertson et al., 1994), to obtain negative documents (Luan et al., 2021; Karpukhin et al., 2020). Another strategy is to leverage _in-batch negatives_(Henderson et al., 2017; Karpukhin et al., 2020): for a given query in a mini-batch, items appearing as positive labels for other queries in the mini-batch are treated as negatives. However, in-batch negatives often constitute "easy" negatives (with very small contribution to the overall gradient) and do not aid the training much (see, e.g., Karpukhin et al., 2020; Luan et al., 2021). Same holds for the negatives sampled according to uniform or unigram distribution (Mikolov et al., 2013b). Reddi et al. (2019) proposed sampling a large uniform subset of items and weighting those according to their hardness for each query. Taking this approach to an extreme, for each query, ANCE (Xiong et al., 2021) selects the hardest negatives from the entire corpus according to the query-document similarity based on a document index.
+
+## 3 Background: multi-label classification
+
+As discussed in Section 1, the (many-shot) retrieval problem explored in this work is essentially a multi-label classification problem. Assuming that \(\mathcal{Q}\) and \(\mathcal{D}\) denote the query and document (or labeled) spaces, respectively, the underlying _query-document relevance_ is defined by the distribution \(\mathcal{P}\) where \(\mathcal{P}(d|q)\) captures the true relevance for the query-document pair \((q,d)\in\mathcal{Q}\times\mathcal{D}\). In this paper, we assume that the document space is finite with a total \(|\mathcal{D}|=L\) documents. Let the training data consists of \(N\) examples \(\mathcal{S}:=\{(q_{i},\mathbf{y}_{i})\}_{i\in N}\subseteq\mathcal{Q}\times\{0, 1\}^{L}\), where, for \(j\in[L]\), \(y_{i,j}=1\)_iff_\(j\)th document in \(\mathcal{D}\) is relevant for query \(q_{i}\). We also denote the set of positive labels for \(q_{i}\) as \(P_{i}=\{j:y_{i,j}=1\}\)
+
+**Dual-encoder models and classification networks.** Note that learning a retrieval model is equivalent to learning a _scoring function_ (or simply _scorer_) \(s_{\mathbf{\theta}}:\mathcal{Q}\times\mathcal{D}\rightarrow\mathbb{R}\), which is parameterized by model parameters \(\mathbf{\theta}\). A DE model consists of a _query encoder_\(f_{\mathbf{\phi}}:\mathcal{Q}\rightarrow\mathbb{R}^{d}\) and a _document encoder_\(h_{\mathbf{\psi}}:\mathcal{D}\rightarrow\mathbb{R}^{d}\) that map query and document features to \(d\)-dimensional embeddings, respectively. Accordingly, the corresponding scorer for the DE model is defined as: \(s_{\mathbf{\theta}}(q,d)=\langle x_{q},z_{d}\rangle=\langle f_{\mathbf{\phi}}(q),h_{ \mathbf{\psi}}(d)\rangle\), where \(\mathbf{\theta}=[\mathbf{\phi};\mathbf{\psi}]\) and \(x_{q},z_{d}\in\mathbb{R}^{d}\). Note that it is common to share encoders for query and document, i.e., \(\mathbf{\phi}=\mathbf{\psi}\). We also focus on this shared parameter setting in our exploration.
+
+Different from DE models, classification networks ignore document features. Such networks consist of a query encoder \(g_{\mathbf{\phi}}:\mathcal{Q}\rightarrow\mathbb{R}^{d}\) and a classification matrix \(W\in\mathbb{R}^{L\times d}\), with \(i\)th row as the classification weight vector for the \(i\)th document. The scorer for the classification network then becomes \(s_{\mathbf{\theta}}(q,d)=\langle g_{\mathbf{\phi}}(q),\mathbf{w}_{d}\rangle\), where \(\mathbf{w}_{d}\) denotes the classification vector associated with document \(d\) and \(\mathbf{\theta}=[\mathbf{\phi};W]\). For ease of exposition, we do not always highlight the explicit dependence on trainable parameters \(\mathbf{\theta},\mathbf{\phi},\mathbf{\psi}\) while discussing DE models and classification networks.
+
+**Loss functions.** Given the training set \(\mathcal{S}\), one learns a scorer by minimizing the following objective:
+
+\[\mathcal{L}(s;\mathcal{S})=\frac{1}{N}\sum\nolimits_{i\in[N]}\ell(q_{i}, \mathbf{y}_{i};s), \tag{1}\]
+
+where \(\ell\) is a _surrogate loss-function_ for some specific metrics of interest (e.g., Precision@k and Recall@k). Informally, \(\ell(q,\mathbf{y};s)\) serves as a proxy of the quality of score \(s\) for query \(q\), as measured by that metric with \(\mathbf{y}\) as ground truth labels. One of the popular loss functions for multi-label classification problem is obtained by employing one-vs-all (OvA) reduction to converting the problem into \(L\) binary classification tasks (Dembczynski et al., 2010). Subsequently, one can invoke a binary classification loss function such as sigmoid _binary cross-entropy_ (BCE) loss for \(L\) tasks, which leads to OvA-BCE:
+
+\[\ell(q,\mathbf{y},s)=-\sum\nolimits_{j\in[L]}\Big{(}y_{j}\cdot\log\frac{e^{s( q,d_{j})}}{1+e^{s(q,d_{j})}}+(1-y_{j})\cdot\log\frac{1}{1+e^{s(q,d_{j})}} \Big{)}. \tag{2}\]
+
+Alternatively, one can employ a multi-label to multi-class reduction (Menon et al., 2019) and invoke softmax cross-entropy (SoftmaxCE) loss for each positive label:
+
+\[\ell(q,\mathbf{y},s)=-\sum\nolimits_{j\in[L]}y_{j}\cdot\log\Big{(}e^{s(q,d_{j })}/{\sum\nolimits_{l\in[L]}e^{s(q,d_{l})}}\Big{)}. \tag{3}\]
+
+## 4 Improved training of dual-encoder models
+
+In this section, we first discuss the loss function typically used for training dual-encoders, and its shortcomings for multi-label problems. We then suggest simple fixes to address the problems, argue why these changes are necessary, and discuss practical implications of our modifications. Finally, we discuss our proposed soft top-k loss formulation and discuss its implementation.
+
+### Limitations of standard contrastive loss functions for extreme multi-label problems
+
+Existing dual-encoder methods generally rely on contrastive losses for training. For the rest of the paper, we will anchor our technique, experiments, and discussion on the popular InfoNCE contrastive learning loss (Oord et al., 2018), but the observations and the approach apply to other contrastive learning loss functions considered in Xiong et al. (2021); Dahiya et al. (2021, 2023a). In a multi-label setting, given a batch of queries \(\mathcal{B}\) and their positive labels, InfoNCE loss takes the form:
+
+\[\mathcal{L}(s;\mathcal{B})=\sum\limits_{q_{i}\in\mathcal{B}}\ell(q_{i}, \mathbf{y}_{i};s)=-\sum\limits_{q_{i}\in\mathcal{B}}\;\sum\limits_{j\in[L]}y _{ij}\cdot\log\frac{e^{s(q_{i},d_{j})}}{e^{s(q_{i},d_{j})}+\sum_{d^{-}\in \mathcal{D}^{-}\setminus d_{j}}e^{s(q_{i},d^{-})}}, \tag{4}\]
+
+where \(s(q_{i},d_{j})\) is the similarity score for query \(q_{i}\) and document \(d_{j}\). \(\mathcal{D}^{-}\) denotes the set of (hard) negatives created for the batch \(\mathcal{B}\). That is, for in-batch negatives, \(\mathcal{D}^{-}\) represents union of all positive labels for all the queries \(q_{i}\in\mathcal{B}\). In the extreme case when we consider all labels in \(\mathcal{D}^{-}\), (4) becomes the same as the SoftmaxCE loss in (3). A quick analysis of the gradients of this loss function reveals that:
+
+\[\frac{\partial\ell_{i}}{\partial z_{d_{l}}}=\begin{cases}(1-|P_{i}|\sigma_{il})x_ {q_{i}}&\text{if }l\in P_{i}\\ -|P_{i}|\sigma_{il}x_{q_{i}}&\text{otherwise}\end{cases};\sigma_{ij}=\frac{e^{ s(q_{i},d_{j})}}{\sum_{k}e^{s(q_{i},d_{k})}},\text{where }s(q,d)=x_{q}^{T}z_{d}\]
+
+This implies that the loss function is optimized when all positive labels score \(\sigma_{il}=\frac{1}{|P_{i}|}\), while all negative labels achieve \(\sigma_{il}=0\). While this approach appears to be appropriate for elevating the ranking of positive labels above negatives, it raises concerns when applied to imbalanced real-world XMC datasets. In these datasets, not all positive labels possess equal ease of prediction from the available data. To illustrate this issue, consider a scenario where one positive label, denoted as \(l\), is straightforward to predict for a given query \(q_{i}\), while the remaining positive labels are characterized by ambiguity. Consequently, the model assigns a high score to the unambiguous label \(l\). However, this leads to an increase in the softmax score for label \(l\), resulting in \(\sigma_{il}\) exceeding \(\frac{1}{|P_{i}|}\). Consequently, the loss function begins penalizing this particular positive label. Given the inherent label imbalance in XMC datasets, the uniform scoring of all positive labels, and the subsequent penalization of confidently predicted positives, do not align with the ideal modeling strategy.
+
+**Decoupled multi-label InfoNCE formulation.** Based on the above observations, we re-formulate the multi-label InfoNCE loss as:
+
+\[(\mathsf{DecoupledSoftmax})\quad\ell(q_{i},\mathbf{y}_{i};s)=-\sum_{j\in[I]}y _{ij}\cdot\log\frac{e^{s(q_{i},d_{j})}}{e^{s(q_{i},d_{j})}+\sum_{l\in[L]}(1-y_ {il})\cdot e^{s(q_{i},d_{l})}} \tag{5}\]
+
+where \(s(q,d)\) is model assigned score to the query-document pair. Note that we _exclude_ other positives from the softmax's denominator when computing the loss for a given positive, and add all the negatives in the denominator to eliminate the bias/variance in the estimation of that term. Analyzing the gradients with the proposed change gives:
+
+\[\implies\frac{\partial\ell_{i}}{\partial z_{d_{l}}}=\begin{cases}(1-\sigma_{il })x_{q_{i}}&\text{if }l\in P_{i}\\ -\sum_{j\in P_{i}}\frac{e^{s(q_{i},d_{j})}}{e^{s(q_{i},d_{j})}+\sum_{k\not\in P _{i}}e^{s(q_{i},d_{k})}}x_{q_{i}}&\text{otherwise}\end{cases}\]
+
+\[\text{here }\sigma_{ij}=\frac{e^{s(q_{i},d_{j})}}{e^{s(q_{i},d_{j})}+\sum_{k \not\in P_{i}}e^{s(q_{i},d_{k})}},\text{where }s(q,d)=x_{q}^{T}z_{d}\]
+
+It is simple to see DecoupledSoftmax is optimized when we have \(\sigma_{il}=1\) if \(l\in P_{i}\) (for positives) and when the score for a negative \(s(q_{i},d_{l})\) is significantly smaller than all positive scores, i.e., \(s(q_{i},d_{j})\) for \(j\in P_{i}\). Thus, DecoupledSoftmax avoids penalizing positives that are confidently predicted by the model and allows the training to better handle the imbalanced multi-label nature of XMC datasets.
+
+We empirically validate the efficacy of our proposed modification in addressing the aforementioned issues. To achieve this, we construct a synthetic dataset that accentuates the challenges and demonstrate how our modification mitigates these challenges, in contrast to its absence. Specifically, we create this synthetic dataset as follows: We randomly sample 1000 training query texts and 5000 label texts. For the initial 100 training queries, we intentionally designate the first token as "t*" (a randomly selected token) and associate all these queries with the first five labels i.e. labels 0, 1, 2, 3, and 4. However, for the 0th label, we append the token "t*" to its label text. This augmentation aims to facilitate the model's learning of the pattern that whenever "t*" is present in a query, label 0 should be confidently predicted. The test set comprises 1000 new, randomly generated query texts, wherein we again replace the first token with "t*" and exclusively tag these queries with the 0th label.
+
+As illustrated in Figure 2, our proposed modification results in a 100% \(P@1\) on this dataset, while the standard softmax approach achieves approximately 20% \(P@1\). This stark contrast highlights the softmax's inability to capture this straightforward correlation.
+
+Figure 2: Decoupled softmax vs standard softmax on synthetic dataset.
+
+We note that similar situations arise in real-world XMC datasets. For instance in EURLex-4K dataset, labels such as 'afghanistan,' 'international_sanctions,' 'foreign_capital,' and 'cfsp' frequently co-occur in queries. However, 'afghanistan' is easily predictable, as training queries consistently contain the 'afghanistan' keyword, whereas the predictability of the other labels is not trivial. Thus, the observations in Figure 2 are not limited to artificially crafted scenarios, but extend to practical XMC datasets, emphasizing the relevance of our proposed modification. In Figure 3 we visualize the gradients for two labels from the EURLex-4K dataset for all positive training queries encountered during training. This plot reveals that without modification the softmax loss gives very high variance gradient feedback, but with the change the gradient feedback is much more consistent and is always positive.
+
+### Memory Efficient Training
+
+Training a DE model with the above loss function for a very large number of labels is challenging. As the pool of labels to be considered in the loss computation grows, the computational requirements to process these examples increase significantly - as for each query and label, the model needs to compute the embeddings and store all the intermediate activations to facilitate backpropagation. In order to overcome these memory constraints, we utilize a modified version of gradient cache approach (Gao et al., 2021) to perform distributed DE training with a large pool of labels under limited GPU memory. Due to space constraints, we describe our implementation and its runtime/memory analysis in detail in Section B.5 of the appendix.
+
+Although, with the memory-efficient implementation we are able to train DE with the full loss even on the largest XMC benchmarks and establish the capabilities of DE models for XMC tasks with a modest GPU setup (see Table 9), the training is still expensive and is not desirable for scaling to even bigger datasets. To this end, we explore (see Section 5.4) approximations of our proposed approach with standard negative mining techniques similar to (Xiong et al., 2021) and evaluate the performance of the learned DE model with the increasing number of negative samples. Furthermore, in Section C.3, following the embedding cache approach proposed in (Lindgren et al., 2021), we also study how the quality of the sampled negatives affects the model performance.
+
+### Proposed differentiable top-k operator-based loss
+
+Many-shot retrieval systems are applicable in a variety of fixed-size retrieval settings like say product-product retrieval - similar to LF-AmazonTitles-1.3M dataset - where the goal is to retrieve top-k products for a given input product. While our modification to InfoNCE loss does tend to give higher scores to positives than the negatives, it might be a bit too harsh in certain cases. For example, consider there are five positives and it is difficult to rank all the five positives over all the negatives. Suppose the goal is to optimize Recall@10. Then as long as the five positives are ranked above _all but five_ negatives, the loss should be small (ideally zero). However, the proposed loss in (5) would still penalize such solutions.
+
+To explicitly optimize such top-k metrics, we propose to use a differentiable soft top-k operator to define the loss function. The soft top-k operator takes a score vector as input, and essentially serves as
+
+Figure 3: Gradient analysis of two labels [_left_] ”afghanistan” (cherry-picked) and [_right_]”data_transmission” (randomly-chosen) on EURLex-4K dataset for all positive training queries encountered during training.
+
+a filter, assigning values close to 1 for the top-k scores and values close to 0 for the remaining scores. It is designed to be differentiable to allow gradients to flow through it during backpropagation.
+
+Once we have the soft top-k score vector, we apply a log-likelihood loss over this vector. This loss serves to provide the model with feedback on its performance in placing all positives among the top-K predictions. When all positive labels are among the top-k predictions, the loss is zero. However, if any positive label falls outside the top-k scores, the loss provides a non-zero feedback signal that guides the model to adjust its parameters during backpropagation. That is, given query \(q_{i}\), let the score vector \(\mathbf{s}_{i}:=\big{(}s(q_{i},d_{1}),\dots,s(q_{i},d_{L})\big{)}\in\mathbb{R} ^{L}\) and \(\mathbf{z}_{i}:=\mathsf{SoftTop\text{-}k}(\mathbf{s}_{i})\) be the output of the soft top-k operator. With \(\mathbf{y}_{i}\in\{0,1\}^{L}\) as the label vector, the loss function for \(q_{i}\) takes the form:1
+
+Footnote 1: Note that, with slight abuse of notation, we use \(\mathsf{SoftTop\text{-}k}(\cdot)\) and \(\mathsf{SoftTop\text{-}k}\) to refer to a soft version of the top-k operator and the corresponding loss function, respectively.
+
+\[(\mathsf{SoftTop\text{-}k})\quad\ell(q_{i},\mathbf{y}_{i};s)=-\frac{1}{L} \sum_{j\in[L]}y_{ij}\cdot\log z_{ij}. \tag{6}\]
+
+Since \(z_{ij}\) depends on the full score vector \(\mathbf{s}_{i}\), this loss also provides feedback to all the positives and negatives in the dataset. To complete the loss function formulation, we specify the differentiable soft top-k operator below. Note that the operator is based on a proposal in ([https://math.stackexchange.com/users/7072/thomasa](https://math.stackexchange.com/users/7072/thomasa)).
+
+**Soft differentiable top-k formulation.** We first look at a variational definition of hard top-k operator. Let \(\mathbf{x}=\{x_{i}\}_{i=1}^{N}\) be the input vector, then \(\mathsf{HardTop\text{-}k}(x)=\{s(x_{i}+t_{\mathbf{x}})\}_{i=1}^{N}\), where \(s(a)=I[a>0]\) is the step function that outputs \(1\) if \(a>0\) and \(0\), otherwise. \(t_{\mathbf{x}}\) is a threshold so that exactly \(k\) elements exceed it, i.e., \(\sum_{i=1}^{N}s(x_{i}+t_{\mathbf{x}})=k\); for simplicity, let \(\mathbf{x}\) comprise unique elements.
+
+Based on HardTop-k operator, we can now define \(\mathsf{SoftTop\text{-}k}\) operator by essentially replacing the above hard step function with a smooth \(\sigma\) function such as the standard sigmoid function. We can change the smoothness of our soft approximator by changing the \(\sigma\) function. We use a scaled sigmoid function i.e. \(\sigma(x)=\mathsf{sigmoid}(\alpha x)\) where \(\alpha>0\) is a hyperparameter that controls the smoothness. In general, we might not have a closed-form solution for \(t_{\mathbf{x}}\) depending on our choice of \(\sigma\). However, for monotonic \(\sigma\), we can find \(t_{\mathbf{x}}\) using binary search: start with an under- and over-estimate of \(t_{\mathbf{x}}\) and at every iteration reduce the search space by half based on comparison of \(\sum\sigma(x_{i}+t_{\mathbf{x}})\) and \(k\).
+
+**Computing gradient of SoftTop-k operator.** By definition, \(\mathsf{SoftTop\text{-}k}(\mathbf{x})=\{\sigma(x_{i}+t_{\mathbf{x}})\}_{i=1}^{N}\), where \(t_{\mathbf{x}}\) is computed using binary search. Now,
+
+\[\sum_{j}\sigma(x_{j}+t_{\mathbf{x}})=k\implies\frac{\partial t_{\mathbf{x}}}{ \partial x_{i}}=\frac{-\sigma^{\prime}(x_{i}+t_{\mathbf{x}})}{\sum_{j}\sigma^{ \prime}(x_{j}+t_{\mathbf{x}})}.\]
+
+\[\text{Hence, }\frac{\partial\mathsf{SoftTop\text{-}k}(\mathbf{x}_{i})}{\partial x _{l}}=\sigma^{\prime}(x_{i}+t_{\mathbf{x}})(\mathbb{1}_{[i=l]}+\frac{\partial t _{\mathbf{x}}}{\partial x_{l}})=\sigma^{\prime}(x_{i}+t_{\mathbf{x}})(\mathbb{1 }_{[i=l]}-\frac{\sigma^{\prime}(x_{l}+t_{\mathbf{x}})}{\sum_{j}\sigma^{\prime }(x_{j}+t_{\mathbf{x}})}). \tag{7}\]
+
+Combining definition of \(\mathsf{SoftTop\text{-}k}\) operator along with associated loss function in (6), and by using gradient of \(\mathsf{SoftTop\text{-}k}\) in (7), we now get an approach - \(\mathsf{SoftTop\text{-}k}\) DE - to train DE models in extreme multi-label kind of scenarios. Note that here again we have to compute gradient wrt all negatives; thus, requiring the memory efficient and distributed backpropagation implementation from Section 4.2.
+
+## 5 Experiments
+
+In this section we compare DE models trained with the proposed loss functions to XMC methods. We show that the proposed loss functions indeed substantially improve the performance of DE models, even improving over SOTA in some settings. We also present ablations validating choices such as loss functions, number of negatives, and further provide a more exhaustive analysis in Section C of the Appendix
+
+### Datasets and evaluation
+
+We experiment with diverse XMC datasets, EURLex-4K, LF-AmazonTitles-131K, LF-Wikipedia-500K, and LF-AmazonTitles-1.3M, each containing label texts. These datasets cover various applications like product recommendation, Wikipedia category prediction, and EU-law document tagging.
+
+### Baselines and setup
+
+We compare our approach with SOTA XMC methods such as DEXA (Dahiya et al., 2023b), NGAME (Dahiya et al., 2023a), XR-Transformer (Zhang et al., 2021), ELIAS (Gupta et al., 2022), ECLARE (Mittal et al., 2021b), SiameseXML (Dahiya et al., 2021). To keep the comparison fair, we use the same 66M parameter distilledbert-base transformer (Sanh et al., 2019) used in NGAME in all of our dual-encoder experiments and share the encoder parameters for both query and document. We also compare against encoder only version of NGAME and DEXA (represented by NGAME DE and DEXA DE), i.e., retrieval using only encoder representation. In order to have a direct comparison between a pure classification model trained with all negatives and our proposed approach, similar to the BERT-OVA approach in Gupta et al. (2022, Table 2), we also report results for the Distil-BERT OvA classifier model which stacks a classification layer with \(L\) labels on top of a distilbert-base transformer and fine-tunes both the classification layer and the transformer by using the full one-vs-all BCE loss in (2). See B for more details on the experimental setup.
+
+### Comparison with XMC methods
+
+Table 1 presents the main comparison results, showcasing the performance of our approach relative to existing methods. On large-scale datasets such as LF-Wikipedia-500K and LF-AmazonTitles-1.3M, our approach significantly outperforms all existing XMC methods. More specifically, it can be upto 2% better than the next best method on P@K and up to 2.5% better on PSP@k, while being \(20\times\) smaller (in terms of trainable parameters) than existing state-of-the-art method on LF-AmazonTitles-1.3M (cf. Figure 1). Moreover, compared to the DE versions of NGAME and DEXA our approach can be 6% better at P@k.
+
+On smaller datasets such as EURLex-4K, XR-Transformer outperforms our approach but as we demonstrate in Section C of the appendix, XR-Transformer gains are mainly because it uses an ensemble of 3 learners and sparse classifier-based re-ranker. Such modifications can easily be incorporated into any of the methods. On LF-AmazonTitles-131K, our approach is comparable to DEXA/NGAME on P@5 but there is a considerable gap on P@1, which can be partially explained by a significant jump in performance at P@1 achieved by using a label propensity aware score fusion module in NGAME; see Dahiya et al. (2023a, Table 8).
+
+\begin{table}
+\begin{tabular}{l|c c|c c c|c c c c} \hline \multirow{2}{*}{**Method**} & **Label** & **Label** & **P@1** & **P@5** & **N@5** & **PSP@5** & **P@1** & **P@5** & **N@5** & **PSP@5** \\ \hline  & & & & \multicolumn{5}{c}{LF-Wikipedia-500K} & \multicolumn{5}{c}{LF-AmazonTitles-1.3M} \\ \hline DistilBERT OvA Classifier & ✗ & ✓ & 82.00 & 48.54 & 73.44 & 48.87 & 48.72 & 39.09 & 44.79 & 25.91 \\ ELIAS & ✗ & ✓ & 81.96 & 48.90 & 73.71 & 48.92 & 49.26 & 39.29 & 45.44 & 27.37 \\ XR-Transformer \(\times\)3 & ✗ & ✓ & 81.62 & 47.85 & 72.43 & 47.81 & 50.14 & 39.98 & 46.59 & 27.79 \\ ECLARE \(\times\)3 & ✓ & ✓ & 68.04 & 35.74 & 56.37 & 38.29 & 50.14 & 40.00 & 46.68 & 30.56 \\ SiameseXML \(\times\)3 & ✓ & ✓ & 67.26 & 33.73 & 54.29 & 37.07 & 49.02 & 38.52 & 45.15 & 32.52 \\ NGAME & ✓ & ✓ & 84.01 & 49.97 & 75.97 & 57.04 & 56.75 & 44.09 & 52.41 & 35.36 \\ NGAME DE & ✓ & ✗ & 77.92 & 40.95 & - & 57.33 & 45.82 & 35.48 & - & 36.80 \\ DEXA & ✓ & ✓ & 84.92 & 50.52 & 76.80 & 58.33 & 66.63 & 43.90 & 52.37 & 38.86 \\ DEXA DE & ✓ & ✗ & 79.99 & 42.52 & - & 57.68 & 51.92 & 38.86 & - & **37.31** \\ \hline DecoupledSoftmax DE & ✓ & ✗ & **85.78** & 50.53 & **77.11** & 58.97 & **58.40** & **45.46** & **54.30** & 36.58 \\ SoftTop-5 DE & ✓ & ✗ & 82.93 & **51.11** & 76.61 & **59.55** & 54.41 & 43.82 & 51.70 & 32.20 \\ \hline \end{tabular}
+\end{table}
+Table 1: Performance comparison on large XMC benchmark datasets. Methods suffixed with \(\times 3\) use an ensemble of \(3\) learners. Bold numbers represent overall best numbers while underlined numbers represent best numbers among pure DE methods. Results for most existing XMC baselines are from either their respective papers or the XMC repository (Bhatia et al., 2016), blank entries indicate source does not have those numbers.
+
+### DecoupledSoftmax with Hard Negatives
+
+Since our proposed DecoupledSoftmax loss uses all negatives in its formulation, we investigate the approximations of this loss formulation by considering only a few negatives per training query in the batch; see Table 3.
+
+Following Xiong et al. (2021), for mining the hard negatives we compute the top 100 negative shortlist at regular intervals and sample the negatives from this shortlist. For each query we train on the full pool of documents sampled in the mini-batch; as a result, for a mini-batch of size \(B\) and number of sampled per query \(m\), we compute the loss on almost \(B(1+m)\) documents. Clearly from Table 3, increasing the number of effective labels considered in the loss significantly increases the performance of the approximate versions. In Section C.2.3 of the appendix we also compare the results of InfoNCE loss with hard negatives and DecoupledSoftmax loss with hard negatives.
+
+### Comparison across different loss functions
+
+Next, we compare different loss formulations as discussed in Sections 3 and 4 on the EURLex-4K and LF-AmazonTitles-131K datasets (cf. Table 4). The DE model fails to train with BCE loss in (2). We hypothesize that this might be due to the stringent demand of the BCE loss, which requires all negative pairs to exhibit high negative similarity and all positive pairs to have a high positive similarity - a feat that can be challenging for DE representations. DecoupledSoftmax loss in (5) performs the best for top-1 predictions. Moreover, the SoftTop-5 and SoftTop-100 losses (cf. (6)) yield optimal results for top-5 and top-100 predictions, respectively. These results show that SoftTop-k loss can outperform other loss formulations when optimizing for a specific prediction set size. We further analyze the label score distributions of models learned with different loss functions in Section C of the Appendix.
+
+**Limitations.** Our key contribution is a simple yet effective training procedure for DE methods that allows them to match or surpass SOTA extreme classification methods on standard benchmarks for many-shot retrieval. One limitation of our empirical evaluation is that we have only evaluated our proposal up to O(million)-sized label spaces. Verifying our gains on O(billion) scale is an interesting and challenging avenue for future work. Additionally, designing algorithms that can improve DE performance on XMC tasks without requiring all the negatives is another interesting direction. We
+
+\begin{table}
+\begin{tabular}{l|c c c c c} \hline \hline
+**Loss** & **P@1** & **P@5** & **R@10** & **R@100** \\ \hline \multicolumn{5}{|c|}{EURLex-4K} \\ \hline BCE (2) & 0.1 & 0.07 & 0.14 & 1.84 \\ SoftmaxCE (3) & 80.05 & **85.36** & 72.41 & 92.57 \\ DecoupledSoftmax (5) & **86.78** & 60.19 & 72.56 & 91.75 \\ SoftTop-5 (6) & 83.42 & **60.55** & **74.21** & 91.30 \\ SoftTop-100 (6) & 52.34 & 37.41 & 56.97 & **93.72** \\ \hline \multicolumn{5}{|c|}{LF-AmazonTitles-131K} \\ \hline BCE (2) & 12.75 & 5.96 & 17.18 & 25.20 \\ SoftmaxCE (3) & 41.77 & 20.87 & 56.91 & 69.49 \\ DecoupledSoftmax (4) & **42.52** & 20.64 & 56.36 & 68.52 \\ SoftTop-5 (6) & 41.11 & **21.23** & **57.72** & 69.46 \\ SoftTop-100 (6) & 33.38 & 18.27 & 53.87 & **71.52** \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: Ablation of loss functions for OvA DE method.
+
+investigated a well known many-shot learning problem and studied it in abstract form, so we don't envision significant additional negative implications for society.
+
+## References
+
+* Babbar and Scholkopf (2017) Rohit Babbar and Bernhard Scholkopf. Dismec: Distributed sparse machines for extreme multi-label classification. In _Proceedings of the Tenth ACM International Conference on Web Search and Data Mining_, WSDM '17, pp. 721-729, New York, NY, USA, 2017. Association for Computing Machinery. ISBN 9781450346757. doi: 10.1145/3018661.3018741. URL [https://doi.org/10.1145/3018661.3018741](https://doi.org/10.1145/3018661.3018741).
+* Bartlett et al. (2006) Peter L Bartlett, Michael I Jordan, and Jon D McAuliffe. Convexity, classification, and risk bounds. _Journal of the American Statistical Association_, 101(473):138-156, 2006.
+* Bengio and Senecal (2008) Yoshua Bengio and Jean-S Sebastien Senecal. Adaptive importance sampling to accelerate training of a neural probabilistic language model. _IEEE Transactions on Neural Networks_, 19(4):713-722, 2008. doi: 10.1109/TNN.2007.912312.
+* Berrada et al. (2018) Leonard Berrada, Andrew Zisserman, and M. Pawan Kumar. Smooth loss functions for deep top-k classification. In _International Conference on Learning Representations_, 2018. URL [https://openreview.net/forum?id=Hk5elxbRW](https://openreview.net/forum?id=Hk5elxbRW).
+* Bhatia et al. (2016) K. Bhatia, K. Dahiya, H. Jain, P. Kar, A. Mittal, Y. Prabhu, and M. Varma. The extreme classification repository: Multi-label datasets and code, 2016. URL [http://manikvarma.org/downloads/XC/XMLRepository.html](http://manikvarma.org/downloads/XC/XMLRepository.html).
+* Blanc and Rendle (2018) Guy Blanc and Steffen Rendle. Adaptive sampled softmax with kernel based sampling. In Jennifer Dy and Andreas Krause (eds.), _Proceedings of the 35th International Conference on Machine Learning_, volume 80 of _Proceedings of Machine Learning Research_, pp. 590-599. PMLR, 10-15 Jul 2018.
+* Chang et al. (2020) Wei-Cheng Chang, Hsiang-Fu Yu, Kai Zhong, Yiming Yang, and Inderjit S. Dhillon. Taming pretrained transformers for extreme multi-label text classification. In _Proceedings of the 26th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining_, KDD '20, pp. 3163-3171, New York, NY, USA, 2020. Association for Computing Machinery. ISBN 9781450379984. doi: 10.1145/3394486.3403368. URL [https://doi.org/10.1145/3394486.3403368](https://doi.org/10.1145/3394486.3403368).
+* Covington et al. (2016) Paul Covington, Jay Adams, and Emre Sargin. Deep neural networks for youtube recommendations. In _Proceedings of the 10th ACM Conference on Recommender Systems_, RecSys '16, pp. 191-198, New York, NY, USA, 2016. Association for Computing Machinery. ISBN 9781450340359. doi: 10.1145/2959100.2959190. URL [https://doi.org/10.1145/2959100.2959190](https://doi.org/10.1145/2959100.2959190).
+* Dahiya et al. (2023a) K. Dahiya, N. Gupta, D. Saini, A. Soni, Y. Wang, K. Dave, J. Jiao, K. Gururaj, P. Dey, A. Singh, D. Hada, V. Jain, B. Paliwal, A. Mittal, S. Mehta, R. Ramjee, S. Agarwal, P. Kar, and M. Varma. Ngame: Negative mining-aware mini-batching for extreme classification. In _Proceedings of the ACM International Conference on Web Search and Data Mining_, March 2023a.
+* Dahiya et al. (2023b) K. Dahiya, S. Yadav, S. Sondhi, D. Saini, S. Mehta, J. Jiao, S. Agarwal, P. Kar, and M. Varma. Deep encoders with auxiliary parameters for extreme classification. In _Proceedings of the ACM SIGKDD Conference on Knowledge Discovery and Data Mining_, August 2023b.
+* Dahiya et al. (2021) Kunal Dahiya, Ananye Agarwal, Deepak Saini, Gururaj K, Jian Jiao, Amit Singh, Sumeet Agarwal, Purushottam Kar, and Manik Varma. Siamesexml: Siamese networks meet extreme classifiers with 100m labels. In Marina Meila and Tong Zhang (eds.), _Proceedings of the 38th International Conference on Machine Learning_, volume 139 of _Proceedings of Machine Learning Research_, pp. 2330-2340. PMLR, 18-24 Jul 2021. URL [https://proceedings.mlr.press/v139/dahiya21a.html](https://proceedings.mlr.press/v139/dahiya21a.html).
+* Dembczynski et al. (2010) Krzysztof Dembczynski, Weiwei Cheng, and Eyke Hullermeier. Bayes optimal multilabel classification via probabilistic classifier chains. In _Proceedings of the 27th International Conference on International Conference on Machine Learning_, ICML'10, pp. 279-286, Madison, WI, USA, 2010. Omnipress. ISBN 9781605589077.
+
+* Devlin et al. (2019) Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: Pre-training of deep bidirectional transformers for language understanding. In _Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers)_, pp. 4171-4186, Minneapolis, Minnesota, June 2019. Association for Computational Linguistics. doi: 10.18653/v1/N19-1423. URL [https://aclanthology.org/N19-1423](https://aclanthology.org/N19-1423).
+* Gao et al. (2021) Luyu Gao, Yunyi Zhang, Jiawei Han, and Jamie Callan. Scaling deep contrastive learning batch size under memory limited setup. In _Proceedings of the 6th Workshop on Representation Learning for NLP (RepL4NLP-2021)_, pp. 316-321, Online, August 2021. Association for Computational Linguistics. doi: 10.18653/v1/2021.repl4nlp-1.31. URL [https://aclanthology.org/2021.repl4nlp-1.31](https://aclanthology.org/2021.repl4nlp-1.31).
+* Guo et al. (2019) Chuan Guo, Ali Mousavi, Xiang Wu, Daniel Holtmann-Rice, Satyen Kale, Sashank Reddi, and Sanjiv Kumar. _Breaking the Glass Ceiling for Embedding-Based Classifiers for Large Output Spaces_. Curran Associates Inc., Red Hook, NY, USA, 2019.
+* Guo et al. (2020) Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Kumar. Accelerating large-scale inference with anisotropic vector quantization. In _International Conference on Machine Learning_, 2020. URL [https://arxiv.org/abs/1908.10396](https://arxiv.org/abs/1908.10396).
+* Gupta et al. (2021) N. Gupta, S. Bohra, Y. Prabhu, S. Purohit, and M. Varma. Generalized zero-shot extreme multi-label learning. In _Proceedings of the ACM SIGKDD Conference on Knowledge Discovery and Data Mining_, August 2021.
+* Gupta et al. (2022) N. Gupta, P.H. Chen, H-F. Yu, C-J. Hsieh, and I. Dhillon. Elias: End-to-end learning to index and search in large output spaces. In _Neural Information Processing Systems_, November 2022.
+* Gupta et al. (2019) Vivek Gupta, Rahul Wadbude, Nagarajan Natarajan, Harish Karnick, Prateek Jain, and Piyush Rai. Distributional semantics meets multi-label learning. In _Proceedings of the AAAI Conference on Artificial Intelligence_, volume 33, pp. 3747-3754, 2019.
+* Henderson et al. (2017) Matthew Henderson, Rami Al-Rfou, Brian Strope, Yun-Hsuan Sung, Laszlo Lukacs, Ruiqi Guo, Sanjiv Kumar, Balint Miklos, and Ray Kurzweil. Efficient natural language response suggestion for smart reply. _arXiv preprint arXiv:1705.00652_, 2017.
+* Ahle (2018) Thomas Ahle ([https://math.stackexchange.com/users/7072/thomas](https://math.stackexchange.com/users/7072/thomas) ahle). Differentiable top-k function. Mathematics Stack Exchange. URL [https://math.stackexchange.com/q/4506773](https://math.stackexchange.com/q/4506773). URL:[https://math.stackexchange.com/q/4506773](https://math.stackexchange.com/q/4506773) (version: 2022-08-07).
+* Jagerman et al. (2022) Rolf Jagerman, Zhen Qin, Xuanhui Wang, Michael Bendersky, and Marc Najork. On optimizing top-k metrics for neural ranking models. In _Proceedings of the 45th International ACM SIGIR Conference on Research and Development in Information Retrieval_, SIGIR '22, pp. 2303-2307, New York, NY, USA, 2022. Association for Computing Machinery. ISBN 9781450387323. doi: 10.1145/3477495.3531849. URL [https://doi.org/10.1145/3477495.3531849](https://doi.org/10.1145/3477495.3531849).
+* Jernite et al. (2017) Yacine Jernite, Anna Choromanska, and David Sontag. Simultaneous learning of trees and representations for extreme classification and density estimation. In Doina Precup and Yee Whye Teh (eds.), _Proceedings of the 34th International Conference on Machine Learning_, volume 70 of _Proceedings of Machine Learning Research_, pp. 1665-1674. PMLR, 06-11 Aug 2017. URL [https://proceedings.mlr.press/v70/jernite17a.html](https://proceedings.mlr.press/v70/jernite17a.html).
+* Jiang et al. (2021) Ting Jiang, Deqing Wang, Leilei Sun, Huayi Yang, Zhengyang Zhao, and Fuzhen Zhuang. Lightxml: Transformer with dynamic negative sampling for high-performance extreme multi-label text classification. In _Proceedings of the AAAI Conference on Artificial Intelligence_, volume 35, pp. 7987-7994, 2021.
+* Johnson et al. (2021) Jeff Johnson, Matthijs Douze, and Herve Jegou. Billion-scale similarity search with gpus. _IEEE Transactions on Big Data_, 7(3):535-547, 2021. doi: 10.1109/TBDATA.2019.2921572.
+* Joulin et al. (2018) Armand Joulin, Edouard Grave, Piotr Bojanowski, and Tomas Mikolov. Bag of tricks for efficient text classification. In _Proceedings of the 15th Conference of the European Chapter of the Association for Computational Linguistics: Volume 2, Short Papers_, pp. 427-431, Valencia, Spain, April 2017. Association for Computational Linguistics. URL [https://aclanthology.org/E17-2068](https://aclanthology.org/E17-2068).
+* Kar et al. (2015) Purushottam Kar, Harikrishna Narasimhan, and Prateek Jain. Surrogate functions for maximizing precision at the top. In Francis Bach and David Blei (eds.), _Proceedings of the 32nd International Conference on Machine Learning_, volume 37 of _Proceedings of Machine Learning Research_, pp. 189-198, Lille, France, 07-09 Jul 2015. PMLR. URL [https://proceedings.mlr.press/v37/kar15.html](https://proceedings.mlr.press/v37/kar15.html).
+* Karpukhin et al. (2020) Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. Dense passage retrieval for open-domain question answering. In _Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP)_, pp. 6769-6781, Online, November 2020. Association for Computational Linguistics. doi: 10.18653/v1/2020.emnlp-main.550. URL [https://aclanthology.org/2020.emnlp-main.550](https://aclanthology.org/2020.emnlp-main.550).
+* Lapin et al. (2016) Maksim Lapin, Matthias Hein, and Bernt Schiele. Loss functions for top-k error: Analysis and insights. In _Proceedings of the IEEE conference on computer vision and pattern recognition_, pp. 1468-1477, 2016.
+* Lee et al. (2019) Kenton Lee, Ming-Wei Chang, and Kristina Toutanova. Latent retrieval for weakly supervised open domain question answering. In Anna Korhonen, David R. Traum, and Lluis Marquez (eds.), _Proceedings of the 57th Conference of the Association for Computational Linguistics, ACL 2019, Florence, Italy, July 28- August 2, 2019, Volume 1: Long Papers_, pp. 6086-6096. Association for Computational Linguistics, 2019.
+* Li et al. (2017) Yuncheng Li, Yale Song, and Jiebo Luo. Improving pairwise ranking for multi-label image classification. In _Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)_, July 2017.
+* Lindgren et al. (2021) Erik Lindgren, Sashank Reddi, Ruiqi Guo, and Sanjiv Kumar. Efficient training of retrieval models using negative cache. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman Vaughan (eds.), _Advances in Neural Information Processing Systems_, volume 34, pp. 4134-4146. Curran Associates, Inc., 2021. URL [https://proceedings.neurips.cc/paper_files/paper/2021/file/2175f8c5cd9604f6ble576b252ddc86e-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2021/file/2175f8c5cd9604f6ble576b252ddc86e-Paper.pdf).
+* Liu et al. (2009) Tie-Yan Liu et al. Learning to rank for information retrieval. _Foundations and Trends(r) in Information Retrieval_, 3(3):225-331, 2009.
+* Luan et al. (2021) Yi Luan, Jacob Eisenstein, Kristina Toutanova, and Michael Collins. Sparse, dense, and attentional representations for text retrieval. _Transactions of the Association for Computational Linguistics_, 9:329-345, 2021. doi: 10.1162/tacl_a_00369. URL [https://aclanthology.org/2021.tacl-1.20](https://aclanthology.org/2021.tacl-1.20).
+* Medini et al. (2019) Tharun Kumar Reddy Medini, Qixuan Huang, Yiqiu Wang, Vijai Mohan, and Anshumali Shrivastava. Extreme classification in log memory using count-min sketch: A case study of amazon search with 50m products. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Menon et al. (2019) Aditya K Menon, Ankit Singh Rawat, Sashank Reddi, and Sanjiv Kumar. Multilabel reductions: what is my loss optimising? In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alche-Buc, E. Fox, and R. Garnett (eds.), _Advances in Neural Information Processing Systems_, volume 32. Curran Associates, Inc., 2019. URL [https://proceedings.neurips.cc/paper_files/paper/2019/file/da647c549ddc572c2c5edc4f5bef039c-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2019/file/da647c549ddc572c2c5edc4f5bef039c-Paper.pdf).
+* Mikolov et al. (2013a) Tomas Mikolov, Kai Chen, Greg Corrado, and Jeffrey Dean. Efficient estimation of word representations in vector space. _arXiv preprint arXiv:1301.3781_, 2013a.
+* Mikolov et al. (2013b) Tomas Mikolov, Ilya Sutskever, Kai Chen, Greg S Corrado, and Jeff Dean. Distributed representations of words and phrases and their compositionality. In C.J. Burges, L. Bottou, M. Welling, Z. Ghahramani, and K.Q. Weinberger (eds.), _Advances in Neural Information Processing Systems_, volume 26. Curran Associates, Inc., 2013b. URL [https://proceedings.neurips.cc/paper_files/paper/2013/file/9aa42b31882ec039965f3c4923ce901b-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2013/file/9aa42b31882ec039965f3c4923ce901b-Paper.pdf).
+
+* Mitra and Craswell (2018) Bhaskar Mitra and Nick Craswell. An introduction to neural information retrieval. _Foundations and Trends(r) in Information Retrieval_, 13(1):1-126, 2018. ISSN 1554-0669. doi: 10.1561/1500000061. URL [http://dx.doi.org/10.1561/15000000061](http://dx.doi.org/10.1561/15000000061).
+* Mittal et al. (2021a) Anshul Mittal, Kunal Dahiya, Sheshansh Agrawal, Deepak Saini, Sumeet Agarwal, Purushottam Kar, and Manik Varma. Decaf: Deep extreme classification with label features. In _Proceedings of the 14th ACM International Conference on Web Search and Data Mining_, WSDM '21, pp. 49-57, New York, NY, USA, 2021a. Association for Computing Machinery. ISBN 9781450382977. doi: 10.1145/3437963.3441807. URL [https://doi.org/10.1145/3437963.3441807](https://doi.org/10.1145/3437963.3441807).
+* Mittal et al. (2021b) Anshul Mittal, Noveen Sachdeva, Sheshansh Agrawal, Sumeet Agarwal, Purushottam Kar, and Manik Varma. Eclare: Extreme classification with label graph correlations. In _Proceedings of the Web Conference 2021_, WWW '21, pp. 3721-3732, New York, NY, USA, 2021b. Association for Computing Machinery. ISBN 9781450383127. doi: 10.1145/3442381.3449815. URL [https://doi.org/10.1145/3442381.3449815](https://doi.org/10.1145/3442381.3449815).
+* Mittal et al. (2022) Anshul Mittal, Kunal Dahiya, Shreya Malani, Janani Ramaswamy, Seba Kuruvilla, Jitendra Ajmera, Keng-Hao Chang, Sumeet Agarwal, Purushottam Kar, and Manik Varma. Multi-modal extreme classification. In _2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)_, pp. 12383-12392, 2022. doi: 10.1109/CVPR52688.2022.01207.
+* Mnih and Kavukcuoglu (2013) Andriy Mnih and Koray Kavukcuoglu. Learning word embeddings efficiently with noise-contrastive estimation. In C.J. Burges, L. Bottou, M. Welling, Z. Ghahramani, and K.Q. Weinberger (eds.), _Advances in Neural Information Processing Systems_, volume 26. Curran Associates, Inc., 2013. URL [https://proceedings.neurips.cc/paper_files/paper/2013/file/db2b4182156b2f1f817860ac9f409ad7-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2013/file/db2b4182156b2f1f817860ac9f409ad7-Paper.pdf).
+* Mnih and Teh (2012) Andriy Mnih and Yee Whye Teh. A fast and simple algorithm for training neural probabilistic language models. In _Proceedings of the 29th International Coference on International Conference on Machine Learning_, ICML'12, pp. 419-426, Madison, WI, USA, 2012. Omnipress. ISBN 9781450312851.
+* Oord et al. (2018) Aaron van den Oord, Yazhe Li, and Oriol Vinyals. Representation learning with contrastive predictive coding. _arXiv preprint arXiv:1807.03748_, 2018.
+* Petersen et al. (2022) Felix Petersen, Hilde Kuehne, Christian Borgelt, and Oliver Deussen. Differentiable top-k classification learning. In Kamalika Chaudhuri, Stefanie Jegelka, Le Song, Csaba Szepesvari, Gang Niu, and Sivan Sabato (eds.), _Proceedings of the 39th International Conference on Machine Learning_, volume 162 of _Proceedings of Machine Learning Research_, pp. 17656-17668. PMLR, 17-23 Jul 2022. URL [https://proceedings.mlr.press/v162/petersen22a.html](https://proceedings.mlr.press/v162/petersen22a.html).
+* Prabhu and Varma (2014) Yashoteja Prabhu and Manik Varma. Fastxml: A fast, accurate and stable tree-classifier for extreme multi-label learning. In _Proceedings of the 20th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining_, KDD '14, pp. 263-272, New York, NY, USA, 2014. Association for Computing Machinery. ISBN 9781450329569. doi: 10.1145/2623330.2623651. URL [https://doi.org/10.1145/2623330.2623651](https://doi.org/10.1145/2623330.2623651).
+* Prabhu et al. (2018) Yashoteja Prabhu, Anil Kag, Shrutendra Harsola, Rahul Agrawal, and Manik Varma. Parabel: Partitioned label trees for extreme classification with application to dynamic search advertising. In _Proceedings of the 2018 World Wide Web Conference_, WWW '18, pp. 993-1002, Republic and Canton of Geneva, CHE, 2018. International World Wide Web Conferences Steering Committee. ISBN 9781450356398. doi: 10.1145/3178876.3185998. URL [https://doi.org/10.1145/3178876.3185998](https://doi.org/10.1145/3178876.3185998).
+* Qu et al. (2021) Yingqi Qu, Yuchen Ding, Jing Liu, Kai Liu, Ruiyang Ren, Wayne Xin Zhao, Daxiang Dong, Hua Wu, and Haifeng Wang. RocketQA: An optimized training approach to dense passage retrieval for open-domain question answering. In _Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies_, pp. 5835-5847, Online, June 2021. Association for Computational Linguistics. doi: 10.18653/v1/2021.naacl-main.466. URL [https://aclanthology.org/2021.naacl-main.466](https://aclanthology.org/2021.naacl-main.466).
+
+* Rawat et al. (2019) Ankit Singh Rawat, Jiecao Chen, Felix Xinnan X Yu, Ananda Theertha Suresh, and Sanjiv Kumar. Sampled softmax with random fourier features. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alche-Buc, E. Fox, and R. Garnett (eds.), _Advances in Neural Information Processing Systems_, volume 32. Curran Associates, Inc., 2019. URL [https://proceedings.neurips.cc/paper_files/paper/2019/file/e43739bba7cdb577e9e3e4e42447f5a5-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2019/file/e43739bba7cdb577e9e3e4e42447f5a5-Paper.pdf).
+* Reddi et al. (2019) Sashank J. Reddi, Satyen Kale, Felix Yu, Daniel Holtmann-Rice, Jiecao Chen, and Sanjiv Kumar. Stochastic negative minima for learning with large output spaces. In Kamalika Chaudhuri and Masashi Sugiyama (eds.), _Proceedings of the Twenty-Second International Conference on Artificial Intelligence and Statistics_, volume 89 of _Proceedings of Machine Learning Research_, pp. 1940-1949. PMLR, 16-18 Apr 2019. URL [https://proceedings.mlr.press/v89/reddi19a.html](https://proceedings.mlr.press/v89/reddi19a.html).
+* Robertson et al. (2004) Stephen Robertson, Hugo Zaragoza, and Michael Taylor. Simple bm25 extension to multiple weighted fields. In _Proceedings of the Thirteenth ACM International Conference on Information and Knowledge Management_, CIKM '04, pp. 42-49, New York, NY, USA, 2004. Association for Computing Machinery. ISBN 1581138741. doi: 10.1145/1031171.1031181. URL [https://doi.org/10.1145/1031171.1031181](https://doi.org/10.1145/1031171.1031181).
+* Robertson et al. (1995) Stephen E Robertson, Steve Walker, Susan Jones, Micheline M Hancock-Beaulieu, Mike Gatford, et al. Okapi at trec-3. _Nist Special Publication Sp_, 109:109, 1995.
+* Saini et al. (2021) Deepak Saini, Arnav Kumar Jain, Kushal Dave, Jian Jiao, Amit Singh, Ruofei Zhang, and Manik Varma. Galaxy: Graph neural networks with labelwise attention for extreme classification. In _Proceedings of the Web Conference 2021_, WWW '21, pp. 3733-3744, New York, NY, USA, 2021. Association for Computing Machinery. ISBN 9781450383127. doi: 10.1145/3442381.3449937. URL [https://doi.org/10.1145/3442381.3449937](https://doi.org/10.1145/3442381.3449937).
+* Sanh et al. (2019) Victor Sanh, Lysandre Debut, Julien Chaumond, and Thomas Wolf. Distilbert, a distilled version of bert: smaller, faster, cheaper and lighter. _arXiv preprint arXiv:1910.01108_, 2019.
+* Su et al. (2022) Jianlin Su, Mingren Zhu, Ahmed Murdadha, Shengfeng Pan, Bo Wen, and Yunfeng Liu. Zlpr: A novel loss for multi-label classification. _arXiv preprint arXiv:2208.02955_, 2022.
+* Usunier et al. (2009) Nicolas Usunier, David Buffoni, and Patrick Gallinari. Ranking with ordered weighted pairwise classification. In _Proceedings of the 26th annual international conference on machine learning_, pp. 1057-1064, 2009.
+* Xiong et al. (2021) Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang, Jialin Liu, Paul N. Bennett, Junaid Ahmed, and Arnold Overwijk. Approximate nearest neighbor negative contrastive learning for dense text retrieval. In _International Conference on Learning Representations_, 2021. URL [https://openreview.net/forum?id=zeFFfgyZln](https://openreview.net/forum?id=zeFFfgyZln).
+* Yang and Koyejo (2020) Forest Yang and Sanmi Koyejo. On the consistency of top-k surrogate losses. In Hal Daume III and Aarti Singh (eds.), _Proceedings of the 37th International Conference on Machine Learning_, volume 119 of _Proceedings of Machine Learning Research_, pp. 10727-10735. PMLR, 13-18 Jul 2020. URL [https://proceedings.mlr.press/v119/yang20f.html](https://proceedings.mlr.press/v119/yang20f.html).
+* Ye et al. (2020) Hui Ye, Zhiyu Chen, Da-Han Wang, and Brian D. Davison. Pretrained generalized autoregressive model with adaptive probabilistic label clusters for extreme multi-label text classification. In _Proceedings of the 37th International Conference on Machine Learning_, ICML'20. JMLR.org, 2020.
+* Volume 48_, ICML'16, pp. 3069-3077. JMLR.org, 2016.
+* Yen et al. (2018) Ian E.H. Yen, Xiangru Huang, Wei Dai, Pradeep Ravikumar, Inderjit Dhillon, and Eric Xing. Ppdsparse: A parallel primal-dual sparse method for extreme classification. In _Proceedings of the 23rd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining_,KDD '17, pp. 545-553, New York, NY, USA, 2017. Association for Computing Machinery. ISBN 9781450348874. doi: 10.1145/3097983.3098083. URL [https://doi.org/10.1145/3097983.3098083](https://doi.org/10.1145/3097983.3098083).
+* You et al. (2019) Ronghui You, Zihan Zhang, Ziye Wang, Suyang Dai, Hiroshi Mamitsuka, and Shanfeng Zhu. Attentionxml: Label tree-based attention-aware deep model for high-performance extreme multi-label text classification. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Yu et al. (2022) H-F. Yu, K. Zhong, J. Zhang, W-C. Chang, and I. S. Dhillon. Pecos: Prediction for enormous and correlated output spaces. _Journal of Machine Learning Research_, 2022.
+* Zhang et al. (2021) Jiong Zhang, Wei-Cheng Chang, Hsiang-Fu Yu, and Inderjit Dhillon. Fast multi-resolution transformer fine-tuning for extreme multi-label text classification. _Advances in Neural Information Processing Systems_, 34:7267-7280, 2021.
+* Zhang et al. (2019) Shuai Zhang, Lina Yao, Aixin Sun, and Yi Tay. Deep learning based recommender system: A survey and new perspectives. _ACM Comput. Surv._, 52(1), feb 2019. ISSN 0360-0300. doi: 10.1145/3285029. URL [https://doi.org/10.1145/3285029](https://doi.org/10.1145/3285029).
+* Zhang (2004) Tong Zhang. Statistical analysis of some multi-category large margin classification methods. _Journal of Machine Learning Research_, 5(Oct):1225-1251, 2004.
+* Zhang et al. (2018) Wenjie Zhang, Junchi Yan, Xiangfeng Wang, and Hongyuan Zha. Deep extreme multi-label learning. In _Proceedings of the 2018 ACM on International Conference on Multimedia Retrieval_, ICMR '18, pp. 100-107, New York, NY, USA, 2018. Association for Computing Machinery. ISBN 9781450350464. doi: 10.1145/3206025.3206030. URL [https://doi.org/10.1145/3206025.3206030](https://doi.org/10.1145/3206025.3206030).
+
+## Appendix A Future Work and Reproducibility
+
+While our work shows that dual encoder model can be better or as competent as SOTA extreme classification methods without needing to linearly scale the model parameters with the number of labels, there are still challenges that need to be addressed. Below we highlight a few key future work directions:
+
+* **Scaling to larger label spaces:** We have established the performance of small dual encoders on up to O(million) label spaces. However, it would be interesting to study up to how big datasets can the limited-size dual encoders can retain their performance and if there is any fundamental capacity threshold that is essential for scaling to practical web-scale datasets.
+* **Improving DE performance without all negatives:** We have observed a clear relationship between DE performance and the availability of negatives. While it is computationally challenging to have all negatives, designing algorithms that can boost DE performance on many-shot retrieval problems without requiring a large pool of documents in loss computation is another promising area for exploration.
+* **DE encoder with in-built fast search procedure:** DE approaches rely on external approximate nearest neighbor search routines to perform fast inference when searching for top documents for a given query. In contrast, many hierarchical extreme classification methods come in-built with fast search procedures, it would be interesting to explore such hierarchical approaches for DE models.
+
+**Reproducibility:** Our PyTorch based implementation is available at the following link. We plan to open-source the code after the review period along with the trained models to facilitate further research in these directions. Below we provide additional details to clarify our approach and experimental setup.
+
+## Appendix B Implementation Details
+
+### Dataset
+
+In this subsection we provide more details of the datasets considered in this work,
+
+* **EURLex-4K**: The EURLex-4K dataset is a small extreme classification benchmark dataset. It was sourced from the publications office of the European Union (EU). Specifically, it's a collection of documents concerning European Union law. The dataset comprises approximately 4,000 distinct labels, represented by EuroVoc descriptors. EuroVoc is a multilingual thesaurus maintained by the EU, covering fields of EU interest and offering a consistent set of terms for the categorization of documents. There are over 15,000 training examples in the dataset. Each document within the EURLex-4K dataset is provided as a text string, consisting of the title and the content (or body) of the document.
+* **LF-AmazonTitles-131K**: Originated from Amazon, this dataset encapsulates product relationships, aiming to predict associated products based on a queried product. It comprises about 131,000 labels (products for recommendation from the catalog), and around 300,000
+
+\begin{table}
+\begin{tabular}{l|c|c} \hline
+**Dataset** & **Other** & **Labels/Datasets** \\ \hline EURLex-4K & \begin{tabular}{c} **Domain-do not only need multiple labels \\ **exploring with small annotations \\ **exploring with small annotations \\ **exploration-guided-annotated dataset** \\ \end{tabular} & 
+\begin{tabular}{c}
+
+training query products. The products are recognized via their respective Amazon product titles, which function as the principal descriptive feature.
+* **LF-Wikipedia-500K**: A conventional large-scale extreme classification benchmark, this dataset comprises document tagging of Wikipedia articles. Human annotators have tagged query documents with multiple categories, amounting to a total of 500,000 labels and approximately 1.8 million training queries. It is marked by the presence of certain super-head classes.
+* **LF-AmazonTitles-1.3M**: This dataset is similar to LF-AmazonTitles-131K, albeit on a larger scale and with a denser network. It includes a total of 2.2 million training points and 1.3 million labels. The distribution of these co-purchasing links can be significantly skewed. Some popular products relate to a considerable number of other products, while less popular ones maintain fewer connections.
+
+### Training hyperparameters
+
+In all of our experiments we train the dual encoders for 100 epochs with AdamW optimizer and use the linear decay with warmup learning rate schedule. Following the standard practices, we use \(0\) weight decay for all non-gain parameters (such as layernorm, bias parameters) and \(0.01\) weight decay for all the rest of the model parameters. Rest of the hyperparameters considered in our experiments are described below:
+
+* max_len: maximum length of the input to the transformer encoder, similar to (Daihya et al., 2023a) we use \(128\) max_len for the long-text datasets (EURLex-4K and LF-Wikipedia-500K) and \(32\) max_len for short-text datasets (LF-AmazonTitles-131K and LF-AmazonTitles-1.3M)
+* LR: learning rate of the model
+* batch_size: batch-size of the mini-batches used during training
+* dropout: dropout applied to the dual-encoder embeddings during training
+* \(\alpha\): multiplicative factor to control steepness of \(\sigma\) function described in Section 4.3
+* \(\eta\): micro-batch size hyperparameter that controls how many labels get processed at a time when using gradient caching
+* \(\tau\): temperature hyperparameter used to scale similarity values (i.e. \(s(q_{i},d_{j})\)) during loss computation
+
+\begin{table}
+\begin{tabular}{l|c c c c c} \hline \hline
+**Dataset** & **Num Train** & **Num Test** & **Num** & **Avg Labels** & **Avg Points** \\  & **Points** & **Points** & **Labels** & **per Point** & **per Label** \\ \hline EURLex-4K & 15,449 & 3,865 & 3801 & 5.30 & 20.79 \\ LF-AmazonTitles-131K & 294,805 & 134,835 & 131,073 & 2.29 & 5.15 \\ LF-Wikipedia-500K & 1,779,881 & 769,421 & 501,070 & 4.75 & 16.86 \\ LF-AmazonTitles-1.3M & 2,248,619 & 970,237 & 1,305,265 & 22.20 & 38.24 \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Dataset statistics
+
+\begin{table}
+\begin{tabular}{l|c c c c c c c} \hline \hline
+**Dataset** & **max\_len** & **LR** & **batch\_size** & **dropout** & \(\alpha\) & \(\eta\) & \(\tau\) \\ \hline \hline EURLex-4K & 128 & 0.0002 & 1024 & 0.1 & 2 & 4096 & 0.05 \\ LF-AmazonTitles-131K & 32 & 0.0004 & 4096 & 0 & 2 & 2048 & 0.05 \\ LF-Wikipedia-500K & 128 & 0.0004 & 4096 & 0.1 & 2 & 2048 & 1 \\ LF-AmazonTitles-1.3M & 32 & 0.0008 & 8192 & 0.1 & 2 & 1024 & 1 \\ \hline \hline \end{tabular}
+\end{table}
+Table 7: Hyperparameters
+
+### Baselines and Evaluation Metrics
+
+For existing extreme classification baselines (apart from ELIAS), we obtain their numbers from their respective papers or the extreme classification repository (Bhatia et al., 2016). Since the ELIAS paper do not report results on most of the datasets considered in this work, we ran the publicly available ELIAS implementation to report the results.
+
+### Evaluation Metrics
+
+We evaluate the models using standard XMC and retrieval metrics such as P@1, P@5, PSP@5, nDCG@5, R@10, and R@100. P@k (_Precision_ at k) measures the proportion of the top-k predicted labels that are also among the true labels for a given instance. PSP@k (_Propensity Scored Precision_ at k) is a variant of precision that takes into account the propensity scores of the labels, which are indicative of the likelihood of a label being positive. nDCG@k (_normalized Discounted Cumulative Gain_ at k) measures the quality of the ranked list of labels up to the position k. R@k (_Recall_ at k) is the proportion of the true labels that are included in the top-k predicted labels.
+
+### Memory efficient Distributed implementation
+
+In this section we describe our distributed implementation in more detail. For a multi-GPU setting, where we have \(G\) GPUs, a batch size of \(B\) queries, and a pool size of \(L\) labels considered in the loss computation.
+
+We begin by distributing the data and labels evenly across the GPUs. Each GPU receives \(B/G\) queries and \(L/G\) labels. However, for extreme multi-label problems with \(>1\)M labels, even this reduced load can be too large for the \(L/G\) labels - memory-wise - for an individual GPU during backpropagation. To handle this, we use the _gradient caching_ method (Gao et al., 2021). More concretely, on each GPU, we first divide the large \(L/G\) label input batch into manageable sub-batches of size \(\eta\). Then the encoder performs \(L/\eta G\) forward passes to compute label embeddings without
+
+Figure 4: Illustration of distributed implementation with gradient caching applied on label embedding computation. Here solid black line indicate forward pass direction and solid red lines indicate gradient backpropagation direction. \(L\) is the number of labels considered in the loss computation, \(B\) is the batch size of queries, \(\eta\) is a micro batch-size hyperparameter which controls how many labels are processed at a time.
+
+constructing the computation graph (i.e. with torch.no_grad()). Then, the loss is computed based on these embeddings, and the gradients for each embedding are computed and stored in a cache. Once we get the gradients with respect to the label embeddings, the encoder is run again on each \(\eta\) sized sub-batch separately (but this time we retain the computation graph), and the stored embedding gradients are used to backpropagate through the encoder parameters. This allows for constant memory usage during the encoder's forward-backward pass at the cost of doing the forward pass twice.
+
+To compute the loss, we perform an _all-gather_ operation on query embeddings across all GPUs. This enables each GPU to compute the dot product similarity matrix for the full \(B\) queries and \(L/G\) labels. The computation of the loss requires certain common terms, such as the denominator in the case of softmax-style losses. To compute these common terms, we perform an _all-reduce_ operation across all GPUs. Finally, each GPU computes the gradients with respect to its batch of \(L/G\) label and \(B/G\) query embeddings and backpropagates the respective gradients through the encoder parameters. By computing the loss and gradients in this distributed manner and by employing gradient cache, we can effectively handle large pools of labels without overwhelming the memory capacity of individual GPUs.
+
+In the following description we assume that the loss is standard softmax loss but appropriate modifications can be done to make it work for other losses discussed in Section 4. Figure 4 illustrates the overall processing of a mini-batch in a 2 GPU setup. More generally, let there be \(G\) GPUs, \(B\) queries \(\{x_{i}\}_{i=1}^{B}\) and \(L\) labels \(\{l_{i}\}_{i=1}^{L}\) considered in the loss computation.
+
+* Each GPU receives \(B/G\) queries and \(L/G\) labels. More concretely, we define the set of queries received by the \(g^{th}\) GPU as \(\{x_{i}^{g}\}_{i=1}^{B/G}\) and the set of labels as \(\{l_{i}^{g}\}_{i=1}^{L/G}\).
+* We can then define the embedding matrices for each GPU for \(B/G\) queries and \(L/G\) labels as \(Q_{g}=\phi(\{x_{i}^{g}\}_{i=1}^{B/G})\) and \(L_{g}=\phi(\{l_{i}^{g}\}_{i=1}^{L/G})\) respectively, where \(\phi\) is the query/document encoder. Note that, computing \(L_{g}\) for large \(L\) requires gradient caching as described in Section 4.2.
+* We then gather all query embeddings at each GPU, denoted as \(\hat{Q}=\text{Gather}(Q_{g})_{g=1}^{G}\)
+* We compute the similarity matrix for \(B\) queries and \(L/G\) labels as \(S_{g}=\hat{Q}L_{g}^{T}\).
+* Finally, we compute the softmax loss for each query-label pair \((i,j)\) (on respective GPUs) as \(\ell_{i,j}=-(S_{i,j}-\texttt{logsum}\mathbb{L}_{j=1}^{L}(S_{i,j}))\). Note, since \(S=[S_{1},S_{2},...,S_{G}]\) is distributed across GPU, we will have to perform an _all_reduce_ operation to compute \(\texttt{logsum}\mathbb{L}_{j=1}^{L}(S_{i,j})\) term in the loss.
+
+#### b.5.1 Memory and Runtime Analysis of Proposed implementation
+
+Below we provide analysis of memory and compute requirements of the implementation with or without gradient cache based approach: let's assume we have \(G\) gpus, our batch size is \(B\), number of labels \(L\), gradient cache sub-batch size \(\eta\), embedding dimension \(d\) and the memory required for processing (combined forward and backward pass of transformer encoder during training) a single query and label is \(M_{q}^{enc}\) and \(M_{l}^{enc}\) respectively. Without gradient caching, the total memory requirements for processing the whole mini-batch during training will be: \(\mathcal{O}(\frac{B(M_{q}^{enc}+d)+L(M_{l}^{enc}+d)+BL}{G})\), notice that with transformer encoders \(LM_{l}^{enc}\) is the largest bottleneck for XMC datasets with \(L\) in order of millions. With gradient caching the memory requirement is: \(\mathcal{O}(\frac{B(M_{q}^{enc}+d)+Ld+\eta M_{l}^{enc}+BL}{G})\). Similarly for compute let's assume the compute required for the forward and backward pass of query be \(T_{q}^{enc-f}\) and \(T_{q}^{enc-b}\) respectively, the compute required for the forward and backward pass of a label be \(T_{l}^{enc-f}\) and \(T_{l}^{enc-b}\). Then, without gradient caching the total compute requirement is: \(\mathcal{O}(\frac{B(T_{q}^{enc-f}+T_{q}^{enc-b}+d)+L(T_{l}^{enc-f}+T_{l}^{enc-b }+d)+BL}{G})\). With gradient caching the compute requirement will be: \(\mathcal{O}(\frac{B(T_{q}^{enc-f}+T_{q}^{enc-b}+d)+L(2T_{l}^{enc-f}+T_{l}^{enc-b }+d)+BL}{G})\).
+
+Empirically even with 16 A100 GPUs, the naive approach without gradient caching runs easily out of GPU memory even on LF-AmazonTitles-131K dataset as it demands about \(\sim\)TB combined GPU memory just for encoding all the labels. Table 8 provides the ablation of memory used and runtimesof the memory-efficient approach with different global batch sizes and gradient cache sub-batch sizes on LF-AmazonTitles-131K dataset (experiments ran with 4 A100 GPU setup):
+
+### Hardware and Runtimes
+
+We run our experiments on maximum 16 A100 GPU setup each having 40 GB GPU memory. In principle, our experiments can also be performed on a single GPU setup, but it'll take significantly longer to train. Table 9 reports the training times and number of GPU used during training for each dataset.
+
+### Distributed \(\log\) SoftTop-\(k\) implementation
+
+Below we provide the code snippet for efficient distributed implementation of \(\log\) SoftTop-\(k\) operator (for loss computation it is more desirable to directly work in \(\log\) domain) in PyTorch, here it is assumed that xs (the input to our operator is of shape \(B\times L/G\) where B is the batch size, \(L\) is the total number of labels and \(G\) is the number of GPUs used in the distributed setup.
+
+```
+1#Topkcodeadaptedfrom[https://gist.github.com/thomasahle/4cle85e5842d0lb007a8d10f5fed3a18](https://gist.github.com/thomasahle/4cle85e5842d0lb007a8d10f5fed3a18)
+2sigmoid=torch.sigmoid
+3defsigmoid_grad(x):
+4sig_x=sigmoid(x)
+5returnsig_x*(1-sig_x)
+6
+7fromtorch.autogradimportFunction
+8classDistLogTopK(Function):
+9@staticmethod
+10defforward(ctx,xs,k,alpha,n_iter=32):
+11logits,log_sig=_dist_find_ts(xs,k,alpha=alpha,n_iter=n_iter,returnlog_sigTrue)
+12ctx.save_for_backward(torch.tensor(alpha),logits)
+13returnlog_sig
+14
+15@staticmethod
+16defbackward(ctx,grad_output):
+17#Computevjp,thatisgrad_output.T@J.
+```
+
+\begin{table}
+\begin{tabular}{c c c c c} \hline \hline Global batch size & Gradient cache sub-batch size & Max Memory per GPU & Avg time per batch & Avg time per epoch \\ \hline
+1024 & 64 & 6.03 GB & 17.8s & 1.42 hrs \\
+1024 & 256 & 6.31 GB & 7.1s & 0.56 hrs \\
+1024 & 1024 & 14.89 GB & 5.9s & 0.47 hrs \\
+1024 & 4096 & 48.51 GB & 5.6s & 0.44 hrs \\
+4096 & 256 & 15.75 GB & 7.9s & 0.16 hrs \\
+4096 & 1024 & 16.16 GB & 6.7s & 0.14 hrs \\
+4096 & 4096 & 51.85 GB & 6.0s & 0.12 hrs \\
+16384 & 256 & 53.12 GB & 12.2s & 0.06 hrs \\
+16384 & 1024 & 53.12 GB & 8.2s & 0.04 hrs \\
+16384 & 4096 & 58.77 GB & 6.6s & 0.03 hrs \\ \hline \hline \end{tabular}
+\end{table}
+Table 8: Ablation of memory used and runtimes of the grad-cache based memory efficient implementation
+
+\begin{table}
+\begin{tabular}{l|c c c c} \hline \hline
+**Parameter** & **EURLex-4K** & **LF-AmazonTitles-131K** & **LF-Wikipedia-500K** & **LF-AmazonTitles-1.3M** \\ \hline \hline Number of GPU & 2 & 4 & 8 & 16 \\ \hline Total Training time (hrs) & 0.27 & 4.2 & 37 & 66 \\ \hline \hline \end{tabular}
+\end{table}
+Table 9: Training times and resources used for each dataset in our experimentsalpha, logits = ctx.saved_tensors sig_x = sigmoid(logits) v = alpha*sig_x*(1-sig_x) s = v.sum(dim=1, keepdims=True) dist.all_reduce(s, op=dist.ReduceOp.SUM) uv = grad_output * alpha * (1-sig_x) uv_sum = uv.sum(dim=1, keepdims=True) dist.all_reduce(uv_sum, op=dist.ReduceOp.SUM) t1 = - uv.sum * v / s return t1.add_(uv), None, None # in-place addition
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+300
+311
+32
+33
+338
+339
+340
+341
+342
+343
+344
+345
+346
+347
+348
+349
+350
+351
+352
+353
+354
+355
+356
+357
+358
+359
+359
+360
+350
+351
+353
+354
+355
+356
+357
+358
+359
+359
+361
+359
+362
+359
+363
+364
+365
+366
+367
+368
+369
+360
+369
+3610
+362
+363
+364
+365
+366
+367
+368
+369
+360
+3611
+368
+369
+360
+362
+363
+364
+365
+366
+367
+368
+369
+369
+3600
+3601
+3602
+3612
+3603
+3613
+362
+3635
+364
+365
+3666
+367
+368
+369
+369
+3601
+3602
+3603
+3614
+3604
+3615
+3616
+362
+3637
+364
+365
+3667
+368
+369
+3690
+3605
+3606
+3607
+3618
+3608
+3619
+3610
+3620
+3638
+3640
+3651
+3669
+36611
+3639
+3662
+3641
+3642
+3653
+3666
+367
+368
+3691
+3692
+3603
+3604
+3605
+3606
+3617
+3618
+3619
+36210
+3638
+3642
+3643
+3654
+3666
+3671
+3681
+3693
+3694
+3695
+3696
+3607
+3608
+36097
+3610
+36111
+3612
+3613
+3614
+3615
+3616
+3617
+3618
+3619
+36100
+36111
+3619
+36113
+36114
+3616
+3617
+3618
+3619
+3619
+36101
+36115
+3619
+36116
+3619
+36117
+3618
+3619
+36118
+3619
+3619
+36102
+3619
+36119
+36119
+36118
+3619
+3619
+3619
+3619
+3620
+36319
+36321
+3633
+3643
+3644
+3655
+3666
+3671
+3682
+3683
+3696
+3697
+3698
+3699
+3699
+3699
+3699
+3699
+37000
+3699
+3699
+3800
+3699
+3901
+3699
+39102
+3699
+39211
+3693
+36940
+3695
+3696
+3697
+36981
+36999
+3699
+3699
+3699
+3699
+3699
+37001
+3699
+37101
+37111
+3712
+3713
+37214
+3734
+3735
+37401
+37415
+37421
+3743
+37444
+3745
+3746
+37475
+37481
+37516
+37517
+37618
+3777
+37781
+3781
+3782
+3783
+3783
+3833
+3833
+3833
+3833
+3833
+3833
+38333
+3833
+3833
+3833
+38333
+38333
+3833
+38333
+38333
+38333
+38333
+38333
+38333
+38333
+38333
+38333
+38333
+38333
+383333
+383333
+383333
+383333
+38333
+38333
+383333
+383333
+38333
+383333
+383333
+383333
+383333
+383333
+383333
+3833333
+3833333
+383333
+383333
+3833333
+3833333
+3833333
+3833333
+38333333
+38333333
+38333333
+38333333
+38333333
+38333333
+38333333
+383333333
+383333333
+38333333333
+383
+
+#### c.2.2 DecoupledSoftmax vs standard softmax
+
+#### c.2.1 Analytical gradient analysis
+
+**Softmax gradient analysis**:
+
+\[\mathcal{L}=-\frac{1}{N}\sum_{i=1}^{N}\ell_{i}\]
+
+\[\ell_{i}=\sum_{j\in P_{i}}\ell_{ij},\text{where }P_{i}\text{ is the set of positive documents of label }i\]
+
+\[\ell_{ij}=\log(\sigma_{ij}),\text{here }\sigma_{ij}=\frac{e^{s(q_{i},d_{j})}}{ \sum_{k}e^{s(q_{i},d_{k})}},\text{where }s(q,d)=x_{q}^{T}z_{d}\]
+
+\[\implies\frac{\partial\ell_{ij}}{\partial z_{d_{i}}}=\begin{cases}(1-\sigma_{il })x_{q_{i}}&\text{if }l=j\\ -\sigma_{il}x_{q_{i}}&\text{otherwise}\end{cases}\]
+
+\[\implies\frac{\partial\ell_{i}}{\partial z_{d_{i}}}=\begin{cases}(1-|P_{i}| \sigma_{il})x_{q_{i}}&\text{if }l\in P_{i}\\ -|P_{i}|\sigma_{il}x_{q_{i}}&\text{otherwise}\end{cases}\]
+
+This suggests that the multi-label extension of standard softmax is optimized when:
+
+\[\sigma_{il}=\begin{cases}\frac{1}{|P_{i}|}&\text{if }l\in P_{i}\\ 0&\text{otherwise}\end{cases}\]
+
+DecoupledSoftmax **gradient analysis**:
+
+\[\mathcal{L}=-\frac{1}{N}\sum_{i=1}^{N}\ell_{i}\]
+
+\[\ell_{i}=\sum_{j\in P_{i}}\ell_{ij},\text{where }P_{i}\text{ is the set of positive documents of label }i\]
+
+\[\ell_{ij}=\log(\sigma_{ij}),\text{here }\sigma_{ij}=\frac{e^{s(q_{i},d_{j})}}{e^{s(q_{i},d_ {j})}+\sum_{k\notin P_{i}}e^{s(q_{i},d_{k})}},\text{where }s(q,d)=x_{q}^{T}z_{d}\]
+
+\[\frac{\partial\ell_{ij}}{\partial z_{d_{i}}}=\begin{cases}(1-\sigma_{il})x_{q_ {i}}&\text{if }l=j\\ 0&\text{if }l\neq j\text{ and }l\in P_{i}\end{cases}\]
+
+\[\implies\frac{\partial\ell_{i}}{\partial z_{d_{i}}}=\begin{cases}(1-\sigma_{il })x_{q_{i}}&\text{if }l\in P_{i}\\ -\sum_{j\in P_{i}}\frac{e^{s(q_{i},d_{j})}}{e^{s(q_{i},d_{j})}+\sum_{k\notin P_ {i}}e^{s(q_{i},d_{k})}}x_{q_{i}}&\text{otherwise}\end{cases}\]
+
+#### c.2.2 Empirical results on XMC benchmarks
+
+Table 11 compares DecoupledSoftmax with SoftmaxCE loss across all XMC datasets considered in this work.
+
+\begin{table}
+\begin{tabular}{l|c c c c|c c c c} \hline \hline
+**Dataset size (\(N\))** & **P@1** & **P@5** & **R@10** & **R@100** & **P@1** & **P@5** & **R@10** & **R@100** \\ \hline  & \multicolumn{4}{c|}{DE with in-batch negative} & \multicolumn{4}{c}{DE with hard negative} \\ \hline
+100K & 100.00 & 20.00 & 100.00 & 100.00 & 100.00 & 20.00 & 100.00 & 100.00 \\
+500K & 98.60 & 20.00 & 100.00 & 100.00 & 100.00 & 20.00 & 100.00 & 100.00 \\
+1M & 81.21 & 18.67 & 95.71 & 99.15 & 99.93 & 20.00 & 99.99 & 99.99 \\ \hline \hline \end{tabular}
+\end{table}
+Table 10: Performance of DE on random text pair synthetic dataset at different scales
+
+### Quality of negatives in DE training
+
+As mentioned in Section 5.4 we perform negative sampling following (Xiong et al., 2021), we mine hard negatives by computing the shortlist of nearest indexed labels for each training query at regular intervals and sample negatives from this shortlist. Although, this approach is computationally efficient it suffers from the problem of having to deal with state negatives since the model parameters constantly change but the negative shortlist gets updated only after certain training steps. To study the importance of the quality of hard negatives we implement an approach similar to (Lindgren et al., 2021) where we maintain an active cache of all label embeddings and use this to first identify the hardest negatives and then use these negatives along with in-batch labels to perform loss computation. More specifically, we maintain a label embedding cache of \(L\times d\) size where \(L\) is the number of labels and \(d\) is the embedding dimension. We initialize this matrix with the embeddings of all the labels at the start of training. For a mini-batch of \(B\) queries and \(L^{\prime}\) sampled labels in the mini-batch, we first update the embedding cache of all \(L^{\prime}\) mini-batch labels, then we compute the loss using embeddings of \(B\) training queries and the label embedding cache and identify the labels that receive the highest gradients. We take the top-\(K\) labels that are not already part of the \(L^{\prime}\) mini-batch labels. Then we use these top-k labels as the hard negative for the mini-batch and then compute the loss using the \(L^{\prime}\) mini-batch labels and \(K\) hard negative labels. This approach allows us to mine _almost_ fresh hard negatives for each mini-batch. In Table 13 we compare the results obtained using this approach and ANCE (Xiong et al., 2021) style hard negatives. Note that for a fair comparison, we compare them in settings where an equivalent total number of negatives are sampled per batch. These results suggest that there can be moderate gains made with an increase in the quality of negatives and further research into mining better negatives can be helpful in training better DE models with lower cost.
+
+### Results with confidence intervals on small datasets
+
+Since XMC datasets are fairly big benchmarks so running multiple experiments with different seeds is very expensive. Below in Table 14 we provide mean and 95% confidence intervals for DecoupledSoftmax DE results for the smaller EURLex-4K and LF-AmazonTitles-131K datasets.
+
+\begin{table}
+\begin{tabular}{l c|c c|c c c} \hline \hline
+**Batch** & **Hard neg** & **Effective** & **P@1** & **P@5** & **R@10** & **R@100** & **P@1** & **P@5** & **R@10** & **R@100** \\ \hline \multicolumn{7}{c|}{DecoupledSoftmax} & \multicolumn{3}{c}{Softmax} \\ \hline \(8192\) & \(1\) & \(\sim 16384\) & 49.16 & 39.07 & 32.76 & 60.09 & 47.60 & 38.85 & 32.12 & 61.49 \\ \(8192\) & \(2\) & \(\sim 24576\) & 50.74 & 40.14 & 33.31 & 60.45 & 49.11 & 40.16 & 32.77 & 62.05 \\ \(8192\) & \(10\) & \(\sim 90112\) & 54.01 & 42.08 & 34.19 & 61.04 & 51.19 & 42.06 & 33.31 & 62.76 \\ \(8192\) & **All** & \(\sim 1.3M\) & 58.40 & 45.46 & 36.49 & 64.25 & 52.42 & 43.42 & 34.00 & 65.84 \\ \hline \hline \end{tabular}
+\end{table}
+Table 12: Performance comparison of DecoupledSoftmax vs Softmax with sampled hard negatives, note that Softmax with sampled hard negatives is same as InfoNCE with hard negatives
+
+\begin{table}
+\begin{tabular}{l|c c|c c} \hline \hline
+**Dataset** & & **P@1** & & **P@5** & \\ \hline  & & Decoupled Softmax & Softmax & Decoupled Softmax & Softmax \\ \hline EURLex-4K & 86.78 & 80.05 & 60.19 & 58.36 \\ LF-AmazonTitles-131K & 42.52 & 41.77 & 20.64 & 20.87 \\ LF-Wikipedia-500K & 85.78 & 79.85 & 50.53 & 49.78 \\ LF-AmazonTitles-1.3M & 58.40 & 52.42 & 45.46 & 43.43 \\ \hline \hline \end{tabular}
+\end{table}
+Table 11: Side by side comparison of DE models trained with DecoupledSoftmax vs Softmax loss on XMC datasets.
+
+### Score distribution analysis
+
+In Figure 5 we plot the precision-recall curve on EURLex-4K for DE models trained using DecoupledSoftmax and Softmax loss. This plot reveals that DE model trained with DecoupledSoftmax offers a better precision vs recall tradeoff. In Figure 6 we analyze the distribution of scores given by DE models trained with different loss function on the test set of EURLex-4K dataset. More specifically, we plot the distribution of scores of positive and negative labels for Softmax loss 3, DecoupledSoftmax loss 5, and SoftTop-5 loss 6. These plots reveal that the positives and negatives are better separated when we use DecoupledSoftmax and SoftTop-5 loss, when compared to the Softmax loss.
+
+### Decilewise comparison
+
+We investigate the performance variation across different label regimes (many-shot versus few-shot labels) among various approaches. These include the pure classification-based method (DistilBERT OvA Classifier), DecoupledSoftmax DE models trained with in-batch negatives (In-batch DE), hard negatives (Hard negative DE), and all negatives (DecoupledSoftmax DE and SoftTop-k DE).
+
+\begin{table}
+\begin{tabular}{l|c c c|c c c c} \hline \hline
+**Dataset** & **P@1** & **P@5** & **R@10** & **R@100** & **P@1** & **P@5** & **R@10** & **R@100** \\ \hline \hline  & \multicolumn{4}{c|}{ANCE (Xiong et al., 2021)} & \multicolumn{4}{c}{Embedding cache (Lindgren et al., 2021)} \\ \hline EURLex-4K & 84.61 & 59.15 & 71.08 & 90.21 & 85.87 & 59.93 & 71.54 & 90.34 \\ LF-AmazonTitles-131K & 40.99 & 20.59 & 57.20 & 70.08 & 41.72 & 20.25 & 45.54 & 65.54 \\ LF-Wikipedia-500K & 82.85 & 48.84 & 74.47 & 90.08 & 84.53 & 48.66 & 72.97 & 88.93 \\ \hline \hline \end{tabular}
+\end{table}
+Table 13: Comparing DecoupledSoftmax DE trained with ANCE (Xiong et al., 2021) style scale negatives and fresh negatives mined using embedding cache (Lindgren et al., 2021)
+
+Figure 5: PR curve for Decoupled softmax vs standard softmax on EURLex-4K dataset
+
+Figure 6: Plot of score distribution of DE models trained with different loss functions. _left_ plot compares DecoupledSoftmax 5 vs softmax 3 _right_ plot compares SoftTop-5 6 vs softmax 3Consistent with Daiya et al. (2023a), we devise different label deciles based on the count of training examples per label, wherein the first decile signifies labels with the most training examples and the last decile signifies those with the least. On LF-Wikipedia-500K, as anticipated, Figure 7 shows that the pure classification-based approach achieves subpar performance on the last deciles. However, intriguingly, DE methods trained with hard or all negatives exhibit performance comparable to the classification-based approaches even on head deciles. DE methods trained with our approach does well across _all_ deciles and hence improve the performance over existing DE methods. On LF-AmazonTitles-1.3M, when comparing the DistilBERT OvA classifier with DE models, we notice a similar trend that the pure classification-based approach and DE approach are comparable at head deciles but on tail deciles DE starts significantly outperforming the classifier approach. When comparing DE trained with all negatives and the ones trained with in-batch or hard-negatives, we notice a substantial gap on head deciles but the gap diminishes on tail deciles.
+
+### Better generalization of DE models on tail labels
+
+In this section, we study whether DE models offer improved learning when dealing with similar but distinct labels when compared to the classifier approach. We use LF-Wikipedia-500K dataset for this experiment. We first quantify how much a label is similar to the rest of the labels in the dataset, we do this by computing the normalized embeddings of each label (from the trained DE model) and searching for the top 10 nearest labels for each label, we use the mean similarity score of the top 10 nearest labels as an indication of how similar this label is compared to rest of the labels. Based on this mean similarity score, we divide our labels into 3 equal bins, where the first bin corresponds to the *most dissimilar* labels and the last bin corresponds to the *most similar* labels. We compute the contribution of labels from each bin to final P@5 numbers for both the pure classifier-based approach (DistilBERTovA baseline) and pure dual encoder-based approach (DecoupledSoftmax DE). We then plot the relative improvement between the classifier-based approach and the dual-encoder approach, more specifically we plot the relative improvement in P@5 contribution of the dual-encoder method relative to the classifier method. We also perform the same analysis but this time we create label bins for only tail labels (we define a tail label as any label with \(\leq 5\) training points
+
+From Figure 8 we can infer that there doesn't seem to be any meaningful pattern when we look at the results of the analysis on all labels but when we look at the analysis just on tail labels there appears to be a trend that the relative improvement is more on similar labels and less on dissimilar labels. This demonstrates that for labels with less training data, dual-encoders can perform relatively better on similar but distinct labels compared to a pure classifier-based approach which treats each label as an atomic entity.
+
+Figure 7: Decile-wise analysis of P@5 on LF-Wikipedia-500K (_left_) and LF-AmazonTitles-1.3M (_right_), \(1^{st}\) decile represents labels with most training points i.e. head labels while \(10^{th}\) decile represents labels with least training points i.e. tail labels
+
+### Comparison with XR-Transformer on EURLex-4K
+
+As highlighted in (Gupta et al., 2022), methods like XR-Transformer use high-capacity sparse classifiers learned on the concatenated sparse tf-idf features and dense embedding obtained from the BERT encoder for ranking their top predictions. In table 15 we compare XR-Transformer's performance without ensembling and without using tf-idf features. We also, report results by adding the sparse ranker layer (implemented similarly to the approach described in Section 3.5 of (Gupta et al., 2022)) on top of DecoupledSoftmax DE top 100 predictions. As we can see that XR-Transformer's better performance on EURLex-4K dataset can be greatly attributed to the use of ensemble of 3 learners and high-capacity sparse classifiers.
+
+Figure 8: Plot to study if dual encoder training performs better on similar but distinct labels on LF-Wikipedia-500K dataset. We first divide labels into 3 equal bins, where the first bin corresponds to the *most dissimilar* labels and the last bin corresponds to the *most similar* labels (based on the mean similarity score of the top 10 nearest embedded labels). We then compute the contribution of labels from each bin to final P@5 numbers for both pure classifier-based approach (DistilBERTOvA baseline) and pure dual encoder-based approach (DecoupledSoftmax DE). In the **right** subplot, we plot the relative improvement between the classifier based approach and the dual encoder approach when considering all labels, more specifically we plot the relative improvement in P@5 contribution of the dual encoder method relative to the classifier method. In the **left** perform the same analysis but this time we create label bins for only tail labels (we define a tail label as any label with \(\leq 5\) training points.

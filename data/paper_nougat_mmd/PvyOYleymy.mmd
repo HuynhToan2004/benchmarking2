@@ -1,0 +1,686 @@
+# Masked Completion via Structured Diffusion with White-Box Transformers
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Modern learning frameworks often train deep neural networks with massive amounts of unlabeled data to learn representations by solving simple pretext tasks, then use the representations as foundations for downstream tasks. These networks are empirically designed; as such, they are usually not interpretable, their representations are not structured, and their designs are potentially redundant. White-box deep networks, in which each layer explicitly identifies and transforms structures in the data, present a promising alternative. However, existing white-box architectures have only been shown to work at scale in supervised settings with labeled data, such as classification. In this work, we provide the first instantiation of the white-box design paradigm that can be applied to large-scale unsupervised representation learning. We do this by exploiting a fundamental connection between diffusion, compression, and (masked) completion, deriving a deep transformer-like masked autoencoder architecture, called crate-mae, in which the role of each layer is mathematically fully interpretable: they transform the data distribution to and from a structured representation. Extensive empirical evaluations confirm our analytical insights. crate-mae demonstrates highly promising performance on large-scale imagery datasets while using only \(\sim\)30% of the parameters compared to the standard masked autoencoder with the same model configuration. The representations learned by crate-mae have explicit structure and also contain semantic meaning.
+
+## 1 Introduction
+
+In recent years, deep learning has been called upon to process continually larger quantities of high-dimensional, noisy, and unlabeled data. A key property which makes these ever-larger tasks tractable is that the high-dimensional data tends to have _low-dimensional geometric and statistical structure_. Modern deep networks tend to learn (implicit or explicit) representations of this structure, which are then used to efficiently perform downstream tasks. Learning these representations is thus of central importance in machine learning, and there are so far several common methodologies for this task. We focus our attention below on approaches that incrementally transform the data towards the end representation with _simple, mathematically-interpretable primitives_. Discussion of popular alternatives is postponed to Appendix A.
+
+**Denoising-diffusion models for high-dimensional data.** A popular method for learning implicit representations of high-dimensional data is _learning to denoise_: a model that can _denoise_, i.e., remove noise from a corrupted observation from the data distribution (to the extent information-theoretically possible), can be chained across noise levels to transform the data distribution to and from certain highly structured distributions, such as an isotropic Gaussian, enabling efficient sampling (Hyvarinen, 2005; Vincent, 2011; Sohl-Dickstein et al., 2015; Ho et al., 2020; Song et al., 2021; 2023a). Crucially, in the case of data with low-dimensional structure--including the highly nonlinear structure characteristic of natural images--these models can be learned efficiently (Chen et al., 2023; Oko et al., 2023; Moitra and Risteski, 2020), and as a result this framework has significant practical impact (Rombach et al., 2022). Despite this progress, these techniques have been largely limited to use in generative modeling; the use of denoising-diffusion for representation learning is relatively underexplored.
+
+**White-box models and structured representation learning.** Another method for representation learning, this time built to produce explicit and structured representations, is that of _white-box models_. Such models attempt to produce representations of the data distribution with some desired structure, e.g., sparsity (Gregor & LeCun, 2010; Zhai et al., 2020) or (piecewise) linearity (Chan et al., 2022), etc. Recent work (Yu et al., 2023; 20) has built white-box deep networks via unrolled optimization: namely, to obtain representations with a desired set of properties, one composes an objective function which encourages these desiderata, then constructs a deep network where each layer is designed to iteratively optimize the objective. This builds deep networks as a chain of operators, representing well-understood optimization primitives, which iteratively transform the representations to the desired structure. However, such-obtained deep networks have yet to be constructed for unsupervised contexts (Yu et al., 2023; 20).
+
+**Our contributions.** In this work, we demonstrate that these two paradigms have more in common than previously known. We make two conceptual observations. First, we show quantitatively that under certain natural regimes, _denoising_ and _compression_ are highly similar primitive data processing operations: when the target distribution has low-dimensional structure, both operations implement a projection operation onto this structure. Second, using this insight, we demonstrate a quantitative connection between unrolled discretized diffusion models and unrolled optimization-constructed deep networks. This leads to a significant expansion of the existing conceptual toolkit for developing white-box neural network architectures, which we use to derive white-box transformer-like encoder and decoder architectures that together form an autoencoding model that we call crate-mae, illustrated in Fig.1. We evaluate crate-mae on the challenging masked autoencoding task (He et al., 2022) and demonstrate promising performance with large parameter savings over traditional masked autoencoders, along with many side benefits such as emergence of semantic meaning in the representations.
+
+## 2 Approach
+
+### Setup and Notation
+
+We use the same notation and basic problem setup as in Yu et al. (2023). Namely, we have some matrix-valued random variable \(\mathbf{X}=[\mathbf{x}_{1},\ldots,\mathbf{x}_{N}]\in\mathbb{R}^{D\times N}\) representing the data, where the \(\mathbf{x}_{i}\in\mathbb{R}^{D}\) are called "tokens" and may be arbitrarily correlated. To obtain representations of the input, we learn an _encoder_\(f\colon\mathbb{R}^{D\times N}\to\mathbb{R}^{d\times N}\), our representations are denoted by the random variable \(\mathbf{Z}=f(\mathbf{X})=[\mathbf{z}_{1},\ldots,\mathbf{z}_{N}]\in\mathbb{R}^{d\times N}\), where the token representations are \(\mathbf{z}_{i}\in\mathbb{R}^{d}\). In the autoencoding setup, we also learn a _decoder_\(g\colon\mathbb{R}^{d\times N}\to\mathbb{R}^{D\times N}\), such that \(\mathbf{X}\approx\widehat{\mathbf{X}}=[\widehat{\mathbf{x}}_{1},\ldots,\widehat{\mathbf{x}}_{ N}]\doteq g(\mathbf{Z})\).
+
+Our encoder and decoder will be deep neural networks, and as such they will be composed of several, say \(L\), _layers_ each. Write \(f=f^{L}\circ\cdots\circ f^{1}\circ f^{\text{pre}}\) and \(g=g^{\text{post}}\circ g^{L-1}\circ\cdots\circ g^{0}\), where \(f^{\ell}\colon\mathbb{R}^{d\times N}\to\mathbb{R}^{d\times N}\) and \(g^{\ell}\colon\mathbb{R}^{d\times N}\to\mathbb{R}^{d\times N}\) are the \(\ell^{\text{th}}\) layer of the encoder and decoder respectively, and \(f^{\text{pre}}\colon\mathbb{R}^{D\times N}\to\mathbb{R}^{d\times N}\) and \(g^{\text{post}}\colon\mathbb{R}^{d\times N}\to\mathbb{R}^{D\times N}\) are the pre- and post-processing layers respectively. The _input_ to the \(\ell^{\text{th}}\) layer of the encoder is denoted \(\mathbf{Z}^{\ell}\doteq\left[\mathbf{z}^{\ell}_{1},\ldots,\mathbf{z}^{\ell}_{N}\right]\in \mathbb{R}^{d\times N}\), and the _input_ to the \(\ell^{\text{th}}\) layer of the decoder is denoted \(\mathbf{Y}^{\ell}\doteq\left[\mathbf{y}^{\ell}_{1},\ldots,\mathbf{y}^{\ell}_{N}\right]\in \mathbb{R}^{d\times N}\).
+
+### Desiderata, Objective, and Optimization
+
+Our goal is to use the encoder \(f\) and decoder \(g\) to learn _representations_\(\mathbf{Z}\) which are _parsimonious_(Ma et al., 2022) and _invertible_; namely, they have _low-dimensional, sparse, (piecewise) linear geo
+
+Figure 1: Diagram of the overall white-box crate-mae pipeline, illustrating the end-to-end (masked) autoencoding process, along with the conceptual role of each encoder layer \(f^{\ell}\) to compress and sparsify the representations, and each decoder layer \(g^{L-\ell}\) to invert \(f^{\ell}\).
+
+metric and statistical structure, and are (approximately) bijective with the original data \(\mathbf{X}\). Yu et al. (2023a) proposes to implement this principle of parsimony by posting that the final representations \(\mathbf{Z}\) lie on a _union of low-dimensional axis-aligned subspaces_, such that the \(k^{\mathrm{th}}\) subspace has basis \(\mathbf{U}_{k}\in\mathbb{R}^{d\times p}\) where \(p\ll d\), where together the bases form a _local signal model_ for the representations and are denoted \(\mathbf{U}_{[K]}\doteq(\mathbf{U}_{1},\ldots,\mathbf{U}_{K})\). More specifically, Yu et al. (2023a) proposes to learn an encoding \(f\) such that the token representations \(\mathbf{z}_{i}\) each have _marginal distribution_ equal to a _Gaussian mixture_ supported on the subspaces \(\mathbf{U}_{[K]}\). Such representations are those that maximize the _sparse rate reduction_ objective function (Yu et al., 2023a):
+
+\[\mathbb{E}_{\mathbf{Z}}[\Delta R(\mathbf{Z}\mid\mathbf{U}_{[K]})-\lambda\|\mathbf{Z}\|_{0}]= \mathbb{E}_{\mathbf{Z}}[R(\mathbf{Z})-R^{c}(\mathbf{Z}\mid\mathbf{U}_{[K]})-\lambda\|\mathbf{Z}\|_ {0}], \tag{2.1}\]
+
+where \(R\) and \(R^{c}\) are _lossy coding rates_, or _rate distortions_(Cover, 1999), which are estimates for the number of bits required to encode the sample up to precision \(c>0\) using a Gaussian codebook, both unconditionally (for \(R\)), and conditioned on the samples being drawn from \(\mathbf{U}_{k}\) summed over all \(k\) (for \(R^{c}\)). Concretely, closed-form tight approximations (Ma et al., 2007; Yu et al., 2023a) for such rate distortions are:
+
+\[R(\mathbf{Z}) =\frac{1}{2}\log\det\bigl{(}\mathbf{I}_{N}+\alpha\mathbf{Z}^{\top}\mathbf{Z} \bigr{)},\qquad\alpha\doteq\frac{d}{N\epsilon^{2}} \tag{2.2}\] \[R^{c}(\mathbf{Z}\mid\mathbf{U}_{[K]}) =\frac{1}{2}\sum_{k=1}^{K}\log\det\bigl{(}\mathbf{I}_{N}+\beta(\mathbf{U }_{k}^{\top}\mathbf{Z})^{\top}(\mathbf{U}_{k}^{\top}\mathbf{Z})\bigr{)},\qquad\beta\doteq \frac{p}{N\epsilon^{2}}. \tag{2.3}\]
+
+Notably, \(R^{c}\) is a measure of _compression against our statistical structure_ -- it measures how closely the overall distribution of tokens in \(\mathbf{Z}\) fit a Gaussian mixture on \(\mathbf{U}_{[K]}\).
+
+To optimize the sparse rate reduction, Yu et al. (2023a) proposed to construct the deep neural network \(f\)_layer-by-layer_ using the unrolled optimization paradigm. In particular, \(f^{t}\) was constructed as a two-step alternating optimization procedure which compressed the input against the (learned) local signal model \(\mathbf{U}_{[K]}^{t}\), by taking a step of gradient descent on \(R^{c}(\mathbf{Z}\mid\mathbf{U}_{[K]}^{t})\), and taking a step of proximal gradient descent on a LASSO objective (Tibshirani, 1996; Wright and Ma, 2022) to sparsify the data in a (learned) dictionary \(\mathbf{D}^{t}\in\mathbb{R}^{d\times d}\):
+
+\[\mathbf{Z}^{\ell+1/2} =\mathbf{Z}^{\ell}+\texttt{MSSA}(\mathbf{Z}^{\ell}\mid\mathbf{U}_{[K]}^{\ell} )\approx\mathbf{Z}^{\ell}-\kappa\nabla_{\mathbf{Z}}R^{c}(\mathbf{Z}^{\ell}\mid\mathbf{U}_{[K]} ^{\ell}) \tag{2.4}\] \[\mathbf{Z}^{\ell+1} =\texttt{ISTA}(\mathbf{Z}^{\ell+1/2}\mid\mathbf{D}^{\ell})\doteq\mathrm{ ReLU}\left(\mathbf{Z}^{\ell+1/2}+\eta(\mathbf{Z}^{\ell+1/2}-\mathbf{D}^{\ell}\mathbf{Z}^{\ell+1/2})- \eta\lambda\mathbf{1}\right), \tag{2.5}\]
+
+where \(\texttt{MSSA}(\cdot)\), the **M**ulti-head **S**ubspace **S**elf-**A**tttention block (Yu et al., 2023a), is defined as
+
+\[\texttt{MSSA}(\mathbf{Z}\mid\mathbf{U}_{[K]})\doteq\frac{p}{N\epsilon^{2}}\left[\mathbf{ U}_{1}\quad\cdots\quad\mathbf{U}_{K}\right]\begin{bmatrix}(\mathbf{U}_{1}^{\top}\mathbf{Z}) \operatorname{softmax}((\mathbf{U}_{1}^{\top}\mathbf{Z})^{\top}(\mathbf{U}_{1}^{\top}\mathbf{Z }))\\ \vdots\\ (\mathbf{U}_{K}^{\top}\mathbf{Z})\operatorname{softmax}((\mathbf{U}_{K}^{\top}\mathbf{Z})^{ \top}(\mathbf{U}_{K}^{\top}\mathbf{Z}))\end{bmatrix}. \tag{2.6}\]
+
+One may observe that the \(\texttt{MSSA}\) block has a remarkable functional form: it is exactly the same as a multi-head self-attention block in a transformer, with the changes that the \(\mathbf{Q}_{k}\)/\(K_{k}\)/\(V_{k}\) blocks are replaced by a single matrix \(\mathbf{U}_{k}\) in each head \(k\). As the layer \(f^{t}\) defined by \(\mathbf{Z}^{\ell+1}=f^{t}(\mathbf{Z}^{\ell})\) and with parameters \(\mathbf{U}_{[K]}^{\ell}\) and \(\mathbf{D}^{\ell}\) is the concatenation of a self attention-like block (MSSA, as in (2.6)) and nonlinearity (ISTA, as in (2.5)), it bears significant resemblance to a transformer block. The crate model, which is a concatenation of such white-box blocks, is thus a white-box transformer-like architecture constructed via unrolled optimization. Such crate models obtain competitive performance on standard tasks, like image classification (Yu et al., 2023a), while enjoying many side benefits (Yu et al., 2023b), yet they have so far only been trained on supervised classification. In the sequel, we introduce a paradigm to obtain white-box networks which learn through unsupervised tasks, such as autoencoding, via unrolling discretized diffusion processes. This program obtains a model structurally similar to crate, along the way demonstrating conceptual and quantitative links between denoising and compression while connecting diffusion models and unrolled optimization-constructed white-box networks through the lens of iterative signal processing.
+
+### Unifying Denoising and Compression
+
+One common method for learning the structures of high-dimensional data is the so-called _diffusion model_(Ho et al., 2020). Diffusion models are built on the general principle and task of _denoising_,which seeks to remove the disturbance (e.g., noise) from noisy data, essentially projecting it onto the data distribution (Elad & Aharon, 2006; Romano et al., 2017; Ryu et al., 2019). In contrast to previous works which denoised in one iteration, diffusion models take many small denoising steps towards the data distribution (Ho et al., 2020; Graikos et al., 2022; Karras et al., 2022; Mei & Wu, 2023). Such models use estimates of the so-called _score function_\(\nabla\log p_{\sigma}\)(Hyvarinen & Dayan, 2005), where \(p_{\sigma}\) is the probability density function of the noise input when the noise has standard deviation \(\sigma>0\). The score function \(\nabla\log p_{\sigma}(\widetilde{\mathbf{Z}})\) for a particular noised input \(\widetilde{\mathbf{Z}}\) and small \(\sigma\) points towards the closest point to \(\widetilde{\mathbf{Z}}\) on the data distribution support (Chen et al., 2023; Lu et al., 2023; Yu et al., 2023a), or more generally the modes of the true data distribution, which guides the denoising diffusion model to project \(\mathbf{Z}\) onto the support of the data distribution and diffuse it within this support. In particular, if \(\sigma\) is small, then the denoising iteration in the diffusion model acts as a projection onto the support of the true data distribution. More exposition on diffusion models may be found in Appendix B.
+
+Another approach to removing statistically or geometrically incoherent disturbances from perturbed data, is _lossy compression against learned structures_(Ma et al., 2007; Yu et al., 2020; Psenka et al., 2023; Yu et al., 2023a). Compressed versions of the data would form the _representations_, preserving the data structure while removing the ancillary disturbances. Such an approach has been favored in the construction of previous white-box deep networks (Chan et al., 2022; Yu et al., 2023a) due to explicit information-theoretic criteria for compression, such as the \(R^{c}\) function defined in (2.3). Compression against learned structures has a deep connection to general diffusion models. As we see from the following informally stated theorem, whose rigorous statement and proof is deferred to Appendix C, the score function and conditional rate distortion gradient share the crucial property that they project noisy inputs onto the support of the true input distribution. This suggests a way to bootstrap denoising diffusion models to perform compression against learned statistical or geometric structures; we refer to such models as _structured diffusion_ models.
+
+**Theorem 1** (Informal).: _Under certain conditions, usually observed in practice, if \(\mathbf{Z}\) has the statistical structure discussed in Section 2.2 and \(\widetilde{\mathbf{Z}}\) is a noisy version of \(\mathbf{Z}\) with small noise level, we have that \(\nabla_{\mathbf{z}_{i}}R^{c}(\widetilde{\mathbf{Z}}\mid\mathbf{U}_{[K]})\) points from \(\widetilde{\mathbf{z}}_{i}\) to the nearest \(\mathbf{U}_{k}\)._
+
+This result suggests the following approach to constructing white-box autoencoding networks. First, construct a time-reversible Ito diffusion process (Millet et al., 1989; Song et al., 2020), i.e., the continuous-time backbone behind diffusion models, which compresses the data towards a learned desired statistical and geometric structure, as opposed to a standard Gaussian as in regular diffusion models (Ho et al., 2020). Each layer in the encoder corresponds to a discretized step of this flow, and each layer in the decoder corresponds to a discretized step of its time reversal. The encoder is designed to compress or denoise against the low-dimensional structures in the data to obtain good representations, while the decoder is designed to invert this compression and denoising. Both networks thus need to learn the low-dimensional structure of their input. To learn these structures, we train on masked autoencoding, which as a masked completion task evaluates how well we have learned the low-dimensional structures in the data and internal representations.
+
+### Constructing an Invertible Transformer Layer
+
+In Section 2.1, we described a method to construct a white-box transformer-like encoder network via unrolled optimization meant to compress the data against learned geometric and statistical structures,
+
+Figure 2: The compression-sparsification iteration implemented by each layer of crate, and each encoder layer of crate-mae.
+
+say against a distribution of tokens where each token is marginally distributed as a Gaussian mixture supported on \(\mathbf{U}_{[K]}\). In Section 2.3, we described in general terms an approach that relates denoising and compression to yield a conceptually similar network using the formalism of diffusion models, this time trainable via autoencoding. In this section, we carry out this procedure concretely to obtain an encoder and decoder layer with similarly interpretable operational characteristics.
+
+To measure compression, we use the \(R^{c}\) function defined in (2.3). By using a standard (reverse-time) diffusion process with \(R^{c}\) as a drop-in replacement for the score, we obtain that such a diffusion process may be described by the following stochastic differential equation (SDE) (Song et al., 2020).
+
+\[\mathrm{d}\mathbf{Z}(t)=-\nabla R^{c}(\mathbf{Z}(t)\mid\mathbf{U}_{[K]})\,\mathrm{d}t+ \sqrt{2}\,\mathrm{d}\mathbf{B}(t),\qquad\forall t\in[0,T], \tag{2.7}\]
+
+where \((\mathbf{B}(t))_{t\in[0,T]}\) is a Brownian motion. _As a design choice_, we wish to assert that our encoder and decoder ought to be deterministic, in particular preferring that our encoder-decoder architecture achieves _sample-wise autoencoding_ as opposed to _distribution-wise autoencoding_ or _generation_. Thus we need to construct some ordinary differential equation (ODE) which transports the input probability distribution in the same way as (2.7). Such an equation is readily obtained as the _probability flow ODE_(Song et al., 2020), which itself is commonly used for denoising and sampling (Song et al., 2020; Lu et al., 2022; Song et al., 2023b) and has the form
+
+\[\mathrm{d}\mathbf{Z}(t)=-\nabla R^{c}(\mathbf{Z}(t)\mid\mathbf{U}_{[K]})\,\mathrm{d}t, \qquad\forall t\in[0,T]. \tag{2.8}\]
+
+In particular, the \(\mathbf{Z}(t)\) generated by (2.7) and (2.8) have the same law. A first-order discretization (the discretization scheme being another design choice) of (2.8) with step size \(\kappa\) obtains the iteration:
+
+\[\mathbf{Z}^{\ell+1/2}=\mathbf{Z}^{\ell}+\texttt{MSSA}(\mathbf{Z}^{\ell}\mid\mathbf{U}^{\ell}_{ [K]})\approx\mathbf{Z}^{\ell}-\kappa\nabla R^{c}(\mathbf{Z}^{\ell}\mid\mathbf{U}^{\ell}_{[ K]}), \tag{2.9}\]
+
+where \(\texttt{ISTA}(\cdot)\) was defined in (2.6). Similar to Yu et al. (2023a), in order to optimize the sparse rate reduction of the features, and in particular to sparsify them, we instantiate a learnable dictionary \(\mathbf{D}^{\ell}\in\mathbb{R}^{d\times d}\) and sparsify against it, obtaining
+
+\[\mathbf{Z}^{\ell+1}=\texttt{ISTA}(\mathbf{Z}^{\ell+1/2}\mid\mathbf{D}^{\ell}), \tag{2.10}\]
+
+where \(\texttt{ISTA}(\cdot)\) was defined in (2.5). This yields a two step iteration for the \(\ell^{\mathrm{th}}\) encoder layer \(f^{\ell}\), where \(\mathbf{Z}^{\ell+1}=f^{\ell}(\mathbf{Z}^{\ell})\):
+
+\[\mathbf{Z}^{\ell+1/2}=\mathbf{Z}^{\ell}+\texttt{MSSA}(\mathbf{Z}^{\ell}\mid\mathbf{U}^{\ell}_ {[K]}),\qquad\mathbf{Z}^{\ell+1}=\texttt{ISTA}(\mathbf{Z}^{\ell+1/2}\mid\mathbf{D}^{\ell}). \tag{2.11}\]
+
+This is the same layer as in crate, whose conceptual behavior is illustrated in Figure 2. This equivalence stems from the fact that the diffusion probability flow (2.8) is conceptually and mechanically similar to gradient flow on the compression objective in certain regimes, and so it demonstrates a useful conceptual connection between discretized diffusion and unrolled optimization as iteratively compressing or denoising the signal against the learned data structures.
+
+Note that we parameterized a _different_ local signal model \(\mathbf{U}^{\ell}_{[K]}\) and dictionary \(\mathbf{D}^{\ell}\) at each layer, despite the continuous-time flows in (2.8) using only one (i.e., the final) local signal model. This is because the sparsification step (2.10) transforms the data distribution, and so we require a different local signal model at each layer to model the new (more sparse) data distribution; see Figure 1 for intuition on the iterative transformations. Also, having a different signal model at each layer may allow for more efficient iterative linearization and compression of highly nonlinear structures.
+
+We now construct a matching decoder. The time reversal of the ODE (2.8) is:
+
+\[\mathrm{d}\mathbf{Y}(t)=\nabla R^{c}(\mathbf{Y}(t)\mid\mathbf{U}_{[K]})\,\mathrm{d}t, \qquad\forall t\in[0,T], \tag{2.12}\]
+
+in the sense that the \(\mathbf{Y}(T-t)\) generated by (2.12) has the same law as the \(\mathbf{Z}(t)\) generated by (2.8), assuming compatible initial conditions. A first-order discretization of (2.12) obtains the iteration:
+
+\[\mathbf{Y}^{\ell+1}=\mathbf{Y}^{\ell+1/2}-\texttt{MSSA}(\mathbf{Y}^{\ell+1/2}\mid\mathbf{V}^{ \ell}_{[K]})\approx\mathbf{Y}^{\ell+1/2}+\kappa\nabla R^{c}(\mathbf{Y}^{\ell+1/2}\mid \mathbf{V}^{\ell}_{[K]}), \tag{2.13}\]
+
+where \(\mathbf{V}^{\ell}_{[K]}=(\mathbf{V}^{\ell}_{1},\ldots,\mathbf{V}^{\ell}_{K})\) and each \(\mathbf{V}^{\ell}_{k}\in\mathbb{R}^{d\times p}\) are the bases of the subspaces to "anti-compress" against. In our work, we treat them as _different_ from the corresponding \(\mathbf{U}^{L-\ell}_{k}\), because the discretization of (2.8) and (2.12) is imperfect, and thus we should not expect a \(1\)-\(1\) correspondence between local signal models in the encoder and decoder. To invert the effect of a sparsifying ISTAstep, which we consider as intuitively close to a rotation of the subspace supports to a more statistically incoherent configuration, we merely instantiate another learnable dictionary \(\mathbf{E}^{\ell}\in\mathbb{R}^{d\times d}\) and multiply by it, obtaining the iteration:
+
+\[\mathbf{Y}^{\ell+1/2}=\mathbf{E}^{\ell}\mathbf{Y}^{\ell},\qquad\mathbf{Y}^{\ell+1}=\mathbf{Y}^{\ell+ 1/2}-\texttt{MSSA}(\mathbf{Y}^{\ell+1/2}\mid\mathbf{V}^{\ell}_{[K]}). \tag{2.14}\]
+
+This constructs the \((\ell+1)^{\text{st}}\) layer \(g^{\ell}\) of our decoder. A graphical depiction of the encoder and decoder layers, with layer normalization added to match the implementation, is found in Figure 3.
+
+### A Complete White-Box Transformer-Like Architecture for Autoencoding
+
+As previously discussed, the encoder is the concatenation of a preprocessing map \(f^{\text{pre}}\colon\mathbb{R}^{D\times N}\to\mathbb{R}^{d\times N}\) which is a learnable linear projection \(\mathbf{W}^{\text{pre}}\in\mathbb{R}^{d\times D}\) plus a learnable positional embedding \(\mathbf{E}^{\text{pos}}\in\mathbb{R}^{d\times N}\):
+
+\[f^{\text{pre}}(\mathbf{X})\doteq\mathbf{W}^{\text{pre}}\mathbf{X}+\mathbf{E}^{\text{pos}} \tag{2.15}\]
+
+and \(L\) transformer-like layers \(f^{\ell}\colon\mathbb{R}^{d\times N}\to\mathbb{R}^{d\times N}\) given by
+
+\[f^{\ell}(\mathbf{Z}^{\ell})\doteq\texttt{ISTA}(\mathbf{Z}^{\ell}+\texttt{MSSA}(\mathbf{Z }^{\ell}\mid\mathbf{U}^{\ell}_{[K]})\mid\mathbf{D}^{\ell}),\qquad\forall\ell\in[L], \tag{2.16}\]
+
+omitting layer-norms for simplicity. The decoder is the concatenation of \(L\) transformer-like layers \(g^{\ell}\colon\mathbb{R}^{d\times N}\to\mathbb{R}^{d\times N}\) given by
+
+\[g^{\ell}(\mathbf{Y}^{\ell})\doteq\mathbf{E}^{\ell}\mathbf{Y}^{\ell}-\texttt{MSSA}(\mathbf{E}^{ \ell}\mathbf{Y}^{\ell}\mid\mathbf{V}^{\ell}_{[K]}),\qquad\forall\ell\in[L]-1, \tag{2.17}\]
+
+with a postprocessing map \(g^{\text{post}}\colon\mathbb{R}^{d\times N}\to\mathbb{R}^{D\times N}\) which is a learnable linear map \(\mathbf{W}^{\text{post}}\in\mathbb{R}^{D\times d_{z}}\)
+
+\[g^{\text{post}}(\mathbf{Y}^{L})\doteq\mathbf{W}^{\text{post}}\mathbf{Y}^{L}. \tag{2.18}\]
+
+A full diagram of the autoencoding procedure is given in Figure 1, whence the intuition is that \(f^{\ell}\) and \(g^{L-\ell}\) are mutually (partially) invertible.
+
+Our training procedure seeks to learn the structures in the data distribution, by using a pretext task that measures the degree to which these structures have been learnt. For this, we turn to _masked autoencoding_(He et al., 2022), which "masks out" a large percentage of randomly selected tokens in the input \(\mathbf{X}\) (precise implementation details left to Appendix D.1) and then attempts to reconstruct the whole image, measuring success by the resulting autoencoding objective:
+
+\[L_{\text{MAE}}(f,g)\doteq\mathbb{E}_{\mathbf{X}}\big{[}\|(g\circ f)(\texttt{Mask}( \mathbf{X}))-\mathbf{X}\|_{2}^{2}\big{]}. \tag{2.19}\]
+
+Conceptually, masked autoencoding is a generalization of the classical _matrix completion_ task, which attempts to use low-dimensional structure (either _a priori_ assumed, or learned) to impute missing entries in incomplete data. Indeed, classical matrix completion can be solved efficiently and effectively if and only if the data has _low-dimensional linear structures_(Wright & Ma, 2022), and in this case it extracts these structures and uses them for imputation. Correspondingly, masked autoencoding seeks to extract the potentially nonlinear low-dimensional structures in the data into _representations_, and use these representations to impute the missing entries. Thus, a network that learns well-structured and linearized representations by design, such as crate-mae, fits the role of the network in the masked autoencoding pretext task particularly well. For this reason, we train on masked autoencoding.
+
+Further implementation details of this architecture are discussed in Appendices D.1 and D.2.
+
+Figure 3: Diagram of each encoder layer (_top_) and decoder layer (_bottom_) in crate-mae.
+
+## 3 Empirical Evaluations
+
+In this section, we conduct experiments to evaluate crate-mae on real-world datasets and both supervised and unsupervised tasks. Similarly to Yu et al. (2023), crate-mae is built using simple design choices that we do not claim are optimal. We also do not claim that our results are optimally engineered; in particular, _we do not use the extreme amount of computational resources required to obtain state-of-the-art performance using vision transformer-backed masked autoencoders (MAEs) (He et al., 2022)_. Our goals in this section are to verify that our white-box masked autoencoding model crate-mae has overall promising performance, has several of the same characteristics (such as representation learning and robustness to mask percentage) as the usual masked autoencoder, and finally that the roles of each operator in the crate-mae network align with our theoretical design.
+
+**Network architecture.** We implement the encoder and decoder architectures described in Section 2, with a few changes detailed in Appendix D.1. We consider different model sizes of crate-mae by varying the token dimension \(d\), number of heads \(K\), and number of layers \(L\); such parameters will be kept the same for the encoder and decoder, which is contrary to He et al. (2022) yet totally in line with our white-box derivation. We consider two model sizes, crate-mae-Small and crate-mae-Base; Table 1 displays the model configurations and number of parameters, with a comparison to MAE, showing that crate-mae _uses around 30% of the parameters of MAE with the same model configuration_. A PyTorch-like pseudocode for crate-mae can be found in Appendix D.2, while Appendix D.1 contains more implementation details.
+
+**Datasets and optimization.** We mainly consider ImageNet-1K (Deng et al., 2009) as the main experimental setting for our architecture. We apply the AdamW (Loshchilov and Hutter, 2017) optimizer to train crate-mae models for both pre-training and fine-tuning. When fine-tuning, we also use several commonly used downstream datasets: CIFAR10, CIFAR100 (Krizhevsky et al., 2009),
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline
+**Researchoruction Loss** & crate-mae-Base & MAE-Base \\ \hline \hline Training & 0.285 & 0.240 \\ \hline Validation & 0.317 & 0.267 \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: Top-1 classification accuracy of crate-mae-Small when pre-trained on ImageNet-1K and fine-tuned on classification on CIFAR-10, when pre-trained using different mask percentage (i.e., masking a different number of tokens in each sample). This shows that crate-mae-Small models with 75% of the tokens masked during training tend to have the most structured representations that are useful for downstream tasks, an empirical conclusion that echoes He et al. (2022), but a wide range of mask percentages result in good representations.
+
+\begin{table}
+\begin{tabular}{l c c c c c c c} \hline \hline
+**Model Size** & \(L\) & \(d\) & \(K\) & \(N\) & crate-mae \# Parameters & (CRATE-mae \# Parameters) / (MAE \# Parameters) \\ \hline \hline Small & 12 & 576 & 12 & 196 & 25.4M & - \\ \hline Base & 12 & 768 & 12 & 196 & 44.6M & 0.31 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Model configurations for different sizes of crate-mae, parameter counts, and comparisons to MAE models. Note that MAE does not provide model configurations smaller than Base (He et al., 2022). We observe that crate-mae-Base uses around 30% of the parameters of MAE-Base.
+
+\begin{table}
+\begin{tabular}{l c c c c c c} \hline \hline
+**Model** & ImageNet-1K & CIFAR 10 & CIFAR 100 & Oxford Flowers & Oxford-Pets \\ \hline \hline crate-mae-Base (trained) & 66.2\% & 93.6\% & 72.2\% & 74.7\% & 62.4\% \\ \hline crate-mae-Base (random init) & 53.4\% & 85.1\% & 58.8\% & 38.0\% & 28.8\% \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Top-1 classification accuracy of crate-mae-Base when pre-trained on ImageNet-1K and fine-tuned on classification for various datasets. We compare pre-trained models with models trained from scratch on classification (_“random init”_) using exactly the same experimental conditions. Our results show that the representation learning occurring during pre-training substantially improves performance on downstream tasks.
+
+Oxford Flowers (Nilsback and Zisserman, 2008), and Oxford-IIT-Pets (Parkhi et al., 2012). More details about training and datasets can be found in Appendix D.1.
+
+**Layer-wise function analysis.** First, we confirm that our model actually does do layer-wise compression and sparsification, confirming our conceptual understanding as described in Section 2. In Figure 4, we observe that each layer of the encoder tends to compress and sparsify the input features, confirming our theoretical designing of the role of each operator in the network.
+
+**Autoencoding performance.** In Figure 5, we qualitatively compare the masked autoencoding performance of crate-mae-Base to MAE-Base (He et al., 2022). We observe that both models are able to reconstruct the data well, despite crate-mae using less than a third of the parameters of MAE. In Table 3 we display the average reconstruction loss of crate-mae-Base and MAE-Base, showing a similar quantitative conclusion.
+
+**Representation learning and emerging semantic properties.** In this paragraph, we prove qualitatively and quantitatively that the crate-mae encoder learns high-quality features that match our theoretical understanding. First, in Table 2 we display the performance of crate-mae-Base when fine-tuned for supervised classification on a variety of datasets. We observe that the fine-tuning classification accuracy is much higher than a classification network fine-tuned from a random initialization, showing that the learned representations are useful for downstream tasks and in particular carry high semantic content. In particular, we show that the representations may be used for semantic segmentation. First, by taking the alignment of the representations of each token with the top few principal components of the representations of tokens in each class (precise details in
+
+Figure 4: _Left_: The compression measure \(R^{c}(\mathbf{Z}^{t+1/2}\mid\mathbf{U}^{t}_{[K]})\) at different layers of the encoder. _Right_: the sparsity measure \(\|\mathbf{Z}^{t+1}\|_{0}/(d\cdot N)\), at different layers of the encoder. (Model: crate-mae-Base). We observe that the compression and sparsity improve consistently over each layer and through the whole network.
+
+Figure 5: Autoencoding visualization comparison of crate-mae-Base to MAE-Base (He et al., 2022) with 75% patches masked. We observe that the reconstructions from crate-mae-Base are on par with the reconstructions from MAE-Base, despite using less than \(1/3\) of the parameters.
+
+Appendix D.3), we observe in Figure 6 that the representations are linearized, and that the top few principal components carry semantic structure, in that they clearly align well with tokens belonging to the the semantically meaningful parts of the image. We also examine the behavior of attention heads in the last layer of the encoder; we show in Figure 7 that the attention heads in the MSSA operator in crate-mae truly capture the semantics of the input images, i.e., they "attend" to the semantically meaningful tokens. Such semantic segmentation properties are not clearly observed in standard vision transformers (Caron et al., 2021; Yu et al., 2023b).
+
+## 4 Conclusion
+
+In this work, we uncover a quantitative connection between denoising and compression, and use it to design a conceptual framework for building white-box (mathematically interpretable) transformer-like deep neural networks which can learn using unsupervised pretext tasks, such as masked autoencoding. We show that such models are more parameter-efficient over their empirically designed cousins, achieve promising performance on large-scale real-world imagery datasets, and learn structured representations that contain semantic meaning. This work demonstrates the potential and practicality of white-box networks derived from first principles for tasks outside supervised classification. We thus believe that this work helps to bridge the theory and practice of deep learning, by unifying on both the conceptual and technical level many previously separated approaches including, but not limited to, diffusion and denoising, compression and rate reduction, transformers, and (masked) autoencoding.
+
+Figure 6: Visualizations of the alignment of the top three principal components (in red, blue, and green respectively) of the representations of all tokens in images in a given class against the representations of all tokens in a single image in the class. We observe that the top three principal components are aligned with tokens from parts of the image that carry its semantics.
+
+Figure 7: Visualizations of hand-picked attention map across all attention heads in the last layer of crate-mae-Base for each image. We observe that the attention maps correctly “attend to” (activate strongly on) exactly the parts of the image which are semantically meaningful.
+
+## References
+
+* Abnar and Zuidema (2020) Samira Abnar and Willem Zuidema. Quantifying attention flow in transformers. _arXiv preprint arXiv:2005.00928_, 2020.
+* Albergo et al. (2023) Michael S Albergo, Nicholas M Boffi, and Eric Vanden-Eijnden. Stochastic interpolants: A unifying framework for flows and diffusions. _arXiv preprint arXiv:2303.08797_, 2023.
+* Amir et al. (2022) Shir Amir, Yossi Gandelsman, Shai Bagon, and Tali Dekel. Deep vit features as dense visual descriptors. _ECCVW What is Motion For?_, 2022.
+* Bardes et al. (2021) Adrien Bardes, Jean Ponce, and Yann LeCun. Vicreg: Variance-invariance-covariance regularization for self-supervised learning. _arXiv preprint arXiv:2105.04906_, 2021.
+* Caron et al. (2021) Mathilde Caron, Hugo Touvron, Ishan Misra, Herve Jegou, Julien Mairal, Piotr Bojanowski, and Armand Joulin. Emerging properties in self-supervised vision transformers. In _Proceedings of the IEEE/CVF international conference on computer vision_, pp. 9650-9660, 2021.
+* Chan et al. (2022) Kwan Ho Ryan Chan, Yaodong Yu, Chong You, Haozhi Qi, John Wright, and Yi Ma. Redunet: A white-box deep network from the principle of maximizing rate reduction. _The Journal of Machine Learning Research_, 23(1):4907-5009, 2022.
+* Chen et al. (2023) Minshuo Chen, Kaixuan Huang, Tuo Zhao, and Mengdi Wang. Score approximation, estimation and distribution recovery of diffusion models on low-dimensional data. _arXiv preprint arXiv:2302.07194_, 2023.
+* Chen et al. (2020) Ting Chen, Simon Kornblith, Mohammad Norouzi, and Geoffrey Hinton. A simple framework for contrastive learning of visual representations. In _International conference on machine learning_, pp. 1597-1607. PMLR, 2020.
+* Cover (1999) Thomas M Cover. _Elements of information theory_. John Wiley & Sons, 1999.
+* De Bortoli et al. (2021) Valentin De Bortoli, James Thornton, Jeremy Heng, and Arnaud Doucet. Diffusion schrodinger bridge with applications to score-based generative modeling. _Advances in Neural Information Processing Systems_, 34:17695-17709, 2021.
+* Deng et al. (2009) Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale hierarchical image database. In _2009 IEEE conference on computer vision and pattern recognition_, pp. 248-255. Ieee, 2009.
+* Efron (2011) Bradley Efron. Tweedie's formula and selection bias. _Journal of the American Statistical Association_, 106(496):1602-1614, 2011.
+* Elad & Aharon (2006) Michael Elad and Michal Aharon. Image denoising via sparse and redundant representations over learned dictionaries. _IEEE Transactions on Image processing_, 15(12):3736-3745, 2006.
+* Graikos et al. (2022) Alexandros Graikos, Nikolay Malkin, Nebojsa Jojic, and Dimitris Samaras. Diffusion models as plug-and-play priors. _Advances in Neural Information Processing Systems_, 35:14715-14728, 2022.
+* Gregor & LeCun (2010) Karol Gregor and Yann LeCun. Learning fast approximations of sparse coding. In _Proceedings of the 27th international conference on international conference on machine learning_, pp. 399-406, 2010.
+* He et al. (2022) Kaiming He, Xinlei Chen, Saining Xie, Yanghao Li, Piotr Dollar, and Ross Girshick. Masked autoencoders are scalable vision learners. In _Proceedings of the IEEE/CVF conference on computer vision and pattern recognition_, pp. 16000-16009, 2022.
+* Ho et al. (2020) Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. _Advances in neural information processing systems_, 33:6840-6851, 2020.
+* Hyvarinen (2005) Aapo Hyvarinen. Estimation of Non-Normalized statistical models by score matching. _Journal of machine learning research: JMLR_, 6(24):695-709, 2005. ISSN 1532-4435, 1533-7928. URL [https://www.jmlr.org/papers/v6/hyvarinen05a.html](https://www.jmlr.org/papers/v6/hyvarinen05a.html).
+
+* Hyvarinen and Dayan (2005) Aapo Hyvarinen and Peter Dayan. Estimation of non-normalized statistical models by score matching. _Journal of Machine Learning Research_, 6(4), 2005.
+* Karras et al. (2022) Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-based generative models. _Advances in Neural Information Processing Systems_, 35:26565-26577, 2022.
+* Khrulkov et al. (2022) Valentin Khrulkov, Gleb Ryzhakov, Andrei Chertkov, and Ivan Oseledets. Understanding ddpm latent codes through optimal transport. _arXiv preprint arXiv:2202.07477_, 2022.
+* Krizhevsky et al. (2009) Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+* Li et al. (2022) Mufan Li, Mihai Nica, and Dan Roy. The neural covariance sde: Shaped infinite depth-and-width networks at initialization. _Advances in Neural Information Processing Systems_, 35:10795-10808, 2022.
+* Loshchilov and Hutter (2017) Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. _arXiv preprint arXiv:1711.05101_, 2017.
+* Lu et al. (2022) Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver: A fast ode solver for diffusion probabilistic model sampling in around 10 steps. _Advances in Neural Information Processing Systems_, 35:5775-5787, 2022.
+* Lu et al. (2023) Yubin Lu, Zhongjian Wang, and Guillaume Bal. Mathematical analysis of singularities in the diffusion model under the submanifold assumption, 2023.
+* Ma et al. (2007) Yi Ma, Harm Derksen, Wei Hong, and John Wright. Segmentation of multivariate mixed data via lossy data coding and compression. _IEEE transactions on pattern analysis and machine intelligence_, 29(9):1546-1562, 2007.
+* Ma et al. (2022) Yi Ma, Doris Tsao, and Heung-Yeung Shum. On the principles of parsimony and self-consistency for the emergence of intelligence. _Frontiers of Information Technology & Electronic Engineering_, 23(9):1298-1323, 2022.
+* Mei and Wu (2023) Song Mei and Yuchen Wu. Deep networks as denoising algorithms: Sample-efficient learning of diffusion models in high-dimensional graphical models, 2023.
+* Millet et al. (1989) Annie Millet, David Nualart, and Marta Sanz. Integration by parts and time reversal for diffusion processes. _The Annals of Probability_, pp. 208-238, 1989.
+* Moitra and Risteski (2020) Ankur Moitra and Andrej Risteski. Fast convergence for langevin diffusion with manifold structure. February 2020. URL [http://arxiv.org/abs/2002.05576](http://arxiv.org/abs/2002.05576).
+* Nilsback and Zisserman (2008) Maria-Elena Nilsback and Andrew Zisserman. Automated flower classification over a large number of classes. In _2008 Sixth Indian Conference on Computer Vision, Graphics & Image Processing_, pp. 722-729. IEEE, 2008.
+* Oko et al. (2023) Kazusato Oko, Shunta Akiyama, and Taiji Suzuki. Diffusion models are minimax optimal distribution estimators. _arXiv preprint arXiv:2303.01861_, 2023.
+* Oquab et al. (2023) Maxime Oquab, Timothee Darcet, Theo Moutakanni, Huy Vo, Marc Szafraniec, Vasil Khalidov, Pierre Fernandez, Daniel Haziza, Francisco Massa, Alaaeldin El-Nouby, et al. Dinov2: Learning robust visual features without supervision. _arXiv preprint arXiv:2304.07193_, 2023.
+* Parkhi et al. (2012) Omkar M Parkhi, Andrea Vedaldi, Andrew Zisserman, and CV Jawahar. Cats and dogs. In _2012 IEEE conference on computer vision and pattern recognition_, pp. 3498-3505. IEEE, 2012.
+* Pesneka et al. (2023) Michael Pesneka, Druv Pai, Vishal Raman, Shankar Sastry, and Yi Ma. Representation learning via manifold flattening and reconstruction. _arXiv preprint arXiv:2305.01777_, 2023.
+* Romano et al. (2017) Yaniv Romano, Michael Elad, and Peyman Milanfar. The little engine that could: Regularization by denoising (red). _SIAM Journal on Imaging Sciences_, 10(4):1804-1844, 2017.
+
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bjorn Ommer. High-resolution image synthesis with latent diffusion models. In _2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)_. IEEE, June 2022. doi: 10.1109/cvpr52688.2022.01042. URL [https://ieeexplore.ieee.org/document/9878449/](https://ieeexplore.ieee.org/document/9878449/).
+* Ryu et al. (2019) Ernest Ryu, Jialin Liu, Sicheng Wang, Xiaohan Chen, Zhangyang Wang, and Wotao Yin. Plug-and-play methods provably converge with properly trained denoisers. In _International Conference on Machine Learning_, pp. 5546-5557. PMLR, 2019.
+* Sarkka & Solin (2019) Simo Sarkka and Arno Solin. _Applied stochastic differential equations_, volume 10. Cambridge University Press, 2019.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric A Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. March 2015. URL [http://arxiv.org/abs/1503.03585](http://arxiv.org/abs/1503.03585).
+* Song et al. (2020) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. _arXiv preprint arXiv:2011.13456_, 2020.
+* Song et al. (2021) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-Based generative modeling through stochastic differential equations. In _International Conference on Learning Representations_, 2021. URL [https://openreview.net/forum?id=PxTIG12RRHS](https://openreview.net/forum?id=PxTIG12RRHS).
+* Song et al. (2023a) Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever. Consistency models. March 2023a. URL [http://arxiv.org/abs/2303.01469](http://arxiv.org/abs/2303.01469).
+* Song et al. (2023b) Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever. Consistency models. 2023b.
+* Tibshirani (1996) Robert Tibshirani. Regression shrinkage and selection via the lasso. _Journal of the Royal Statistical Society Series B: Statistical Methodology_, 58(1):267-288, 1996.
+* Vershynin (2018) Roman Vershynin. _High-dimensional probability: An introduction with applications in data science_, volume 47. Cambridge university press, 2018.
+* Vincent (2011) Pascal Vincent. A connection between score matching and denoising autoencoders. _Neural computation_, 23(7):1661-1674, July 2011. ISSN 0899-7667, 1530-888X. doi: 10.1162/NECO_a\(\backslash\)_00142. URL [http://dx.doi.org/10.1162/NECO_a](http://dx.doi.org/10.1162/NECO_a)\(\backslash\)00142.
+* Wright & Ma (2022) John Wright and Yi Ma. _High-dimensional data analysis with low-dimensional models: Principles, computation, and applications_. Cambridge University Press, 2022.
+* Yu et al. (2020) Yaodong Yu, Kwan Ho Ryan Chan, Chong You, Chaobing Song, and Yi Ma. Learning diverse and discriminative representations via the principle of maximal coding rate reduction. _Advances in Neural Information Processing Systems_, 33:9422-9434, 2020.
+* Yu et al. (2023a) Yaodong Yu, Sam Buchanan, Druv Pai, Tianzhe Chu, Ziyang Wu, Shengbang Tong, Benjamin D Haeffele, and Yi Ma. White-Box transformers via sparse rate reduction. June 2023a. URL [http://arxiv.org/abs/2306.01129](http://arxiv.org/abs/2306.01129).
+* Yu et al. (2023b) Yaodong Yu, Tianzhe Chu, Shengbang Tong, Ziyang Wu, Druv Pai, Sam Buchanan, and Yi Ma. Emergence of segmentation with minimalistic white-box transformers. _arXiv preprint arXiv:2308.16271_, 2023b.
+* Zhai et al. (2020) Yuexiang Zhai, Zitong Yang, Zhenyu Liao, John Wright, and Yi Ma. Complete dictionary learning via 1 4-norm maximization over the orthogonal group. _The Journal of Machine Learning Research_, 21(1):6622-6689, 2020.
+
+## Appendix A Other Related Work
+
+In Section 1, we described the approaches to unsupervised learning of low-dimensional structures in the data that were most relevant to the rest of the work. Here, we discuss some other popular alternatives for completeness.
+
+Black-box unsupervised representation learning.On the other end from white-box models, which learn representations from data that have _a priori_ desired structures, are black-box unsupervised learning methods which learn fully data-driven representations. One implementation of this principle includes contrastive learning, which learns representations from computing the statistics of multiple augmentations of the same data point (Chen et al., 2020; Bardes et al., 2021). Another implementation is that of _autoencoding_ models, the most recently popular of which is the _masked autoencoder_ (MAE) (He et al., 2022). Autoencoders attempt to build low-dimensional representations of the data and use them to reconstruct input data; masked autoencoders specifically mask the input data in training and attempt to impute the missing entries through reconstruction. The common point in such unsupervised learning methods so far is that they use _black-box_ neural networks, such as ResNets (Chen et al., 2020) or transformers (Caron et al., 2021), as their back-end. Thus, although they sometimes develop semantically meaningful representations of the data (Chen et al., 2020; Caron et al., 2021; Bardes et al., 2021), they are uninterpretable, and their training procedures and internal mechanisms are opaque.
+
+Deep networks and stochastic dynamics.There are many quantitative rapprochements of deep learning and stochastic dynamics. The most well-known of these is diffusion models, which can be modeled as discretizations of Ito diffusion processes (Song et al., 2020). The neural network is usually trained to estimate the so-called _score function_. Diffusion models can be thought of as implementing a particular approximation to optimal transport between a template distribution and the true data distribution (Khrulkov et al., 2022). Different types of stochastic dynamics useful for generative modeling may be derived from optimal transport between the data distribution and a pre-specified template (De Bortoli et al., 2021; Albergo et al., 2023). However, diffusion models are unique among these methods in that they have an _iterative denoising_ interpretation (Karras et al., 2022), which this work draws on. Such an interpretation has previously been used to construct deep denoising networks from unrolled diffusion processes (Mei and Wu, 2023), instead of just using the deep networks to do black-box estimation of the score function. Similar studies have interpreted deep networks as discretizations of diffusion processes without this particular denoising interpretation (Li et al., 2022), but the aforementioned unrolled iterative denoising strategy is what we draw upon in this work.
+
+## Appendix B Overview of Diffusion Models
+
+In this section, we develop the basics of diffusion models through the language of time-reversible Ito diffusion processes. The coverage adapts that of Millet et al. (1989); Song et al. (2020); Karras et al. (2022).
+
+Consider a generic Ito diffusion process \((\mathbf{Z}(t))_{t\in[0,T]}\), where \(\mathbf{Z}(t)\) is an \(\mathbb{R}^{m}\)-valued random variable, given by the SDE
+
+\[\mathrm{d}\mathbf{Z}(t)=\phi(\mathbf{Z}(t),t)\,\mathrm{d}t+\Gamma(\mathbf{Z}(t),t)\, \mathrm{d}\mathbf{B}(t),\qquad\mathbf{Z}(0)\sim P,\qquad\forall t\in[0,T]\] (B.1)
+
+where \(\mathbf{B}\) is a Brownian motion and \(P\) is some probability measure (in this case representing the data distribution). Here the _drift coefficient_\(\phi\colon\mathbb{R}^{m}\times\mathbb{R}\to\mathbb{R}^{m}\) and _diffusion coefficient_\(\Gamma\colon\mathbb{R}^{m}\times\mathbb{R}\to\mathbb{R}^{m\times m}\) are functions. To make sense of (B.1) and also verify the existence of strong (i.e., pathwise well-defined) solutions, we need some regularity on them, and we choose the following assumption:
+
+1. \(\phi\) and \(\Gamma\) have some spatial smoothness and do not grow too fast, i.e., there is a constant \(K\geq 0\) such that for all \(x\in\mathbb{R}^{m}\) we have \[\sup_{t\in[0,T]}\left[\|\Gamma(x,t)-\Gamma(y,t)\|_{F}+\|\phi(x,t )-\phi(y,t)\|_{2}\right]\leq K\|x-y\|_{2}\] (B.2) \[\sup_{t\in[0,T]}\left[\|\Gamma(x,t)\|_{F}+\|\phi(x,t)\|_{2}\right] \leq K(1+\|x\|_{2}).\] (B.3)In general, \(\mathbf{Z}(t)\) may not have a density w.r.t. the Lebesgue measure on \(\mathbb{R}^{m}\). For example, suppose that \(P\) is supported on some low-dimensional linear subspace (or even a Dirac delta measure), and take \(\Gamma\) to be the orthoprojector onto this subspace. Then \(\mathbf{Z}(t)\) will be supported on this subspace for all \(t\) and thus not have a density w.r.t. the Lebesgue measure. Thus, when further discussing processes of the type (B.1), we make the following assumption
+
+1. \(\mathbf{Z}(t)\) has a probability density function \(p(\cdot,t)\) for all \(t>0\). This is guaranteed by either of the following conditions (Millet et al., 1989): 1. \(\phi\) and \(\Gamma\) are differentiable in \((x,t)\) and have Holder-continuous derivatives, and \(P\) has a density w.r.t. the Lebesgue measure; 2. The event \[\{\mathrm{rank}(\Gamma(\mathbf{Z}(s),s))=m\text{ for all }s\text{ in some neighborhood of }0\}\] (B.4) happens almost surely with respect to the law of the process given by (B.1).
+
+Define
+
+\[\Psi(x,t)\doteq\Gamma(x,t)\Gamma(x,t)^{\top}.\] (B.5)
+
+To discuss time-reversibility, we also need the following local integrability condition, which is another measure of sharp growth of the coefficients (or precisely their derivatives):
+
+1. The functions \((x,t)\mapsto\nabla_{x}\cdot(\Psi(x,t)p(x,t))\) are integrable on sets of the form \(D\times[t_{0},1]\) for \(t_{0}>0\) and \(D\) a bounded subset of \(\mathbb{R}^{m}\): \[\int_{t_{0}}^{1}\int_{D}\|\nabla_{x}\cdot(\Psi(x,t)p(x,t))\|_{2}\,\mathrm{d}x \,\mathrm{d}t<\infty.\] (B.6)
+
+To write the notation out more explicitly,
+
+\[\nabla_{x}\cdot(\Psi(x,t)p(x,t))=\begin{bmatrix}\nabla_{x}\cdot( \Psi^{1}(x,t)p(x,t))\\ \vdots\\ \nabla_{x}\cdot(\Psi^{m}(x,t)p(x,t))\end{bmatrix}\] (B.7) \[\text{where}\qquad\nabla_{x}\cdot(\Psi^{i}(x,t)p(x,t))=\sum_{j=1} ^{m}\frac{\partial}{\partial x_{j}}[\Psi^{ij}(x,t)p(x,t)]\] (B.8)
+
+where \(\Psi^{i}\) is the \(i^{\mathrm{th}}\) row of \(\Psi\) transposed to a column, and \(\Psi^{ij}\) is the \((i,j)^{\mathrm{th}}\) entry of \(\Psi\). Note that Millet et al. (1989) phrases this in terms of an local integrability condition on each \(|\nabla_{x}\cdot(\Psi^{i}(x,t)p(x,t))|\), which would naturally give a local integrability condition on \(\|\nabla_{x}\cdot(\Psi(x,t)p(x,t))\|_{1}\). However, all norms on \(\mathbb{R}^{m}\) are equivalent, and so this leads to a local integrability condition for \(\|\nabla_{x}\cdot(\Psi(x,t)p(x,t))\|_{2}\) as produced. Note that the assumptions do not guarantee that the involved derivatives exist, in which case they are taken in the distributional (e.g., weak) sense, whence they should exist (Millet et al., 1989).
+
+Under assumptions A1--A3, Millet et al. (1989) guarantees the existence of another process \((\mathbf{Y}(t))_{t\in[0,T]}\) such that the laws of \(\mathbf{Z}(t)\) and \(\mathbf{Y}(T-t)\) are the same for all \(t\in[0,T]\). This process \((\mathbf{Y}(t))_{t\in[0,T]}\) is called the _time reversal_ of \((\mathbf{Z}(t))_{t\in[0,T]}\), and is shown to have law given by
+
+\[\mathrm{d}\mathbf{Y}(t)=\overline{\phi}(\mathbf{Y}(t),t)\,\mathrm{d}t+ \overline{\Gamma}(\mathbf{Y}(t),t)\,\mathrm{d}\mathbf{B}^{\prime}(t),\qquad\mathbf{Y}(0) \sim p(\cdot,T),\qquad\forall t\in[0,T]\] (B.9)
+
+where \(\mathbf{B}^{\prime}(t)\) is an independent Brownian motion and
+
+\[\overline{\phi}(x,t) =-\phi(x,T-t)+\frac{\nabla_{x}\cdot[\Psi(x,T-t)p(x,T-t)]}{p(x,T-t)}\] (B.10) \[=-\phi(x,T-t)+\nabla_{x}\cdot\Psi(x,T-t)+\Psi(x,T-t)[\nabla_{x} \log p(x,T-t)],\] (B.11) \[\overline{\Gamma}(x,t) =\Gamma(x,T-t).\] (B.12)
+
+We would next like to develop an ODE which transports the probability mass \(P\) in the same way as (B.1) -- namely, find another process \((\widetilde{\mathbf{Z}}(t))_{t\in[0,T]}\) which has deterministic dynamics, yet hasthe same law as \((\mathbf{Z}(t))_{t\in[0,T]}\). Song et al. (2020) looks at the Fokker-Planck equations (which can be defined, at least in a weak sense, under assumptions A1-A2) and manipulates them to get the following dynamics for \(\widetilde{\mathbf{Z}}(t)\):
+
+\[\mathrm{d}\widetilde{\mathbf{Z}}(t) =\widetilde{\phi}(\widetilde{\mathbf{Z}}(t),\cdot)\,\mathrm{d}t, \qquad\widetilde{\mathbf{Z}}(0)\sim P,\qquad\forall t\in[0,T],\] (B.13) \[\text{where}\qquad\widetilde{\phi}(x,t) =\phi(x,t)-\frac{1}{2}\cdot\frac{\nabla_{x}\cdot[\Psi(x,t)p(x,t)]} {p(x,t)}\] (B.14) \[=\phi(x,t)-\frac{1}{2}\nabla_{x}\cdot\Psi(x,t)-\frac{1}{2}\Psi(x, t)[\nabla_{x}\log p(x,t)].\] (B.15)
+
+Now to get a similar process for \(\mathbf{Y}(t)\), namely a process \((\widetilde{\mathbf{Y}}(t))_{t\in[0,T]}\) which evolves deterministically yet has the same law as \((\mathbf{Y}(t))_{t\in[0,T]}\), we may either take the time reversal of (B.13) or apply the Fokker-Planck method to (B.9), in both cases obtaining the same dynamics:
+
+\[\mathrm{d}\widetilde{\mathbf{Y}}(t) =\widetilde{\widetilde{\phi}}(\widetilde{\mathbf{Y}}(t),t)\,\mathrm{d }t,\qquad\widetilde{\mathbf{Y}}(0)\sim p(\cdot,T),\qquad\forall t\in[0,T]\] (B.16) \[\text{where}\qquad\widetilde{\widetilde{\phi}}(x,t) =-\widetilde{\phi}(x,T-t)\] (B.17) \[=-\phi(x,T-t)+\frac{1}{2}\cdot\frac{\nabla_{x}\cdot[\Psi(x,T-t)p( x,T-t)]}{p(x,T-t)}\] (B.18) \[=-\phi(x,t)+\frac{1}{2}\nabla_{x}\cdot\Psi(x,T-t)+\frac{1}{2}\Psi (x,T-t)[\nabla_{x}\log p(x,T-t)].\] (B.19)
+
+The quantity \(\nabla_{x}\log p(x,t)\) is of central importance; it is denoted the _score at time_\(t\), and we use the notation \(s(x,t)\doteq\nabla_{x}\log p(x,t)\) for it. With this substitution, we have the following dynamics for our four processes:
+
+\[\mathrm{d}\mathbf{Z}(t) =\phi(\mathbf{Z}(t),t)\,\mathrm{d}t+\Gamma(\mathbf{Z}(t),t)\,\mathrm{d} \mathbf{B}(t),\quad\mathbf{Z}(0)\sim P\] (B.20) \[\mathrm{d}\mathbf{Y}(t) =[-\phi(\mathbf{Y}(t),T-t)+\nabla_{x}\cdot\Psi(\mathbf{Y}(t),T-t)+\Psi( \mathbf{Y}(t),T-t)s(\mathbf{Y}(t),T-t)]\,\mathrm{d}t\] (B.21) \[\qquad+\Gamma(\mathbf{Y}(t),T-t)\,\mathrm{d}\mathbf{B}^{\prime}(t),\quad \mathbf{Y}(0)\sim p(\cdot,T)\] (B.22) \[\mathrm{d}\widetilde{\mathbf{Z}}(t) =\left[\phi(\widetilde{\mathbf{Z}}(t),t)-\frac{1}{2}\nabla_{x}\cdot \Psi(\widetilde{\mathbf{Z}}(t),t)-\frac{1}{2}\Psi(\widetilde{\mathbf{Z}}(t),t)s( \widetilde{\mathbf{Z}}(t),t)\right]\mathrm{d}t,\quad\widetilde{\mathbf{Z}}(0)\sim P\] (B.23) \[\mathrm{d}\widetilde{\mathbf{Y}}(t) =\left[\ -\phi(\widetilde{\mathbf{Y}}(t),T-t)+\frac{1}{2}\nabla_{x}\cdot \Psi(\widetilde{\mathbf{Y}}(t),T-t)\right.\] (B.24) \[\qquad+\frac{1}{2}\Psi(\widetilde{\mathbf{Y}}(t),T-t)s(\widetilde{ \mathbf{Y}}(t),T-t)\right]\mathrm{d}t,\quad\widetilde{\mathbf{Y}}(0)\sim p(\cdot,T).\] (B.25)
+
+In practice, one fits an estimator for \(s(\cdot,\cdot)\) and estimates \(p(\cdot,T)\) and runs a discretization of either (B.9) or (B.16) to sample approximately from \(P\). One common instantiation used in diffusion models (Karras et al., 2022) is the so-called _variance-exploding_ diffusion process, which has the coefficient settings
+
+\[\phi(x,t)=0,\qquad\Gamma(x,t)=\sqrt{2}\mathbf{I}_{m}\] (B.26)
+
+which implies that
+
+\[\Psi(x,t)=2\mathbf{I}_{m}.\] (B.27)
+
+This means that the four specified processes are of the form
+
+\[\mathrm{d}\mathbf{Z}(t) =\sqrt{2}\,\mathrm{d}\mathbf{B}(t),\quad\mathbf{Z}(0)\sim P\] (B.28) \[\mathrm{d}\mathbf{Y}(t) =s(\mathbf{Y}(t),T-t)\,\mathrm{d}t+\sqrt{2}\,\mathrm{d}\mathbf{B}^{ \prime}(t),\quad\mathbf{Y}(0)\sim p(\cdot,T)\] (B.29) \[\mathrm{d}\widetilde{\mathbf{Z}}(t) =s(\widetilde{\mathbf{Z}}(t),t)\,\mathrm{d}t,\quad\widetilde{\mathbf{Z}} (0)\sim P\] (B.30) \[\mathrm{d}\widetilde{\mathbf{Y}}(t) =-s(\widetilde{\mathbf{Y}}(t),T-t),\quad\widetilde{\mathbf{Y}}(0)\sim p (\cdot,T).\] (B.31)
+
+Notice that the deterministic flows are actually gradient flows on the score, which concretely reveals a connection between sampling and optimization, and thus between diffusion models (precisely those which use the probability flow ODE to sample) and unrolled optimization networks.
+
+In this context, we can also establish the connection between diffusion networks and iterative denoising. In the variance-exploding setting, we have
+
+\[\mathbf{Z}(t)\sim\mathcal{N}(\mathbf{Z}(0),2t\mathbf{I}_{m}),\] (B.32)
+
+which can be easily computed using results from, e.g., Sarkka & Solin (2019). Thus \(\mathbf{Z}(T)\) is a noisy version of \(\mathbf{Z}(0)\), with noise level increasing monotonically with \(t\), and sampling \(\mathbf{Z}(0)\) from \(\mathbf{Z}(T)\) conceptually removes this noise. Concretely, _Tweedie's formula_(Efron, 2011) says that the optimal denoising function \(\mathbb{E}_{P}[\mathbf{Z}(0)\mid\mathbf{Z}(t)]\) has a simple form in terms of the score function:
+
+\[\mathbb{E}_{P}[\mathbf{Z}(0)\mid\mathbf{Z}(t)]=\mathbf{Z}(t)+2t\cdot s(\mathbf{Z}(t),t).\] (B.33)
+
+In other words, the score function \(s\) points from the current iterate \(\mathbf{Z}(t)\) to the value of the optimal denoising function, so it is a negative multiple of the conditionally-expected noise. Following the score by (stochastic) gradient flow or its discretization is thus equivalent to iterative denoising.
+
+As a last remark, the notation \(p_{\sigma}\) used in Section 2.3 is a short-hand for \(p(\cdot,\sigma^{2}/2)\), whence \(\sigma^{2}=2t\).
+
+## Appendix C Computations
+
+### Rate Reduction Gradient
+
+In this section, we define a basic yet representative signal model for token sets lying near low-dimensional structures, and show that under this model, in a natural regime of parameter scales motivated by the architecture of CRATE applied to standard image classification benchmarks, the operation implemented by taking a gradient step on the compression term of the sparse rate reduction objective (2.1) corresponds to a projection operation at quantization scales \(\varepsilon^{2}\) proportional to the size of the deviation. This leads us in particular to a formal version of the result Theorem 1 stated in Section 2.
+
+Signal model.We consider a distribution over tokens \(\mathbf{Z}\in\mathbb{R}^{d\times N}\) induced by the following natural signal model: each token \(\mathbf{z}_{i}\) is drawn independently from the normalized isotropic Gaussian measure on one of \(K\)\(p\)-dimensional subspaces \(\mathbf{U}_{1},\ldots,\mathbf{U}_{k}\in\mathbb{R}^{d\times p}\),1 which comprise the low-dimensional structure in the observed tokens, then corrupted with i.i.d. Gaussian noise \(\mathcal{N}(\mathbf{0},\frac{\sigma^{2}}{d}\mathbf{I})\); the subspace each token is drawn from is selected uniformly at random, independently of all other randomness in the problem. This signal model therefore corresponds to the setting of uncorrelated tokens, with maximum entropy coordinate distributions within subspaces. Although in general, the ability of crate-mae to capture correlations in the data through the MSSA block is essential, it is natural to first develop our theoretical understanding of the connection between compression and the score function in the uncorrelated setting. We make the following assumptions within this model:
+
+Footnote 1: More precisely, \(\mathbf{z}_{i}\) is distributed according to the pushforward of the normalized isotropic Gaussian measure \(\mathcal{N}(\mathbf{0},\frac{1}{p}\mathbf{I}_{p})\) on \(\mathbb{R}^{p}\) by the bases \(\mathbf{U}_{k}\).
+
+1. Inspired by an ablation of Yu et al. (2023), which suggests that the learned CRATE model on supervised classification on ImageNet has signal models \(\mathbf{U}_{k}\) which are near-incoherent, we will assume that the subspaces \(\mathbf{\tilde{U}}_{k}\) witness \(\mathbf{\tilde{U}}_{k}^{\top}\mathbf{U}_{k^{\prime}}=\mathds{1}_{k=k^{\prime}}\mathbf{I}_ {p}\).
+2. We assume that the relative scales of these parameters conform to the CRATE-Base settings, trained on ImageNet: recall (Table 1) that these parameters are 1. \(d=768\); 2. \(N=196\); 3. \(K=12\); 4. \(p=d/K=64\). In particular, \(d\gg N\gg p\) and \(p\gg N/K\), and \(Kp=d\). We emphasize that these precise parameter values will not play a role in our analysis, only their relative magnitudes.
+
+Formally, let \(\mu(K,p,\sigma^{2})\) denote the probability measure on \(\mathbb{R}^{d\times N}\) corresponding to the distribution specified above. We let \(\mathbf{Z}_{1}\sim\mu\) denote an observation distributed according to this signal model: formally, there exists a (random) map \(i\mapsto k_{i}\), for \(i\in[N]\) and \(k_{i}\in[K]\), such that
+
+\[\mathbf{z}_{\natural i}=\mathbf{U}_{k_{i}}\mathbf{z}_{i}+\mathbf{\delta}_{i},\quad i=1,\ldots,n,\] (C.1)where \(\mathbf{\Delta}=[\mathbf{\delta}_{1}\quad\ldots\quad\mathbf{\delta}_{N}]\sim_{\rm i.i.d.}\)\(\mathcal{N}(\mathbf{0},\frac{\sigma^{2}}{d}\mathbf{I})\), and (independently) \(\mathbf{x}_{i}\sim_{\rm i.i.d.}\)\(\mathcal{N}(\mathbf{0},\frac{1}{2}\mathbf{I}_{p})\). It is convenient to write this observation model in block form. To this end, let \(K_{k}=\sum_{i=1}^{N}\mathds{1}_{k_{i}=k}\) for \(k\in[K]\) denote the number of times the \(k\)-th subspace is represented amongst the columns of \(\mathbf{Z}_{\natural}\) (a random variable). Then by rotational invariance of the Gaussian distribution, we have
+
+\[\mathbf{Z}_{\natural}\stackrel{{ d}}{{=}}\left[\mathbf{U}_{1}\mathbf{X}_{1} \quad\ldots\quad\mathbf{U}_{K}\mathbf{X}_{K}\right]\mathbf{\Pi}+\mathbf{\Delta},\] (C.2)
+
+where \(\stackrel{{ d}}{{=}}\) denotes equality in distribution, \(\mathbf{\Pi}\in\mathbb{R}^{N\times N}\) is a uniformly random permutation matrix, and each \(\mathbf{X}_{k}\in\mathbb{R}^{p\times K_{k}}\). Because of this equality in distribution, we will commit the mild abuse of notation of identifying the block representation (C.2) with the observation model (C.1) that follows the distribution \(\mu\).
+
+**Denoising in the uncorrelated tokens model.** In the uncorrelated tokens model (C.2), the marginal distribution of each column of \(\mathbf{Z}_{\natural}\) is identical, and equal to an equiproportional mixture of (normalized) isotropic Gaussians on the subspaces \(\mathbf{U}_{1},\ldots\mathbf{U}_{k}\), convolved with the noise distribution \(\mathcal{N}(\mathbf{0},\frac{\sigma^{2}}{d}\mathbf{I})\). This marginal distribution was studied as a model for the multi-head attention selection operation in the transformer architecture by Yu et al. (2023a): precisely, they showed (Yu et al., 2023a, SSA.1) that when the perturbation level \(\sigma^{2}\to 0\), the score function for this marginal distribution approximately implements a projection operation onto the nearest subspace \(\mathbf{U}_{k}\).2
+
+Footnote 2: The aspect of (Yu et al., 2023a, §A.1) that renders it an approximation, rather than a true asymptotic equivalence as \(\sigma^{2}\to 0\), is technical difficulties associated with treating the softmax function that arises in the score. At points in the support of the distribution where there is a unique closest subspace \(\mathbf{U}_{k}\), these difficulties do not present, and the equivalence can be obtained straightforwardly.
+
+Hence, we can connect compression, as implemented in the MSSA block of the crate-mae architecture, to denoising in the uncorrelated tokens model by showing that at similar local scales, and for suitable settings of the model parameters, the compression operation implements a projection onto the low-dimensional structure of the distribution, as well.
+
+**Compression operation.** The MSSA block of the crate-mae architecture arises from taking an (approximate) gradient step on the \(R^{c}\) term of the sparse rate reduction objective (2.1). This term writes
+
+\[R^{c}(\mathbf{Z}\mid\mathbf{U}_{[K]})=\frac{1}{2}\sum_{k=1}^{K}\log\det\left(\mathbf{I}+ \beta(\mathbf{U}_{k}^{\top}\mathbf{Z})^{\top}\mathbf{U}_{k}^{\top}\mathbf{Z}\right),\] (C.3)
+
+where
+
+\[\beta=\frac{p}{N\varepsilon^{2}},\] (C.4)
+
+and \(\varepsilon>0\) is the quantization error. Calculating the gradient, we have
+
+\[\nabla_{\mathbf{Z}}R^{c}(\mathbf{Z}\mid\mathbf{U}_{[K]})=\sum_{k=1}^{K}\mathbf{U}_{k}\mathbf{U}_{k }^{\top}\mathbf{Z}\left(\beta^{-1}\mathbf{I}+(\mathbf{U}_{k}^{\top}\mathbf{Z})^{\top}\mathbf{U}_{k }^{\top}\mathbf{Z}\right)^{-1}.\] (C.5)
+
+Minimizing the sparse rate reduction objective corresponds to taking a gradient descent step on \(R^{c}(\cdot\mid\mathbf{U}_{[K]})\). Performing this operation at the observation from the uncorrelated tokens model \(\mathbf{Z}_{\natural}\), the output can be written as
+
+\[\mathbf{Z}^{+}=\mathbf{Z}_{\natural}-\eta\nabla R^{c}(\mathbf{Z}_{\natural}\mid\mathbf{U}_{[K] }),\] (C.6)
+
+where \(\eta>0\) is the step size.
+
+**Main result on projection.** We will see shortly that the behavior of the compression output (C.6) depends on the relative scales of the perturbation about the low-dimensional structure \(\sigma^{2}\) and the target quantization error \(\varepsilon^{2}\).
+
+**Theorem 2**.: _There exist absolute constants \(C,C^{\prime},C^{\prime\prime},C^{\prime\prime\prime}>0\) such that if \(\max\{N,p\}\geq C\), \(N\geq C^{\prime}K^{2}\log K\), and \(p\geq C^{\prime\prime}N/K\), and moreover if \(\sigma\leq 1\) and \(C^{\prime\prime\prime}\beta\sigma\leq\frac{1}{2}\), then it holds on an event of large probability_
+
+\[\mathbf{Z}^{+}=(1-\eta)\mathbf{Z}_{\natural}-\eta\beta\mathcal{P}_{\mathbf{U}_{[K]}}(\mathbf{ \Delta})+\mathbf{\Xi},\] (C.7)_where \(\mathcal{P}_{\mathbf{U}_{k}\left(\varepsilon\right)}\) implements a projection onto the relevant subspaces for each token in the limiting case as \(\varepsilon\to 0\), and \(\mathbf{\Xi}\) is an error term quantified in the proof that is small at sufficiently large problem parameter scales._
+
+Proof.: We start by noticing that, by orthonormality of the subspaces \(\mathbf{U}_{k}\), we have by (C.2)
+
+\[\mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural}=\left[\mathbf{0}\quad\ldots\quad\mathbf{X}_{k}\quad \ldots\quad\mathbf{0}\right]\mathbf{\Pi}+\mathbf{U}_{k}^{\top}\mathbf{\Delta},\] (C.8)
+
+so that
+
+\[\left(\beta^{-1}\mathbf{I}+\left(\mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural}\right)^{\top} \mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural}\right)^{-1}=\mathbf{\Pi}^{\top}\left(\underbrace {\begin{bmatrix}\beta^{-1}\mathbf{I}&&&&\\ &\ddots&&\\ &&\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k}&&\\ &&\ddots&\\ &&\beta^{-1}\mathbf{I}\end{bmatrix}}_{\mathbf{A}_{k}}+\mathbf{\Xi}_{k}\right)^{-1}\mathbf{\Pi},\] (C.9)
+
+because permutation matrices are orthogonal matrices, and where the perturbation \(\mathbf{\Xi}_{k}\) is defined by
+
+\[\mathbf{\Xi}_{k}=\mathbf{\Pi}\mathbf{\Delta}^{\top}\mathbf{U}_{k}\mathbf{U}_{k}^{\top}\mathbf{\Delta} \mathbf{\Pi}^{\top}+\begin{bmatrix}\mathbf{0}&\ldots&\mathbf{\Delta}_{1}^{\top}\mathbf{U}_{k} \mathbf{X}_{k}&\ldots&\mathbf{0}\\ \vdots&&\vdots&\\ \mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{1}&\ldots&\mathbf{\Delta}_{k}^{\top }\mathbf{U}_{k}\mathbf{X}_{k}+\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{k}&\ldots &\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{K}\\ \vdots&&\vdots&\\ \mathbf{0}&\ldots&\mathbf{\Delta}_{K}^{\top}\mathbf{U}_{k}\mathbf{X}_{k}&\ldots&\mathbf{0}\end{bmatrix},\] (C.10)
+
+and where we have defined (implicitly) in addition
+
+\[\left[\mathbf{\Delta}_{1}\quad\ldots\quad\mathbf{\Delta}_{K}\right]=\mathbf{\Delta}\mathbf{ \Pi}^{\top}.\] (C.11)
+
+The matrix \(\mathbf{A}_{k}\succ\mathbf{0}\), so we can write
+
+\[\left(\beta^{-1}\mathbf{I}+(\mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural})^{\top}\mathbf{U}_{k}^{ \top}\mathbf{Z}_{\natural}\right)^{-1}=\mathbf{\Pi}^{\top}\mathbf{A}_{k}^{-1}\left(\mathbf{I}+ \mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\right)^{-1}\mathbf{\Pi},\] (C.12)
+
+from which it follows
+
+\[\mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural}\left(\beta^{-1}\mathbf{I}+(\mathbf{U}_ {k}^{\top}\mathbf{Z}_{\natural})^{\top}\mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural}\right)^ {-1}\] (C.13) \[=\left(\begin{bmatrix}\mathbf{0}&\ldots&\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+ \mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}&\ldots&\mathbf{0}\end{bmatrix}+\mathbf{U}_{k}^{\top} \mathbf{\Delta}\mathbf{\Pi}^{\top}\mathbf{A}_{k}^{-1}\right)\left(\mathbf{I}+\mathbf{\Xi}_{k}\mathbf{ A}_{k}^{-1}\right)^{-1}\mathbf{\Pi}.\] (C.14)
+
+The task before us is therefore to control \(\|\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\|<1\), in order to apply the Neumann series to further simplify this expression. By Lemma 3 and our hypotheses on the problem parameters, we have
+
+\[\|\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\|\leq C\beta\sigma<1,\] (C.15)
+
+with probability at least \(1-e^{-cN/K}-N^{-2}\). We can therefore apply the Neumann series on this event to obtain
+
+\[\mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural}\left(\beta^{-1}\mathbf{I}+(\mathbf{U}_ {k}^{\top}\mathbf{Z}_{\natural})^{\top}\mathbf{U}_{k}^{\top}\mathbf{Z}_{\natural}\right)^{-1}\] (C.16) \[=\left(\begin{bmatrix}\mathbf{0}&\ldots&\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+ \mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}&\ldots&\mathbf{0}\end{bmatrix}+\mathbf{U}_{k}^{\top} \mathbf{\Delta}\mathbf{\Pi}^{\top}\mathbf{A}_{k}^{-1}\right)\left(\mathbf{I}-\mathbf{\Xi}_{k}\mathbf{ A}_{k}^{-1}+\sum_{j=2}^{\infty}(-1)^{j}\left(\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1} \right)^{j}\right)\mathbf{\Pi}.\] (C.17)
+
+We have on the previous event
+
+\[\left\|\sum_{j=2}^{\infty}(-1)^{j}\left(\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\right)^{j} \right\|\leq\sum_{j=2}^{\infty}\bigl{\|}\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\bigr{\|}^ {j}\leq C(\beta\sigma)^{2}\frac{1}{1-C\beta\sigma}\leq C^{\prime}(\beta\sigma) ^{2}.\] (C.18)Moreover, as in the proof of Lemma 3, we have on the previous event that
+
+\[\left\|\mathbf{U}_{k}^{\top}\mathbf{\Delta}\mathbf{\Pi}^{\top}\mathbf{A}_{k}^{-1}\right\|\leq C \beta\sigma.\] (C.19)
+
+Thus, if we define a "main term"
+
+\[\mathbf{M}_{k}=\begin{bmatrix}\begin{bmatrix}\mathbf{0}&\ldots&\mathbf{X}_{k}(\beta^{-1} \mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}&\ldots&\mathbf{0}\end{bmatrix}\begin{bmatrix} \mathbf{I}-\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\end{bmatrix}+\mathbf{U}_{k}^{\top}\mathbf{\Delta}\mathbf{ \Pi}^{\top}\mathbf{A}_{k}^{-1}\end{bmatrix}\mathbf{\Pi},\] (C.20)
+
+we have on the same event as previously
+
+\[\left\|\mathbf{U}_{k}^{\top}\mathbf{Z}_{k}\left(\beta^{-1}\mathbf{I}+(\mathbf{U}_{k}^{\top}\bm {Z}_{k})^{\top}\mathbf{U}_{k}^{\top}\mathbf{Z}_{k}\right)^{-1}-\mathbf{M}_{k}\right\|\leq C (\beta\sigma)^{2}.\] (C.21)
+
+To conclude, we need only study this main term, since \(\mathbf{U}_{k}\) has operator norm \(1\). We first compute
+
+\[\mathbf{U}_{k}^{\top}\mathbf{\Delta}\mathbf{\Pi}^{\top}\mathbf{A}_{k}^{-1}=\mathbf{U}_{k}^{\top} \left[\beta\mathbf{\Delta}_{1}\quad\ldots\mathbf{\Delta}_{k}\left(\beta^{-1}\mathbf{I}+\bm {X}_{k}^{\top}\mathbf{X}_{k}\right)^{-1}\quad\ldots\quad\beta\mathbf{\Delta}_{K}\right].\] (C.22)
+
+We will repeatedly use in the sequel that, by following the proof of Lemma 4, one has that terms of the form \((\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}\) are well-conditioned, so in particular the previous expression can be simplified as
+
+\[\mathbf{U}_{k}^{\top}\mathbf{\Delta}\mathbf{\Pi}^{\top}\mathbf{A}_{k}^{-1}=\mathbf{U}_{k}^{\top} \left[\beta\mathbf{\Delta}_{1}\quad\ldots O(\sigma)\quad\ldots\quad\beta\mathbf{\Delta }_{K}\right],\] (C.23)
+
+where the \(O(\,\cdot\,)\) notation holds with high probability. Next, we recall that \(\mathbf{\Xi}_{k}\) is a sum of two terms; we will do one term at a time for concision. We have first
+
+\[\begin{bmatrix}\mathbf{0}&\ldots&\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_ {k}^{\top}\mathbf{X}_{k})^{-1}&\ldots&\mathbf{0}\end{bmatrix}\mathbf{\Pi}\mathbf{\Delta}^{\top }\mathbf{U}_{k}\mathbf{U}_{k}^{\top}\mathbf{\Delta}\mathbf{\Pi}^{\top}\] (C.24) \[=\begin{bmatrix}\mathbf{0}&\ldots&\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_ {k}^{\top}\mathbf{X}_{k})^{-1}&\ldots&\mathbf{0}\end{bmatrix}\begin{bmatrix}\mathbf{U}_{k} ^{\top}\mathbf{\Delta}_{1}\\ \vdots\\ \mathbf{U}_{k}^{\top}\mathbf{\Delta}_{K}\end{bmatrix}\begin{bmatrix}\mathbf{U}_{k}^{\top} \mathbf{\Delta}_{1}\\ \vdots\\ \mathbf{U}_{k}^{\top}\mathbf{\Delta}_{K}\end{bmatrix}^{\top}\] (C.25) \[=\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}\mathbf{ U}_{k}^{\top}\mathbf{\Delta}_{k}\begin{bmatrix}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{1}\\ \vdots\\ \mathbf{U}_{k}^{\top}\mathbf{\Delta}_{K}\end{bmatrix}^{\top}.\] (C.26)
+
+We then multiply this term by \(\mathbf{A}_{k}^{-1}\) on the right. The mismatched index terms of this expression are small: if \(\mathbf{g}_{i}\) and \(\mathbf{g}_{j}\) are independent \(\mathcal{N}(\mathbf{0},\frac{\sigma^{2}}{d}\mathbf{I}_{d})\) gaussian random vectors, we have
+
+\[\mathbb{P}[|\langle\mathbf{g}_{i},\mathbf{g}_{j}\rangle|>t]\leq 2e^{-cdt^{2}},\] (C.27)
+
+so by taking a union bound and controlling operator norm in Frobenius norm, we have by independence
+
+\[\mathbb{P}\Big{[}\big{\|}\mathbf{\Delta}_{k}^{\top}\mathbf{\Delta}_{k^{\prime}}\big{\|} >C\sqrt{N/Kd}\Big{]}\leq\frac{2\log N/K}{d^{2}}\] (C.28)
+
+if \(k\neq k^{\prime}\). By Lemma 5 applied to \(\mathbf{\Delta}\) (also i.i.d. Gaussian), the \(k\)-th block is close to the identity, in contrast. Next, we have
+
+\[\begin{bmatrix}\mathbf{0}&\ldots&\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_ {k}^{\top}\mathbf{X}_{k})^{-1}&\ldots&\mathbf{0}\end{bmatrix}\begin{bmatrix}\mathbf{0}& \ldots&\mathbf{\Delta}_{1}^{\top}\mathbf{U}_{k}\mathbf{X}_{k}&\ldots&\mathbf{0}\\ \vdots&&\vdots&\vdots\\ \mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{1}&\ldots&\mathbf{\Delta}_{k}^{\top} \mathbf{U}_{k}\mathbf{X}_{k}+\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{k}&\ldots& \mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{K}\\ \vdots&&\vdots&\vdots\\ \mathbf{0}&\ldots&\mathbf{\Delta}_{k}^{\top}\mathbf{U}_{k}\mathbf{X}_{k}&\ldots&\mathbf{0}\end{bmatrix}\] (C.29) \[=\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1} \begin{bmatrix}\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{1}&\ldots& \left(\mathbf{\Delta}_{k}^{\top}\mathbf{U}_{k}\mathbf{X}_{k}+\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{ \top}\mathbf{\Delta}_{k}\right)&\ldots&\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta} _{K}\end{bmatrix}.\] (C.30)
+
+Now multiplying on the right by \(\mathbf{A}_{k}^{-1}\) gives
+
+\[\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}\left[\beta\mathbf{X} _{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{1}\quad\ldots\quad\left(\mathbf{\Delta}_{k }^{\top}\mathbf{U}_{k}\mathbf{X}_{k}+\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{k} \right)\left(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k}\right)^{-1}\quad \ldots\quad\beta\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{K}\right].\] (C.31)Here, the \(k\)-th block is negligible, by Lemma 4 as above--we can write for this term
+
+\[\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}\left[\beta\mathbf{X}_{k }^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{1}\quad\ldots\quad O(\sigma)\quad\ldots \quad\beta\mathbf{X}_{k}^{\top}\mathbf{U}_{k}^{\top}\mathbf{\Delta}_{K}\right].\] (C.32)
+
+We now introduce the notation \(\widetilde{\mathbf{\Delta}}_{k}=\beta\mathbf{\Delta}\) for convenience, which combines the parameters \(\beta\) and \(\sigma\) into one object. We have shown that on the preceding high probability events,
+
+\[\mathbf{M}_{k} =\left(\mathbf{I}-\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X} _{k})^{-1}\mathbf{X}_{k}^{\top}\right)\left[\mathbf{U}_{k}^{\top}\widetilde{\mathbf{\Delta }}_{1}\quad\ldots\quad O(\sigma)\quad\ldots\quad\mathbf{U}_{k}^{\top}\widetilde{ \mathbf{\Delta}}_{K}\right]\] (C.33) \[\quad+\left[O(\sigma^{2}\beta\sqrt{N/Kd})\quad\ldots\quad\mathbf{X}_{ k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}\left(\mathbf{I}-(\beta^{-1} \mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}\right)\right.\ldots\quad O(\sigma^{2} \beta\sqrt{N/Kd})\right].\] (C.34)
+
+At the same time, by Lemma 4, we recall that the matrix inverses in the second term are well-conditioned on the previously-instantiated high probability event. Hence, by Lemma 4, we have with high probability
+
+\[\mathbf{M}_{k} =\left(\mathbf{I}-\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X} _{k})^{-1}\mathbf{X}_{k}^{\top}\right)\left[\mathbf{U}_{k}^{\top}\widetilde{\mathbf{\Delta }}_{1}\quad\ldots\quad O(\sigma)\quad\ldots\quad\mathbf{U}_{k}^{\top}\widetilde{ \mathbf{\Delta}}_{K}\right]\] (C.35) \[\quad+\left[O(\sigma^{2}\beta\sqrt{N/Kd})\quad\ldots\quad\mathbf{X}_{ k}+O(\sqrt{N/d}+N/d)\quad\ldots\quad O(\sigma^{2}\beta\sqrt{N/Kd})\right].\] (C.36)
+
+To obtain the gradient of \(R^{c}\), we sum these terms over \(k\), and prepend \(\mathbf{U}_{k}\) on the left, and \(\mathbf{\Pi}\) on the right. This gives (up to accumulation of the previous errors)
+
+\[\nabla_{\mathbf{Z}}R^{c}(\mathbf{Z}\mid\mathbf{U}_{[K]})=\beta\mathcal{P}_{\mathbf{U}_{[K]}}( \mathbf{\Delta})+\mathbf{Z}_{k}+O(\sigma^{2}\beta\sqrt{NK/d}),\] (C.37)
+
+where \(\mathcal{P}_{\mathbf{U}_{[K]}}\) is defined blockwise (in the \(\mathbf{\Pi}\)-permuted ordering of the columns) by the approximate projection matrices
+
+\[\mathbf{U}_{k}\left(\mathbf{I}-\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k} )^{-1}\mathbf{X}_{k}^{\top}\right)\mathbf{U}_{k}^{\top},\] (C.38)
+
+which become exact projection matrices in the limit as \(\varepsilon\to 0\). 
+
+### Supporting Results
+
+**Lemma 3**.: _Consider \(\mathbf{\Xi}_{k}\) defined in (C.10), and_
+
+\[\mathbf{A}_{k}=\begin{bmatrix}\beta^{-1}\mathbf{I}&&&&&\\ &\ddots&&&\\ &&\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k}&&\\ &&&\ddots&\\ &&&\beta^{-1}\mathbf{I}\end{bmatrix}.\] (C.39)
+
+_Then there exist absolute constants \(C,C^{\prime},C^{\prime\prime}>0\) such that if \(\max\{N,p\}\geq C\), \(N\geq C^{\prime}K^{2}\log K\), and \(p\geq C^{\prime\prime}N/K\), then with \(\mathbf{X}_{k}\) defined as above, we have with probability at least \(1-e^{-N/K}-2e^{-d}-2N^{-2}\) that_
+
+\[\|\mathbf{\Xi}_{k}\mathbf{A}_{k}\|^{-1}\leq c^{\prime}\beta[\sigma^{2}+\sigma(1+\sqrt{ N/d})]\] (C.40)
+
+_for some absolute constants \(c,c^{\prime}>0\)._
+
+Proof.: Note that
+
+\[\mathbf{A}_{k}^{-1}=\begin{bmatrix}\beta\mathbf{I}&&&&\\ &\ddots&&&\\ &&\left(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k}\right)^{-1}&&\\ &&&\ddots&\\ &&&\beta\mathbf{I}\end{bmatrix}.\] (C.41)
+
+We will use the straightforward estimate \(\|\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\|\leq\|\mathbf{\Xi}_{k}\|\|\mathbf{A}_{k}^{-1}\|\) and bound the two matrices' operator norms individually. By the previous expression,
+
+\[\|\mathbf{A}_{k}^{-1}\|=\max\{\beta,\|(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k })^{-1}\|\}\leq\beta,\] (C.42)
+
+because \(\mathbf{X}_{k}^{\top}\mathbf{X}_{k}\succeq\mathbf{0}\), so we need only control the operator norm of \(\mathbf{\Xi}_{k}\). To this end, note the convenient expression
+
+\[\mathbf{X}_{k}=\mathbf{\Pi}\mathbf{\Delta}^{\top}\mathbf{U}_{k}\mathbf{U}_{k}^{\top}\mathbf{\Delta}\mathbf{ \Pi}^{\top}+2\operatorname{sym}\left((\mathbf{\Delta}\mathbf{\Pi}^{\top})^{\top}\left[ \mathbf{0}\quad\ldots\quad\mathbf{U}_{k}\mathbf{X}_{k}\quad\ldots\quad\mathbf{0}\right]\right),\] (C.43)where \(\operatorname{sym}(\,\cdot\,)\) denotes the symmetric part operator. By the triangle inequality, the operator norm of \(\mathbf{X}_{k}\) is no larger than the sum of the operator norms of each term in the previous expression. The operator norm of the first term is no larger than \(\|\mathbf{\Delta}\|^{2}\), because \(\mathbf{\Pi}\) is a permutation matrix and \(\mathbf{U}\mathbf{U}_{k}^{\top}\) is an orthogonal projection. Meanwhile, using that the symmetric part operator is the orthogonal projection onto the space of symmetric matrices, it follows
+
+\[\big{\|}2\operatorname{sym}\big{(}(\mathbf{\Delta}\mathbf{\Pi}^{\top})^{\top}[\mathbf{0} \quad\dots\quad\mathbf{U}_{k}\mathbf{X}_{k}\quad\dots\quad\mathbf{0}]\big{)}\big{\|}\leq 2 \big{\|}(\mathbf{\Delta}\mathbf{\Pi}^{\top})^{\top}[\mathbf{0}\quad\dots\quad\mathbf{U}_{k}\mathbf{X }_{k}\quad\dots\quad\mathbf{0}]\big{\|},\] (C.44)
+
+and then we find as above that the RHS is no larger than \(2\|\mathbf{\Delta}\|\|\mathbf{X}_{k}\|\). With probability at least \(1-2e^{-d}\), by Lemma 6, since \(d\geq N\) we have
+
+\[\|\mathbf{\Delta}\|\leq C\sigma.\] (C.45)
+
+Also, with probability at least \(1-e^{-N/K}+\frac{1}{N^{2}}\), we have
+
+\[\|\mathbf{X}_{k}\|\leq 1+2C\sqrt{N/d}.\] (C.46)
+
+Thus, with probability at least \(1-e^{-N/K}+\frac{1}{N^{2}}-2e^{-d}\), we have
+
+\[2\|\mathbf{\Delta}\|\|\mathbf{X}_{k}\|\leq C\sigma[1+\sqrt{N/d}].\] (C.47)
+
+Thus we have that with probability at least \(1-e^{-N/K}+\frac{1}{N^{2}}-2e^{-d}\), we have
+
+\[\|\mathbf{\Xi}_{k}\mathbf{A}_{k}^{-1}\|\leq c\beta[\sigma^{2}+\sigma(1+\sqrt{N/d})].\] (C.48)
+
+**Lemma 4**.: _There exist absolute constants \(C,C^{\prime},C^{\prime\prime}>0\) such that if \(\max\{N,p\}\geq C\), \(N\geq C^{\prime}K^{2}\log K\), and \(p\geq C^{\prime\prime}N/K\), then with \(\mathbf{X}_{k}\) defined as above, we have with probability at least \(1-e^{-N/K}-e^{-cN/K}-2N^{-2}\) that_
+
+\[\bigg{\|}\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}-\frac{1 }{1+\beta^{-1}}\mathbf{X}_{k}\bigg{\|}\leq\frac{C_{1}\sqrt{N/d}+C_{2}N/d}{(1+ \beta^{-1})^{2}}.\] (C.49)
+
+_for absolute constants \(c,C_{1},C_{2}>0\)._
+
+Proof.: We will use Lemma 5 and our hypotheses to obtain that with probability at least \(1-e^{-N/K}-e^{-cN/K}-2N^{-2}\), it holds
+
+\[\|\mathbf{X}_{k}\|\leq 1+2C\sqrt{N/d},\qquad\|\mathbf{X}_{k}^{\top}\mathbf{X}_{k}-\mathbf{I} \|\leq 4C\sqrt{N/d}.\] (C.50)
+
+In particular, if \(d\geq C^{\prime}N\), we have on the same event
+
+\[\|\mathbf{X}_{k}^{\top}\mathbf{X}_{k}-\mathbf{I}\|\leq\tfrac{1}{2},\] (C.51)
+
+and \(\mathbf{X}_{k}^{\top}\mathbf{X}_{k}\) is well-conditioned. Write
+
+\[\mathbf{\Xi}=\mathbf{X}_{k}^{\top}\mathbf{X}_{k}-\mathbf{I},\] (C.52)
+
+so that
+
+\[(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1} =((1+\beta^{-1})\mathbf{I}+\mathbf{\Xi})^{-1}\] (C.53) \[=\frac{1}{1+\beta^{-1}}\left(\mathbf{I}+\frac{1}{1+\beta^{-1}}\mathbf{ \Xi}\right)^{-1}\] (C.54) \[=\frac{1}{1+\beta^{-1}}\sum_{j=0}^{\infty}\left(-\frac{1}{1+ \beta^{-1}}\right)^{j}\mathbf{\Xi}^{j}\] (C.55) \[=\frac{1}{1+\beta^{-1}}\mathbf{I}+\frac{1}{1+\beta^{-1}}\sum_{j=1}^{ \infty}\left(-\frac{1}{1+\beta^{-1}}\right)^{j}\mathbf{\Xi}^{j},\] (C.56)by the Neumann series. This gives us
+
+\[\left\|(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{-1}-\frac{1}{1 +\beta^{-1}}\mathbf{I}\right\| =\left\|\frac{1}{1+\beta^{-1}}\sum_{j=1}^{\infty}\left(-\frac{1}{1 +\beta^{-1}}\right)^{j}\mathbf{\Xi}^{j}\right\|\] (C.57) \[\leq\frac{1}{1+\beta^{-1}}\sum_{j=1}^{\infty}\left(\frac{1}{1+ \beta^{-1}}\right)^{j}\|\mathbf{\Xi}\|^{j}\] (C.58) \[\leq\frac{1}{1+\beta^{-1}}\sum_{j=1}^{\infty}\left(\frac{4C\sqrt{N /d}}{1+\beta^{-1}}\right)^{j}\] (C.59) \[=\frac{4C\sqrt{N/d}}{(1+\beta^{-1})(1+\beta^{-1}-4C\sqrt{N/d})}.\] (C.60)
+
+We use submultiplicativity of the operator norm to obtain
+
+\[\left\|\mathbf{X}_{k}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{X}_{k})^{- 1}-\frac{1}{1+\beta^{-1}}\mathbf{X}_{k}\right\|\] (C.61) \[\leq\|\mathbf{X}_{k}\|\Big{\|}(\beta^{-1}\mathbf{I}+\mathbf{X}_{k}^{\top}\mathbf{ X}_{k})^{-1}-\frac{1}{1+\beta^{-1}}\mathbf{I}\Big{\|}\] (C.62) \[\leq[1+2C\sqrt{N/d}]\cdot\frac{4C\sqrt{N/d}}{(1+\beta^{-1})(1+ \beta^{-1}-4C\sqrt{N/d})}\] (C.63) \[\leq\frac{C_{1}\sqrt{N/d}+C_{2}N/d}{(1+\beta^{-1})^{2}}.\] (C.64)
+
+**Lemma 5**.: _There exist absolute constants \(C,C^{\prime},C^{\prime\prime}>0\) such that if \(\max\{N,p\}\geq C\), \(N\geq C^{\prime}K^{2}\log K\), and \(p\geq C^{\prime\prime}N/K\), then with \(\mathbf{X}_{k}\) defined as above, we have_
+
+\[\mathbb{P}\Big{[}\|\mathbf{X}_{k}\|\leq 1+2C_{1}\sqrt{N/d}\Big{]}\geq 1-e^{-N/K}- \frac{1}{N^{2}}\] (C.65)
+
+_for some absolute constant \(C_{1}>0\), and moreover_
+
+\[\mathbb{P}\Big{[}\|\mathbf{X}_{k}^{\top}\mathbf{X}_{k}-\mathbf{I}_{K_{k}}\|\leq 4C_{2} \sqrt{N/d}\Big{]}\geq 1-e^{-cN/K}-\frac{1}{N^{2}},\] (C.66)
+
+_for absolute constants \(c,C_{2}>0\)._
+
+Proof.: Let \(n\in[N]\cup\{0\}\). To start, note that conditioned on \(K_{k}=n\), we have that \(\mathbf{X}_{k}\) is an i.i.d. Gaussian matrix with entries of mean zero and variance \(1/p\), and shape \(p\times n\). By conditioning, for any \(f\), we have
+
+\[\mathbb{P}[f(\mathbf{X}_{k})\geq t]=\sum_{n=0}^{N}\mathbb{P}[f(\mathbf{X}_{k})\geq t\mid K _{k}=n]\mathbb{P}[K_{k}=n].\] (C.67)
+
+By its definition, \(K_{k}\) is the sum of \(N\) i.i.d. Bernoulli random variables, each with rate \(1/K\). We have \(\mathbb{E}[K_{k}]=N/K\), so by Lemma 9 we have for an absolute constant \(C>0\)
+
+\[\mathbb{P}\Big{[}|K_{k}-N/K|\geq C\sqrt{N\log N}\Big{]}\leq 1/N^{3}.\] (C.68)
+
+By this bound, we have
+
+\[\mathbb{P}[f(\mathbf{X}_{k})\geq t]\leq\sum_{n=\lfloor N/K-C\sqrt{N\log N}\rfloor }^{\lceil N/K+C\sqrt{N\log N}\rceil}\mathbb{P}[f(\mathbf{X}_{k})\geq t\mid K_{k}=n ]\mathbb{P}[K_{k}=n]+\frac{1}{N^{2}}.\] (C.69)Now we specialize. First, recall that the definition of \(\mathbf{X}_{k}\) includes normalization by \(\frac{1}{\sqrt{p}}\); below we will calculate without this normalization then reintroduce it at the end of the proof. If \(f=\|\cdot\|\) is the operator norm, then we have by Theorem 8 that
+
+\[\mathbb{P}[\|\mathbf{X}_{k}\|\leq t] \geq 1-\sum_{n=\lfloor N/K-C\sqrt{N\log N}\rfloor}^{\lceil N/K+C \sqrt{N\log N}\rceil}\mathbb{P}[\|\mathbf{X}_{k}\|\leq t\mid K_{k}=n]\mathbb{P}[K_{ k}=n]-\frac{1}{N^{2}}\] (C.70) \[\geq 1-\sum_{n=\lfloor N/K-C\sqrt{N\log N}\rfloor}^{\lceil N/K+C \sqrt{N\log N}\rceil}\left(2\exp\left(-n\left(\frac{t-\sqrt{p}}{C\sqrt{n}}-1 \right)^{2}\right)\right)\mathbb{P}[K_{k}=n]-\frac{1}{N^{2}}.\] (C.71)
+
+Here, we can pick \(t=\sqrt{p}+2C\sqrt{N/K}\). Because we then have
+
+\[\frac{t-\sqrt{p}}{C\sqrt{n}}=2\sqrt{\frac{N/K}{n}}\geq 2\sqrt{\frac{N/K}{N/K+C \sqrt{N\log N}}}\geq 2,\] (C.72)
+
+where the last bound holds when \(N\geq C^{\prime\prime}\) and \(N\geq C^{2}K^{2}\log K\), it follows by lower bounding \((x-1)^{2}\geq x-1\) on \(x\geq 1\) (by convexity) that
+
+\[\mathbb{P}\Big{[}\|\mathbf{X}_{k}\|\leq 1+2C\sqrt{N/d}\Big{]} =\mathbb{P}\Big{[}\|\mathbf{X}_{k}\|\leq 1+2C\sqrt{N/(Kp)}\Big{]}\] (C.73) \[\geq 1-\sum_{n=\lfloor N/K-C\sqrt{N\log N}\rfloor}^{\lceil N/K+C \sqrt{N\log N}\rceil}e^{-2n}\mathbb{P}[K_{k}=n]-\frac{1}{N^{2}}\] (C.74) \[\geq 1-\sum_{n=\lfloor N/K-C\sqrt{N\log N}\rfloor}^{\lceil N/K+C \sqrt{N\log N}\rceil}e^{-2n}\mathbb{P}[K_{k}=n]-\frac{1}{N^{2}}\] (C.75) \[\geq 1-e^{-2(N/K-C\sqrt{N\log N})}-\frac{1}{N^{2}}\] (C.76) \[\geq 1-e^{-N/K}-\frac{1}{N^{2}},\] (C.77)
+
+where the last line uses our previous condition on \(N\) relative to \(K\) (possibly worst-casing constants). This gives the result claimed for the operator norm. Next, we proceed for the concentration of the covariance matrix. Using Theorem 8 again, we have
+
+\[\mathbb{P}\big{[}\|\mathbf{X}_{k}^{\top}\mathbf{X}_{k}-\mathbf{I}_{K_{k}}\| \leq t\big{]} \geq 1-\sum_{n=\lfloor N/K-C\sqrt{N\log N}\rfloor}^{\lceil N/K+C \sqrt{N\log N}\rceil}\mathbb{P}\big{[}\|\mathbf{X}_{k}^{\top}\mathbf{X}_{k}-\mathbf{I}_{n} \|\leq t\big{|}\,K_{k}=n\big{]}\mathbb{P}[K_{k}=n]-\frac{1}{N^{2}}\] (C.78) \[\geq 1-2\sum_{n=\lfloor N/K-C\sqrt{N\log N}\rfloor}^{\lceil N/K+C \sqrt{N\log N}\rceil}\exp\left(-p\left(\frac{t}{C^{\prime}}-\sqrt{\frac{n}{p}} \right)^{2}\right)\mathbb{P}[K_{k}=n]-\frac{1}{N^{2}},\] (C.79)
+
+where in the second line we used that \(p\geq C^{\prime}(N/K+C\sqrt{N\log N})\) and \(p\geq C^{\prime}t^{2}\) (we will pick \(t\) shortly so that this holds). We will choose
+
+\[t=2C^{\prime}\sqrt{(N/K+C\sqrt{N\log N})/p},\] (C.80)
+
+i.e., the largest possible \(n\) in the sum, so that the previous conditions are implied since \(p^{2}\geq p\). We then obtain from the above
+
+\[\mathbb{P}\Big{[}\|\mathbf{X}_{k}^{\top}\mathbf{X}_{k}-\mathbf{I}_{K_{k}}\| \leq 4C^{\prime}\sqrt{N/d}\Big{]}\geq 1-e^{-cN/K}-\frac{1}{N^{2}},\] (C.81)
+
+since the preceding conditions imply that \(N/K\) is larger than \(C\sqrt{N\log N}\).
+
+**Lemma 6**.: _With \(\mathbf{\Delta}\) defined as above, we have_
+
+\[\mathbb{P}\Bigg{[}\bigg{\|}\|\mathbf{\Delta}\|-\frac{\sigma\sqrt{N}}{\sqrt{d}}\bigg{|} >C\sigma\Bigg{]}\leq 2\exp(-d).\] (C.82)
+
+_for some absolute constant \(C\)._
+
+Proof.: We apply Theorem 8 with \(\mathbf{A}_{i}=\frac{\sqrt{d}}{\sigma}\mathbf{\delta}_{i}\), so that \(\mathbf{A}=\frac{\sqrt{d}}{\sigma}\mathbf{\Delta}\). Then we have \(\mathbb{E}\mathbf{A}_{i}=0\) and \(\mathbb{E}\mathbf{A}_{i}\mathbf{A}_{i}^{\top}=\mathbf{I}\), and in particular the \(\mathbf{A}_{i}\) are standard Gaussian variables. Thus, the sub-Gaussian constant \(K_{i}=\|A_{i}\|_{\psi_{2}}=1\). Therefore we have
+
+\[2\exp(-t^{2}) \geq\mathbb{P}\Big{[}\|\mathbf{A}\|-\sqrt{N}|>C(\sqrt{d}+t)\Big{]}\] (C.83) \[=\mathbb{P}\Bigg{[}\bigg{|}\frac{\sqrt{d}}{\sigma}\|\mathbf{\Delta}\| -\sqrt{N}\bigg{|}>C(\sqrt{d}+t)\Bigg{]}\] (C.84) \[=\mathbb{P}\Bigg{[}\bigg{\|}\mathbf{\Delta}\|-\frac{\sigma\sqrt{N}}{ \sqrt{d}}\bigg{|}>C\sigma\left(1+\frac{t}{\sqrt{d}}\right)\Bigg{]}.\] (C.85)
+
+We pick \(t=\sqrt{d}\) and (for a different \(C\)) obtain
+
+\[2\exp(-d)\geq\mathbb{P}\Bigg{[}\bigg{\|}\|\mathbf{\Delta}\|-\frac{\sigma\sqrt{N}}{ \sqrt{d}}\bigg{|}>C\sigma\Bigg{]}.\] (C.86)
+
+### Auxiliary Results
+
+**Lemma 7** ((Vershynin, 2018, Lemma 3.4.2)).: _Let \(\mathbf{X}=(X_{1},\ldots,X_{n})\in\mathbb{R}^{n}\) be a random vector with independent, mean zero, sub-Gaussian coordinates \(X_{i}\). Then \(\mathbf{X}\) is a sub-Gaussian random vector with Orlicz norm_
+
+\[\|\mathbf{X}\|_{\psi_{2}}\leq C\max_{i\in[n]}\hskip-1.422638pt\|X_{i}\|_{\psi_{2}}.\] (C.87)
+
+_In particular, if the \(X_{i}\) are standard Gaussians, then \(\|\mathbf{X}\|_{\psi_{2}}\) is constant in \(n\)._
+
+**Theorem 8** ((Vershynin, 2018, Theorem 4.6.1)).: _Let \(\mathbf{A}\) be an \(m\times n\) matrix whose columns \(\mathbf{A}_{i}\) are independent sub-Gaussian, random vectors in \(\mathbb{R}^{m}\) with \(\mathbb{E}\mathbf{A}_{i}=0\) and \(\mathbb{E}\mathbf{A}_{i}\mathbf{A}_{i}^{\top}=\mathbf{I}\). Then for any \(t\geq 0\) we have_
+
+\[\sqrt{n}-CK^{2}(\sqrt{m}+t)\leq\sigma_{m}(\mathbf{A})\leq\sigma_{1}(\mathbf{A})\leq \sqrt{n}+CK^{2}(\sqrt{m}+t)\] (C.88)
+
+_with probability at least \(1-2\exp(-t^{2})\). Here \(K=\max_{i}\|A_{i}\|_{\psi_{2}}\). In particular, we have the slightly stronger result_
+
+\[\bigg{\|}\frac{1}{n}\mathbf{A}\mathbf{A}^{\top}-\mathbf{I}_{m}\bigg{\|}\leq K^{2}\max( \delta,\delta^{2}),\quad\text{where}\quad\delta=C\left(\sqrt{\frac{m}{n}}+ \frac{t}{\sqrt{n}}\right).\] (C.89)
+
+**Lemma 9** (Hoeffding's Inequality, (Vershynin, 2018, Theorem 2.2.6)).: _Let \(X_{1},\ldots,X_{n}\) be independent random variables valued in \([0,1]\). Then for every \(t>0\) we have_
+
+\[\mathbb{P}\Bigg{[}\bigg{|}\sum_{i=1}^{n}X_{i}-\mathbb{E}[X_{i}]\Bigg{|}\geq t \Bigg{]}\leq 2\exp\left(-\frac{2t^{2}}{n}\right).\] (C.90)
+
+## Appendix D Additional Experiment Details
+
+### Experiment Details and Clarifications
+
+In all circumstances, during tokenization we instantiate a trainable class token \(\mathbf{z}_{1}^{\mathrm{cls}}\in\mathbb{R}^{d}\). This class token is never masked out or reconstructed by the autoencoding procedure, and is only used in fine-tuning and segmentation experiments. Specifically, after obtaining features \(\mathbf{Z}^{1}\) of (unmasked) tokens as the output of \(f^{\mathrm{pre}}\), we replace \(\mathbf{Z}^{1}\) by \(\left[\mathbf{z}_{\mathrm{cls}}^{1},\mathbf{Z}^{1}\right]\) (i.e., replacing \(N\) with \(N+1\)) and proceed with the rest of the autoencoding.
+
+For training using masked autoencoding, we follow the recipe of (He et al., 2022). We mask a fixed percentage \(\mu\in[0,1]\) of randomly selected tokens in \(\mathbf{X}\); that is, we randomly sample (without replacement) \(\overline{N}\doteq(1-\mu)N\) image tokens \(\overline{\mathbf{x}}_{i}\) from the whole image token set, collecting them as \(\overline{\mathbf{X}}=[\overline{\mathbf{x}}_{1},\ldots,\overline{\mathbf{x}}_{\overline{ N}}]\). Thus \(\overline{\mathbf{X}}\) is the input to the encoder. In fact, this is conceptually very similar to inputting \(\mathbf{X}\) into the encoder, only with zero vectors \(\mathbf{0}\in\mathbb{R}^{D}\) replacing the \(\mu N\) masked tokens. For the decoder, we pad \(\overline{\mathbf{Z}}\doteq f(\overline{X})\) with \(\mu N\) copies of a trainable "mask token" \(\mathbf{z}_{\mathrm{mask}}\in\mathbb{R}^{d}\), filling in the locations of the tokens that were masked out, apply an additive positional embedding (as in the encoder (2.15)), and then pass it through the decoder transformer layers. The loss is computed only on the masked image patches. Refer to He et al. (2022) for more MAE implementation details.
+
+For fine-tuning using supervised classification, we examine the last-encoder-layer representation of the (so far vestigial) class token \(\mathbf{z}_{\mathrm{cls}}\), which is the first column of the representation \(\mathbf{Z}\). We obtain the unnormalized log-probabilities for the classes as \(\mathbf{u}\doteq\mathbf{W}^{\mathrm{head}}\operatorname{LN}(\mathbf{z}_{\mathrm{cls}})\), where \(\operatorname{LN}\) is a trainable layer-norm and \(\mathbf{W}^{\mathrm{head}}\in\mathbb{R}^{C\times d}\) is a trainable weight matrix, where \(C\) is the number of classes. The output \(\mathbf{u}\in\mathbb{R}^{C}\) is the input to the softmax cross-entropy loss. All model parameters are trainable during fine-tuning.
+
+In all training setups, we average the loss over all samples in the batch.
+
+We pre-train crate-mae on ImageNet-1K (Deng et al., 2009). We employ the AdamW optimizer (Loshchilov and Hutter, 2017). We configure the learning rate as \(3\times 10^{-5}\), weight decay as \(0.1\), and batch size as \(4,096\).
+
+We fine-tune our pre-trained crate-mae on the following target datasets: CIFAR10/CIFAR100 (Krizhevsky et al., 2009), Oxford Flowers-102 (Nilsback and Zisserman, 2008), Oxford-IIIT-Pets (Parkhi et al., 2012). For each fine-tuning task, we employ the AdamW optimizer (Loshchilov and Hutter, 2017). We configure the learning rate as \(5\times 10^{-5}\), weight decay as \(0.01\), and batch size as \(256\).
+
+To allow transfer learning, in all training and evaluations setups we first resize our input data to 224 height and width. For data augmentations during pre-training and fine-tuning, we also adopt several standard techniques: random cropping, random horizontal flipping, and random augmentation (with number of transformations \(n=2\) and magnitude of transformations \(m=14\)).
+
+### PyTorch-Like Pseudocode
+
+``` classISTA:
+#initialization def__init__(self,dim,hidden_dim,dropout=0.,step_size=0.1,  lamb=0.1): super()__init__() self.weight=nn.Parameter(torch.Tensor(dim,dim)) withtorch.no_grad(): init.kaiming_uniform_(self.weight) self.step_size=step_size self.lambd=lambd
+#forwardpass defforward(self,x): x1=F.linear(x,self.weight,bias=None) grad_1=F.linear(x1,self.weight.t(),bias=None) grad_2=F.linear(x,self.weight.t(),bias=None)grad_update=self.step_size*(grad_2-grad_1)-self.step_size*self.lambdoutput=F.relu(x+grad_update)returnoutput
+
+classMSSA: #initialization def__init__(self,dim,heads=8,dim_head=64,dropout=0.): inner_dim=dim_head*headsproject_out=not(heads==1anddim_head==dim) self.heads=heads self.scale=dim_head**-0.5 self.attend=Softmax(dim=-1) self.dropout=Dropout(dropout) self.qkv=Linear(dim,inner_dim,bias=False) self.to_out=Sequential(Linear(inner_dim,dim),Dropout(dropout)) ifproject_outelsenn.Identity()
+#forwardpass defforward(self,x): w=rearrange(self.qkv(x),'bn(hd)->bhnd',h=self.heads) dots=matmul(w,w.transpose(-1,-2))*self.scale attn=self.attend(dots) attn=self.dropout(attn) out=matmul(attn,w) out=rearrange(out,'bhnd->bhn(hd')) returnself.to_out(out) ```
+Listing 2: PyTorch-Like Code for crate-mae Encoder
+``` classCRATE_Encoder:
+#initialization def__init__(self,dim,depth,heads,dim_head,mlp_dim,dropout=0.): self.layers=[] self.depth=depth for__inrange(depth): self.layers.extend([LayerNorm(dim),MSSA(dim,heads,dim_head,dropout]) self.layers.extend([LayerNorm(dim),ISTA(dim,mlp_dim,dropout)])
+#forwardpass defforward(self,x): forln1,attn,ln2,ffinself.layers: x=attn(ln1(x))+x x x=ff(ln2(x_)) returnx ```
+Listing 3: PyTorch-Like Code for crate-mae Decoder
+``` classCRATE_Decoder:
+#initialization def__init__(self,dim,depth,heads,dim_head,mlp_dim,dropout=0.):
+#definelayers self.layers=[] self.depth=depth for__inrange(depth): self.layers.extend([LayerNorm(dim),Linear(in_features=dim,out_features=dim,bias=False)]) self.layers.extend([LayerNorm(dim),MSSA(dim,heads,dim_head,dropout]))
+#forwardpass defforward(self,x): forln1,f_linear,ln2,attninself.layers:
+
+x_ = f_linear(ln1(x))  x = ln2(x_) - attn(ln2(x_))  return x
+
+### Visualization Methodology
+
+In this subsection we formally describe the procedures we used to generate the visualizations used to evaluate the segmentation property of crate-mae in Section 3. Much of this evaluation is the same as in Yu et al. (2023b).
+
+#### d.3.1 Visualizing Attention Maps
+
+We recapitulate the method to visualize attention maps in Abnar and Zuidema (2020); Caron et al. (2021).
+
+For the \(k^{\rm th}\) head at the \(\ell^{\rm th}\) layer of the encoder of crate-mae, we compute the _self-attention matrix_\(\mathbf{A}_{k}^{\ell}\in\mathbb{R}^{N}\) defined as follows:
+
+\[\mathbf{A}_{k}^{\ell}=\begin{bmatrix}A_{k,1}^{\ell}\\ \vdots\\ A_{k,N}^{\ell}\end{bmatrix}\in\mathbb{R}^{N},\quad\text{where}\quad A_{k,i}^{ \ell}=\frac{\exp(\langle\mathbf{U}_{k}^{\ell*}\mathbf{z}_{i}^{\ell},\mathbf{U}_{k}^{\ell*} \mathbf{z}_{\rm cls}^{\ell}\rangle)}{\sum_{j=1}^{N}\exp(\langle\mathbf{U}_{k}^{\ell*} \mathbf{z}_{j}^{\ell},\mathbf{U}_{k}^{\ell*}\mathbf{z}_{\rm cls}^{\ell}\rangle)}.\] (D.1)
+
+where \(z_{\rm cls}^{\ell}\) is the \(\ell^{\rm th}\) layer representation of the class token \(\mathbf{z}_{\rm cls}^{1}\).
+
+We then reshape the attention matrix \(\mathbf{A}_{k}^{L}\) for the last layer \(L\) into a \(\sqrt{N}\times\sqrt{N}\) matrix and visualize the heatmaps as shown in Figure 7. For example, the \(i^{\rm th}\) row and the \(j^{\rm th}\) column element of each heatmap in Figure 7 corresponds to the \(m^{\rm th}\) component of \(\mathbf{A}_{k}^{L}\) if \(m=(i-1)\cdot\sqrt{N}+j\). In Figure 7, we select one attention head \(k\) of crate-mae and visualize the attention matrix \(\mathbf{A}_{k}^{L}\) for each image.
+
+#### d.3.2 PCA Visualizations
+
+As in the previous subsection, we recapitulate the method to visualize the patch representations using PCA from Amir et al. (2022); Oquab et al. (2023); Yu et al. (2023b).
+
+We first select \(J\) images that belong to the same class, \(\{\mathbf{X}_{j}\}_{j=1}^{J}\), and extract the token representations for each image at layer \(\ell\), i.e., \([\mathbf{z}_{j,\rm cls}^{\ell},\mathbf{z}_{j,1}^{\ell},\dots,\mathbf{z}_{j,N}^{\ell}]\) for \(j\in[J]\). In particular, \(\mathbf{z}_{j,i}^{\ell}\) represents the \(i^{\rm th}\) token representation at the \(\ell^{\rm th}\) layer for the \(j^{\rm th}\) image. We then compute the first principal components of \(\widehat{\mathbf{Z}}^{\ell}=\{\widehat{\mathbf{z}}_{1,1}^{\ell},\dots,\widehat{\mathbf{z} }_{1,N}^{\ell},\dots,\widehat{\mathbf{z}}_{J,1}^{\ell},\dots,\widehat{\mathbf{z}}_{J, N}^{\ell}\}\), and use \(\widehat{\mathbf{z}}_{j,i}^{\ell}\) to denote the aggregated token representation for the \(i\)-th token of \(\mathbf{X}_{j}\), i.e., \(\widehat{\mathbf{z}}_{j,i}^{\ell}=[(\mathbf{U}_{k}^{*}\widehat{\mathbf{z}}_{j,i}^{\ell})^ {\top},\dots,(\mathbf{U}_{K}^{*}\widehat{\mathbf{z}}_{j,i}^{\ell})^{\top}]^{\top}\in \mathbb{R}^{(p\cdot K)\times 1}\). We denote the first eigenvector of the matrix \(\widehat{\mathbf{Z}}^{\ell}\widehat{\mathbf{Z}}\) by \(\mathbf{u}_{0}\) and compute the projection values as \(\{\sigma_{\lambda}(\langle\mathbf{u}_{0},\mathbf{z}_{j,i}^{\ell}\rangle)\}_{i,j}\), where \(\sigma_{\lambda}(x)=\begin{cases}x,&|x|\geq\lambda\\ 0,&|x|<\lambda\end{cases}\) is the hard-thresholding function. We then select a subset of token representations from \(\widehat{\mathbf{Z}}\) with \(\sigma_{\lambda}(\langle\mathbf{u}_{0},\mathbf{z}_{j,i}^{\ell}\rangle)>0\). which correspond to non-zero projection values after thresholding, and we denote this subset as \(\widehat{\mathbf{Z}}_{s}\subseteq\widehat{\mathbf{Z}}\). This selection step is used to remove the background (Oquab et al., 2023). We then compute the first three right singular vectors of \(\widehat{\mathbf{Z}}_{s}\) with the first three eigenvectors of the matrix \(\widehat{\mathbf{Z}}_{s}^{*}\widehat{\mathbf{Z}}_{s}\) denoted as \(\{\mathbf{u}_{1},\mathbf{u}_{2},\mathbf{u}_{3}\}\). We define the RGB tuple for each token as:
+
+\[[r_{j,i},g_{j,i},b_{j,i}]=[\langle\mathbf{u}_{1},\mathbf{z}_{j,i}^{\ell}\rangle, \langle\mathbf{u}_{2},\mathbf{z}_{j,i}^{\ell}\rangle,\langle\mathbf{u}_{3},\mathbf{z}_{j,i}^{ \ell}\rangle],\quad i\in[N],\,j\in[J],\mathbf{z}_{j,i}^{\ell}\in\widehat{\mathbf{Z}}_ {s}.\] (D.2)
+
+Next, for each image \(\mathbf{X}_{j}\) we compute \(\mathbf{R}_{j},\mathbf{G}_{j},\mathbf{B}_{j}\), where \(\mathbf{R}_{j}=[r_{j,1},\dots,r_{j,N}]^{\top}\in\mathbb{R}^{d\times 1}\) (similar for \(\mathbf{G}_{j}\) and \(\mathbf{B}_{j}\)). Then we reshape the three matrices into \(\sqrt{N}\times\sqrt{N}\) and visualize the "principal components" of image \(\mathbf{X}_{j}\) via the RGB image \((\mathbf{R}_{j},\mathbf{G}_{j},\mathbf{B}_{j})\in\mathbb{R}^{3\times\sqrt{N}\times\sqrt{N}}\).

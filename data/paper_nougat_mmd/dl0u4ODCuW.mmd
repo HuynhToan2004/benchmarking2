@@ -1,0 +1,716 @@
+# Retro-fallback: retrospective planning
+
+in an uncertain world
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Retrosynthesis is the task of proposing a series of chemical reactions to create a desired molecule from simpler, buyable molecules. While previous works have proposed algorithms to find optimal solutions for a range of metrics (e.g. shortest, lowest-cost), these works generally overlook the fact that we have imperfect knowledge of the space of possible reactions, meaning plans created by the algorithm may not work in a laboratory. In this paper we propose a novel formulation of retrosynthesis in terms of stochastic processes to account for this uncertainty. We then propose a novel greedy algorithm called retro-fallback which maximizes the probability that at least one synthesis plan can be executed in the lab. Using in-silico benchmarks we demonstrate that retro-fallback generally produces better sets of synthesis plans than the popular MCTS and retro(r) algorithms.
+
+## 1 Introduction
+
+Retrosynthesis (planning the synthesis of organic molecules via a series of chemical reactions) is a common task in chemistry with a long history of automation (Vleduts, 1963; Corey & Wipke, 1969). Although the combinatorially large search space of chemical reactions makes naive brute-force methods ineffective, recently significant progress has been made by developing modern machine-learning based search algorithms for retrosynthesis (Strieth-Kalthoff et al., 2020; Tu et al., 2023; Stanley & Segler, 2023). However, there remain obstacles to translating the output of retrosynthesis algorithms into real-world syntheses. One significant issue is that these algorithms have imperfect knowledge of the space of chemical reactions. Because the underlying physics of chemical reactions cannot be efficiently simulated, retrosynthesis algorithms typically rely on data-driven reaction prediction models which can "hallucinate" unrealistic outputs (Zhong et al., 2023), akin to hallucinated outputs in other domains (OpenAI, 2023). This results in synthesis plans which cannot actually be executed.
+
+Although future advances in modelling may reduce the prevalence of infeasible reactions, we think it is unlikely that they will ever be eliminated entirely, as even the plans of expert chemists do not always work on the first try. One possible workaround to failing plans is to produce _multiple_ synthesis plans instead of just a single one: the other plans can act as _backup_ plans in case the primary plan fails. Although existing algorithms may find multiple synthesis plans, they are generally not designed to do so, and there is no reason to expect the plans found will be suitable as _backup_ plans (e.g. they may share steps with the primary plan and thereby fail alongside it).
+
+In this paper, we present several advancements towards retrosynthesis with backup plans. First, in section 3 we explain how uncertainty about whether a synthesis plan will work in the wet lab can be quantified with stochastic processes. We then propose an evaluation metric called _successful synthesis probability_ (SSP) which quantifies the probability that _at least one_ synthesis plan found by an algorithm will work. This naturally captures the idea of producing backup plans. Second, in section 4 we present a novel search algorithm called _retro-fallback_ which greedily optimizes SSP, and explain qualitatively how it avoids potential failure modes of other algorithms. Finally, in section 6 we demonstrate quantitatively that retro-fallback outperforms existing algorithms on an in-silico benchmark. Together, we believe these contributions form a notable advancement towards translating results from retrosynthesis algorithms into the lab.
+
+## 2 Background: what is retrosynthesis?
+
+Let \(\mathcal{M}\) represent the space of molecules and \(\mathcal{R}\) represent the space of reactions, where each reaction transforms a set of _reactant_ molecules in \(2^{\mathcal{M}}\) into a _product_ molecule in \(\mathcal{M}\). Retrosynthesis is usually formalized as a search problem on a graph \(\mathcal{G}\), defined implicitly via a _backward reaction model_\(B:\mathcal{M}\mapsto 2^{\mathcal{R}}\) which defines all possible reactions for a given molecule. Because \(\mathcal{G}\) is combinatorially large, most search algorithms only store a small explicit subgraph \(\mathcal{G}^{\prime}\subseteq\mathcal{G}\). We refer to nodes which may have children in \(\mathcal{G}\) but have no children in \(\mathcal{G}^{\prime}\) as _tip_ nodes.1 In general, search algorithms alternate between selecting tip nodes in \(\mathcal{G}^{\prime}\) and querying \(B\) to add new nodes to \(\mathcal{G}^{\prime}\) until the computational budget is exhausted (a process called _expansion_).
+
+Footnote 1: In contrast with _leaf_ nodes which have no children in \(\mathcal{G}\), e.g. molecules where no reactions are possible.
+
+There are multiple ways to define the nodes and edges of \(\mathcal{G}\). We choose \(\mathcal{G}\) to be an _AND/OR graph_: a directed graph containing nodes for molecules and reactions (Heifets and Jurisica, 2012). Edges exist only from reactions to their reactant molecules and from molecules to reactions that produce them, making \(\mathcal{G}\) bipartite.2 An example of an AND/OR graph is shown in Figure 0.1. Reactions can be naturally associated with "AND nodes" because _all_ of their reactant molecules must be synthesized for the reaction to work, while molecules are associated with "OR nodes" because _any_ reaction can be used to synthesize it. However, to avoid confusion we will simply refer to the nodes of \(\mathcal{G}\) as molecules and reactions. Further details on AND/OR graphs are given in Appendix B.
+
+Footnote 2: Note that in _retrosynthesis_, the edges go in the _opposite_ direction of the chemical reactions.
+
+Given a _target molecule_\(m_{t}\in\mathcal{M}\), the primary goal of retrosynthesis algorithms is to find _synthesis plans_: subtrees \(T\subseteq\mathcal{G}\) rooted at \(m_{t}\) containing at most one reaction to produce each molecule. For these plans to be executable, all tip nodes of \(T\) must be contained in an _inventory_\(\mathcal{I}\subseteq\mathcal{M}\) of buyable molecules. Among all synthesis plans, those with minimum cost or highest quality are preferred, commonly formalized with a scalar cost/value function (Segler et al., 2018; Chen et al., 2020).
+
+## 3 A formulation for retrosynthesis with uncertainty
+
+In this section we present our first main contribution: a formalism to represent uncertainty about whether a synthesis plan will work. We use this to construct a novel evaluation metric called _successful synthesis probability_ and explain how it can be computed.
+
+### Binarized view: "feasible" reactions and "buyable" molecules
+
+To account for synthesis plans not working in the lab, we must first define what it means for a synthesis plan to "work". As mentioned in the introduction, the most obvious failure mode is that one of the reactions in the plan cannot be performed. This could happen for a variety of reasons: it may not produce the desired product, produce dangerous by-products, have a low yield, or require specialized expertise or equipment. Rather than trying to explicitly model these factors, we propose to collapse all nuance into a binary outcome: a reaction is either _feasible_ or _infeasible_. Not only is this easier to model, we note that ultimately if a chemist performs a reaction they will either move to the next step in the synthesis plan or admit defeat and abandon the synthesis plan (a binary outcome). Therefore, for a given chemist and lab, we postulate the existence of a binary "feasibility" function \(f^{*}:\mathcal{R}\mapsto\{0,1\}\) which we will use to create and evaluate synthesis plans.
+
+A second reason why a synthesis plan may not work is the inability to buy one of the starting molecules. This is usually not a significant issue since vendors update their inventories in real time and offer fast delivery, especially for common chemicals. However, this is not always the case: for example, some companies offer large "virtual libraries" with billions of molecules which they _believe_ they can synthesize upon request, but not with 100% reliability. To account for this, we therefore define a binary "buyability" function \(b^{*}:\mathcal{M}\mapsto\{0,1\}\) analogously to \(f^{*}\).
+
+### Representing uncertainty with stochastic processes
+
+If we knew \(f^{*}\) and \(b^{*}\) then retrosynthesis would simply be a search problem (albeit a large one). However, in practice they are unknown. A natural response is therefore to model our _epistemicuncertainty about \(f^{*}\) and \(b^{*}\). One approach is to model point-wise uncertainties, using some mechanism to predict \(P\left(f^{*}(r)=1\right)\) and \(P\left(b^{*}(m)=1\right)\) for all \(r\) and \(m\). Unfortunately, this approach is fundamentally incapable of capturing beliefs about _correlations_ between different outcomes. Instead, we propose to model uncertainty about \(f^{*}\) and \(b^{*}\) directly in function space using _stochastic processes_ (essentially distributions over functions). We define a _feasibility model_\(\xi_{f}\) to be a binary stochastic process over \(\mathcal{R}\), and define a _buyability model_\(\xi_{b}\) to be a binary stochastic process over \(\mathcal{M}\). This model class is very general: the fully-deterministic formulation from section 2 is a special case where \(\xi_{f}\) and \(\xi_{b}\) are degenerate distributions3, while independent outcomes are a special case where _fb_ are independent Bernoulli random variables at all points. Other more interesting stochastic processes which induce correlations could be constructed by putting a prior over the parameters of a model (e.g. Bayesian neural networks (MacKay, 1992)) or using non-parametric models like Gaussian processes (Williams & Rasmussen, 2006).
+
+Footnote 3: Specifically, \(\xi_{f}\) contains only \(f(r)=\mathbf{1}_{3m:r\in B(m)}\) and \(\xi_{b}\) contains only \(b(m)=\mathbf{1}_{m\in\mathcal{I}}\).
+
+Importantly, we _do not_ claim to know what the best model for \(\xi_{f}/\xi_{b}\) is (or even what a _good_ model is). Considering that predicting reaction outcomes is an active research area, and that modelling \(\xi_{f}\) implies not only predicting reaction outcomes but also their correlations, it is unrealistic to expect a perfect model here. Because of this, we will generally discuss \(\xi_{f}/\xi_{b}\) in a model-agnostic way and consider a range of different feasibility models in our experiments.
+
+### New evaluation metric: successful synthesis probability
+
+Given \(f\) and \(b\), a successful synthesis plan \(T\subseteq\mathcal{G}\) must have \(f(r)=1\) for all \(r\in T\) and \(b(m)=1\) for every tip molecule in \(T\). However, if we are uncertain about \(f\) and \(b\) then the distinction between "successful" and "unsuccessful" synthesis plans is not binary: every \(T\) could have some probability of succeeding. What then should be the goal of retrosynthesis?
+
+There is no objectively correct answer to this question. Although one could try to find the synthesis plan with the highest probability of succeeding, we instead propose the goal of maximizing the probability that _any_ synthesis plan \(T\subseteq\mathcal{G}^{\prime}\) is valid. Assuming that a chemist would be willing to try all the synthesis plans in \(\mathcal{G}^{\prime}\), this goal not only captures the spirit of finding good synthesis plans, but backup plans too. Specifically, let \(\text{s}(m;\mathcal{G}^{\prime},f,b)\) represent the _successful synthesis_ of a molecule \(m\): 1 if \(m\) can be bought or synthesized using only feasible reactions in \(\mathcal{G}^{\prime}\), otherwise 0. We write \(\text{s}(m)\) when \(\mathcal{G}^{\prime},f,b\) are clear from context. If \(\text{s}(m_{t};\mathcal{G}^{\prime},f,b)=1\), this implies there is a successful synthesis plan for the target molecule. We then define the _successful synthesis probability_ (SSP) as
+
+\[\bar{\text{s}}(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b})=P_{f\sim\xi_{f},b\sim \xi_{b}}\left[\text{s}(m;\mathcal{G}^{\prime},f,b)=1\right] \tag{1}\]
+
+and propose using SSP to evaluate the success of retrosynthesis algorithms. Unfortunately, although this metric is sensible, it is not easy to compute exactly.
+
+**Theorem 3.1**.: _Unless \(P=NP\), there does not exist an algorithm to compute \(\bar{\text{s}}(m_{t};\mathcal{G}^{\prime},\xi_{f},\xi_{b})\) for arbitrary \(\xi_{f},\xi_{b}\) whose time complexity grows polynomially with the number of nodes in \(\mathcal{G}^{\prime}\)._
+
+The proof of this result is given in Appendix D.1. Essentially we show that every instance of the 3-SAT problem (which is known to be NP-hard) is equivalent to computing whether \(\bar{\text{s}}(m_{t};\mathcal{G}^{\prime},\xi_{f},\xi_{b})>0\) for some choice of \(\mathcal{G}^{\prime},\xi_{f},\xi_{b}\), thereby showing that computing SSP must be at least as hard as 3-SAT. Although this result may appear to show that SSP is not a practical evaluation metric, it does not preclude the existence of an efficient randomized algorithm to _estimate_ SSP. This is exactly what we propose. First, note that given \(f/b\), if we define a similar concept of success for reactions then s can be defined recursively in terms of its children in \(\mathcal{G}^{\prime}\) (provided by the function \(Ch_{\mathcal{G}^{\prime}}\)):
+
+\[\text{s}(m;\mathcal{G}^{\prime},f,b) =\max\left[b(m),\max_{r\in Ch_{\mathcal{G}^{\prime}}(m)}\text{s }(r;\mathcal{G}^{\prime},f,b)\right] \tag{2}\] \[\text{s}(r;\mathcal{G}^{\prime},f,b) =f(r)\prod_{m\in Ch_{\mathcal{G}^{\prime}}(r)}\text{s}(m;\mathcal{ G}^{\prime},f,b). \tag{3}\]
+
+This suggests that dynamic programming can be used to compute \(\text{s}(m_{t};\mathcal{G}^{\prime},f,b)\) in polynomial time (we prove this in Appendix D.2). Second, observe that if \(f\sim\xi_{f},b\sim\xi_{b}\) then \(\text{s}(m_{t};\mathcal{G}^{\prime},f,b)\) is a Bernoulli random variable with mean \(\bar{\mathrm{s}}(m_{t};\mathcal{G}^{\prime},\xi_{f},\xi_{b})\). This suggests a natural estimator:
+
+\[\bar{\mathrm{s}}(m_{t};\mathcal{G}^{\prime},\xi_{f},\xi_{b},k)=\frac{1}{k}\sum_{ i=1}^{k}\mathrm{s}(m_{t};\mathcal{G}^{\prime},f_{k},b_{k})\qquad f_{1},\ldots,f_{k} \sim\xi_{f},\quad b_{1},\ldots,b_{k}\sim\xi_{b}\,. \tag{4}\]
+
+Provided samples can be drawn in polynomial time, equation 4 can also be computed in polynomial time. Of course, the output is only an approximation of the true SSP and there will be some error, but this error is well-characterized and can be made small with a modest number of samples: we discuss this further and provide an error bound in Appendix D.3.
+
+## 4 Retro-fallback: A greedy algorithm to maximize SSP
+
+If one believes that SSP is a sensible evaluation metric, then it makes sense to configure retrosynthesis algorithms to maximize it. Of course, one can run any algorithm independently of \(\xi_{f},\xi_{b}\) and compute SSP _post hoc_. However, "succeeding by coincidence" is not very robust: it is more desirable to use \(\xi_{f},\xi_{b}\) during the search to try to maximize SSP. In this section, we first examine why existing algorithms may nonetheless struggle to maximize SSP, then present our second main contribution: an algorithm explicitly designed to maximize SSP which we call _retro-fallback_.
+
+### Existing algorithms can fail to maximize SSP, even with access to \(\xi_{f},\xi_{b}\)
+
+How could existing retrosynthesis algorithms be configured to maximize SSP? A natural inclination is to set SSP as the "objective" of the algorithm. Unfortunately, existing algorithms do not have an "objective" which can be set arbitrarily. For example, retro* has an independent cost for each reaction and molecule (Chen et al., 2020), MCTS uses a reward function for individual plans (Segler et al., 2018), while algorithms like breadth-first search or proof-number search (Kishimoto et al., 2019) have no customizable rewards or costs of any kind. Because SSP depends on an entire graph and distributions over reaction feasibilities and molecule buyabilities (which may involve correlations), we claim _it is not generally possible to directly set SSP as the objective of previously-proposed retrosynthesis algorithms_ (we argue this in detail in Appendix C). Therefore, at best we can hope to use \(\xi_{f},\xi_{b}\) to optimize some proxy for SSP.
+
+For most algorithms, we believe the closest proxy for maximizing SSP is to optimize for individually successful synthesis plans, or plans containing individually feasible reactions and buyable molecules (we justify this for each algorithm in Appendix C). Intuitively these objectives may seem very similar, but it is not difficult to imagine cases where they differ. Figure 1 illustrates such a case, wherein a synthesis plan with reactions \(r_{1},r_{2}\) has been found and the algorithm must choose between expanding \(m_{3}\) or \(m_{4}\). Individually either molecule could be promising, but any new synthesis route proceeding via \(r_{3}\) will also use \(r_{1}\) and is therefore prone to fail alongside the existing plan if \(r_{1}\) turns out to be infeasible. Even though \(m_{4}\) may not be the best choice in general, an algorithm maximizing SSP would clearly need to account for the interaction between existing and prospective synthesis plans in its decision making, which simply is not possible by reasoning about individual synthesis plans in isolation. This provides compelling motivation to develop algorithms which account for interactions between synthesis plans.
+
+### Ingredients for an informed, greedy search algorithm
+
+A natural starting point for an algorithm specifically designed to maximize SSP is to estimate how different actions might affect SSP, and choose actions accordingly. Theorem 3.1 suggests that computing this exactly will scale poorly to larger search graphs, and therefore we assert that the basis
+
+Figure 1: AND/OR graph illustrating how maximizing SSP can be different from finding individually successful synthesis plans (cf. 4.1). Green nodes are part of a synthesis plan, red nodes are not.
+
+of any efficient algorithm must be _samples_ from \(\xi_{f},\xi_{b}\). Furthermore, equations 2-3 show how the success of any given node in \(\mathcal{G}^{\prime}\) can be computed reasonably efficiently in terms of the success values of other nodes. This broadly suggests it might be possible to modify equations 2-3 to perform _counterfactual reasoning_: i.e. predicting what \(\mathsf{s}(m_{t};\mathcal{G}^{\prime},f,b)\)_could be_ if \(\mathcal{G}^{\prime}\) were modified.
+
+Since the "actions" available to a search algorithm are expanding one or more tip nodes in \(\mathcal{G}^{\prime}\), the obvious counterfactual to consider is "what would happen if a node was expanded?" For a tip molecule \(m\), we have that \(\mathsf{s}(m;\mathcal{G},f,b)=b(m)\) from equation 2. If \(b(m)=1\) then expanding \(m\) cannot change \(\mathsf{s}(m)\) (it is already at its maximum value), but if \(b(m)=0\) then it is possible that \(\mathsf{s}(m)\) will change to \(1\) upon expansion. This is a natural entry point for a _search heuristic_: let \(h:\mathcal{M}\mapsto[0,1]\) be a heuristic function mapping molecules4 to probabilities that \(\mathsf{s}(m)\) will become \(1\) upon expansion (assuming \(b(m)=0\)).
+
+Footnote 4: In principle we could also let \(h\) depend on \(f\) and \(b\), but we choose not to (this will allow us to reuse the heuristic across all samples from \(f\) and \(b\) later). Further discussion in Appendix E.3.
+
+This suggests a simple greedy algorithm: at each time step, choose a tip node which is estimated to maximally improve \(\mathsf{s}(m_{t})\) upon expansion. However, even without fully developing such an algorithm we can confidently say that it would not be very effective in practice. The key reason is that in equation 3, the success of a reaction requires the success of _all_ its reactants. If a reaction has more than one reactant which is not already successful, then no _single_ action can change that outcome, causing a greedy algorithm to never expand such molecule. This would limit the simple greedy algorithm to finding only "linear" plans (where at most one reactant requires synthesis), instead of more challenging "convergent" plans with multiple branches.
+
+To address this, we take inspiration from the greedy retro* algorithm (Chen et al., 2020) and instead consider the counterfactual of simultaneously expanding all tip nodes on an _entire synthesis plan_\(T\subseteq\mathcal{G}^{\prime}\). We assume that expanding a synthesis plan \(T\) amounts to setting \(\mathsf{s}(m)=1\) for all non-buyable tip nodes \(m\in T\) with \(\mathsf{s}(m)=0\)_independently_ with probability \(h(m)\). We then define \(\rho(m;\mathcal{G}^{\prime},f,b,h)\) to be the largest expected value of \(\mathsf{s}(m_{t};T,f,b)\) under this expansion scenario across all synthesis plans \(T\subseteq\mathcal{G}^{\prime}\) rooted at \(m_{t}\) and which contain \(m\) (we write \(\rho(m)\) when \(\mathcal{G}^{\prime},f,b,h\) are clear from context). \(\rho\) essentially measures the chance that expanding \(m\) could yield a new successful synthesis plan. Although computing \(\rho\) may seem to require considering a combinatorially large number of synthesis plans \(T\) (an approach which would scale poorly to large \(\mathcal{G}^{\prime}\)), because the expansion outcomes were assumed to be independent all optimal plans will contain sub-plans which are also optimal. This allows \(\rho\) to be efficiently computed using dynamic programming.
+
+As an intermediate quantity to efficiently compute \(\rho\), we define \(\psi(m;\mathcal{G}^{\prime},f,b,h)\) to be the largest expected value of \(\mathsf{s}(m;T,f,b)\) obtained across all synthesis plans \(T\subseteq\mathcal{G}^{\prime}\) rooted at \(m\) under the expansion scenario above (we write \(\psi(m)\) when \(\mathcal{G}^{\prime},f,b,h\) are clear from context). Although \(\psi\) and \(\rho\) have similar definitions they have an important difference: \(\rho(m)\) is a hypothetical success probability of a synthesis plan involving both \(m\) and \(m_{t}\), while \(\psi(m)\) is a hypothetical success probability of a synthesis plan involving just \(m\). This makes \(\psi\) effectively a less constrained version of \(\rho\). Note that definition implies that \(\psi(m_{t})=\rho(m_{t})\). Because of independence, optimal plans \(T\) which produce the value of \(\psi(m)\) will consist of sub-plans which are also individually optimal. This allows us to define \(\psi\) implicitly with the recurrence relation:
+
+\[\psi(m;\mathcal{G}^{\prime},f,b,h) =\begin{cases}\max\left[b(m),h(m)\right]&\text{(Tip molecule)}\\ \max\left[b(m),\max_{r\in Ch_{\mathcal{G}^{\prime}}(m)}\psi(r;\mathcal{G}^{ \prime},f,b,h)\right]&\text{(Non-tip molecule)}\end{cases} \tag{5}\] \[\psi(r;\mathcal{G}^{\prime},f,b,h) =f(r)\prod_{m\in Ch_{\mathcal{G}^{\prime}}(r)}\psi(m;\mathcal{G} ^{\prime},f,b,h)\;. \tag{6}\]
+
+The assumption of independent expansion outcomes also implies that an optimal plan \(T\) which achieves \(\rho(n)\) for a node \(n\in\mathcal{G}^{\prime}\) can be obtained by modifying the optimal plan for a parent of \(n\) to include the plan \(T^{\prime}\) that optimally produces \(n\) (and attains \(\psi(n)\)). This yields the following recursive definition of \(\rho\) in terms of its parents (given by \(Pa_{\mathcal{G}^{\prime}}\)):
+
+\[\rho(m;\mathcal{G}^{\prime},f,b,h) =\begin{cases}\psi(m;\mathcal{G}^{\prime},f,b,h)&\text{$m$ is root node}\\ \max_{r\in Pa_{\mathcal{G}^{\prime}}(m)}\rho(r;\mathcal{G}^{\prime},f,b,h)& \text{all other $m$}\end{cases} \tag{7}\] \[\rho(r;\mathcal{G}^{\prime},f,b,h) =\begin{cases}0&\psi(r;\mathcal{G}^{\prime},f,b,h)=0\\ \rho(Pa_{\mathcal{G}^{\prime}}(r))\frac{\psi(r)}{\psi(Pa_{\mathcal{G}^{\prime}} (r))}&\psi(r;\mathcal{G}^{\prime},f,b,h)>0\end{cases} \tag{8}\]```
+0: target molecule \(m_{t}\), max iterations \(L\), backward reaction model \(B\), search heuristic \(h\)
+0: samples \(f_{1},\ldots,f_{k}\sim\xi_{f}\), \(b_{1},\ldots,b_{k}\sim\xi_{b}\)
+1:\(\mathcal{G}^{\prime}\gets m_{t}\)
+2:for\(i\) in \(1,\ldots,L\)do
+3:for\(j\) in \(1,\ldots,k\)do
+4: Compute \(\operatorname{s}(\cdot;\mathcal{G}^{\prime},f_{j},b_{j})\) for all nodes using equations 2-3
+5: Compute \(\psi(\cdot;\mathcal{G}^{\prime},f_{j},b_{j},h)\) for all nodes using equations 5-6
+6: Compute \(\rho(\cdot;\mathcal{G}^{\prime},f_{j},b_{j},h)\) for all nodes using equations 7-8
+7:endfor
+8:\(E\leftarrow\) all tip nodes in \(\mathcal{G}^{\prime}\)
+9: Terminate early if \(|E|=0\) OR \(\operatorname{s}(m_{t};\mathcal{G}^{\prime},f_{j},b_{j})=1\)\(\forall j\)
+10:\(m_{e}\leftarrow\arg\max_{m\in E}\alpha(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b},h)\) (cf. equation 9, breaking ties arbitrarily)
+11: Add all reactions and molecules from \(B(m_{e})\) to \(\mathcal{G}^{\prime}\)
+12:endfor
+13:return\(\mathcal{G}^{\prime}\)
+```
+
+**Algorithm 1** Retro-fallback algorithm
+
+More details on these equations are given in Appendix E.1. Taken together, these equations suggest a two-stage procedure to compute \(\rho\) for all tip nodes: first pass information "up" the graph using equations 5-6 to compute \(\psi\) for all nodes, then pass information "down" the graph using equations 7-8 to compute \(\rho\) for all nodes. The only remaining question is how efficient this procedure can be. If \(\mathcal{G}^{\prime}\) is acyclic then \(\psi\) and \(\rho\) can be calculated in linear time by iterating equations 5-6 from tip nodes to the root, then iterating equations 7-8 from root to tip nodes. If there are cycles then the cost could potentially be larger, but in Appendix D.2 we prove it is at most quadratic. In any case, it is clear that \(\psi\) and \(\rho\) can form the basis for an efficient search algorithm.
+
+### Retro-fallback: a full greedy algorithm
+
+Creating a full greedy algorithm requires aggregating information across many samples from \(\xi_{f}\) and \(\xi_{b}\) to decide which tip node to expand at each step. Recalling our motivation of producing synthesis plans with backup plans, we propose to greedily expand molecules which are predicted to form successful synthesis plans _in scenarios where all existing synthesis plans currently fail_. Specifically, we propose to choose molecules by maximizing the objective
+
+\[\alpha(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b},h)=\mathbb{E}_{f\sim\xi_{f},b \sim\xi_{b}}\left[\mathbf{1}_{\operatorname{s}(m_{t};\mathcal{G}^{\prime},f,b )=0}\left[\rho(m;\mathcal{G}^{\prime},f,b,h)\right]\right]\;, \tag{9}\]
+
+which is proportional to the expected value of \(\rho(m)\) conditioned on \(\operatorname{s}(m_{t})=0\). We call the resulting algorithm _retro-fallback_ (from "retro-synthesis with fallback plans") and state it explicitly in Algorithm 1. The sections are colour-coded for clarity. After initializing \(\mathcal{G}^{\prime}\) to just the target molecule, the algorithm performs \(L\) iterations of expansion (although this termination condition could be changed as needed). In each iteration, first the values of \(\operatorname{s}\), \(\psi\), and \(\rho\) are computed for each sample.5 Next, the algorithm checks whether there are no nodes to expand or whether the root molecule is synthesized for every sample, and if so terminates (both of these conditions mean no further improvement is possible). Finally, a tip node maximizing equation 9 is chosen and used to expand \(\mathcal{G}^{\prime}\).
+
+Footnote 5: This order is chosen because \(\operatorname{s}\) depends only on \(f\) & \(b\), \(\psi\) depends on \(\operatorname{s}\), and \(\rho\) depends on \(\psi\). Because the optimal algorithm to compute \(\operatorname{s}\), \(\psi\), \(\rho\) may depend on \(\mathcal{G}^{\prime}\), we only specify this computation generically.
+
+A practical implementation of retro-fallback may look slightly different than Algorithm 1. In particular because a full sample from \(\xi_{f}\) or \(\xi_{b}\) contains outcomes for every possible molecule or reaction, in practice one would only store outcomes for nodes in \(\mathcal{G}^{\prime}\) and sample from the posterior stochastic processes when new nodes are added. Vectorized computation could also be used instead of explicit for loops. We refer the reader to Appendix E for further discussion about the design and implementation of retro-fallback.
+
+## 5 Related Work
+
+Mechanistically, retro-fallback most closely resembles retro* (Chen et al., 2020): both perform a bottom-up and top-down update to determine the value of each potential action and select actionsgreedily. In fact, in the special case where costs are defined to be negative log probabilities then the updates for \(\psi\) and \(\rho\) are essentially equivalent to the "reaction number" and "retro(r) value" updates from (Chen et al., 2020). However, in general the update equations are not equivalent. Additionally, retro-fallback performs its updates for many samples from \(\xi_{f}\) and \(\xi_{b}\) and combines information from all samples to make a decision, while retro(r) uses only a single cost. This is what allows retro-fallback to directly optimize SSP, while retro(r) cannot. As explained in Appendix C, this ability also distinguishes retro-fallback from other search algorithms such as MCTS (Segler et al., 2018) and proof-number search (Kishimoto et al., 2019).
+
+Prior works have also considered planning in stochastic graphs, albeit in other contexts. For example, the "Canadian Traveller Problem" and its variants Papadimitriou & Yannakakis (1991) study search on a graph where edges can be randomly deleted. However, this is an _online_ problem, meaning that the planning algorithm learns about edge deletions during the planning process. In contrast, our algorithm assumes _offline_ planning because chemists desire complete synthesis plans _before_ performing any lab experiments.
+
+Lastly, we briefly comment on several research topics which are only tangentially related (deferring fuller coverage to Appendix G). Works proposing search heuristics for retrosynthesis search algorithms (G.1) complement rather than compete with our work: such heuristics could also be applied to retro-fallback. Generative models to produce synthesis plans (G.2) effectively also function as heuristics. Finally, methods to predict individual chemical reactions are sometimes also referred to as "retrosynthesis models" (G.3). Retro-fallback solves a different problem: it is a _multi-step_ search algorithm which would _use_ a reaction prediction model to define the search graph.
+
+## 6 Experiments
+
+In this section we evaluate retro-fallback experimentally. The key question we seek to answer is whether retro-fallback does indeed maximize SSP more effectively than existing algorithms. We also investigate retro-fallback's runtime and the impact of the number of samples from \(\xi_{f}\), \(\xi_{b}\). In the main text we present highlights and key results; see Appendix F for complete details.
+
+### Experiment Setup
+
+We have based our experiment design on the USPTO benchmark from Chen et al. (2020), which has been widely used to evaluate multi-step retrosynthesis algorithms. However, because this benchmark does not include a feasibility or buxability model we have made some adaptations to make it suitable for our problem setting. Importantly, because we do not know what the "best" feasibility model is, we instead test several feasibility models in the hope that the conclusions of our experiments could potentially generalize to future, more advanced feasibility models. We summarize the setup below and refer the reader to Appendix F.1 for further details.
+
+We base all of our feasibility models on the pre-trained template classifier from Chen et al. (2020) restricted to the top-50 templates. We vary our feasibility model across two axes: the _marginal_ feasibility assigned to each reaction and the _correlation_ between feasibility outcomes. Marginally, we consider a constant value (C) and a value which decreases with the rank (R) for marginal feasibility. For correlations we consider all outcomes being independent (I) or determined by a latent GP model (G) which positively correlates similar reactions. Details of these models are given in Appendix F.1.1. Analogous to Chen et al. (2020), we create a buyability model based on eMolecules library, although we use the September 2023 version and exclude molecules with excessively long shipping times (details in Appendix F.1.2).
+
+We compare retro-fallback to breadth-first search (an uninformed search algorithm) and heuristic-guided algorithms retro(Chen et al., 2020) and MCTS (Segler et al., 2018; Genheden et al., 2020; Coley et al., 2019). MCTS and retro* were re-implemented and adapted to maximize SSP, which most notably entailed replacing costs or rewards from the backward reaction model \(B\) with quantities derived from \(\xi_{f}\) and \(\xi_{b}\) (see Appendices C and F.1.4 for details) and standardizing their search heuristics. All algorithms are run with a budget of 200 calls to \(B\). The presence of heuristics makes comparing algorithms difficult because the choice of heuristic will strongly influence an algorithm's behaviour. We decided to use an _optimistic_ heuristic and a heuristic based on the synthetic accessibility (SA) score (Ertl and Schuffenhauer, 2009), which has been shown to be a good heuristic for retrosynthesis in practice despite its simplicity (Skoraczynski et al., 2023).
+
+We test all algorithms on 500 molecules randomly selected from the GuacaMol test set (Brown et al., 2019), which contains drug-like molecules known to be synthesizable, but with a wide range of difficulties (details in Appendix F.1.3). Our primary evaluation metric is the SSP values estimated with \(k=10\,000\) samples, averaged over the 500 molecules.
+
+### How effective is retro-fallback?
+
+Since retro-fallback is designed to maximize SSP, the most basic question is whether it does so more effectively than other algorithms. We found that a minority of molecules are "trivial", and all algorithms achieve a SSP of \(\approx 1\) within a few iterations. In Figure 2 we plot the average SSP for all "non-trivial" test molecules as a function of number of reaction model calls using an optimistic heuristic for all feasibility models (the "trivial" molecules are plotted in Figure F.4). Retro-fallback clearly outperforms the other algorithms in all scenarios by a wider margin than the error bars. The difference is larger for the feasibility models with independent reactions than with GP-correlated reactions. We suspect this is because there are many synthesis plans with similar reactions: when reaction outcomes are uncorrelated these synthesis plans act as backup plans for each other, but not when they are correlated. The same trends can be seen when using the SA heuristic function (shown in Figure F.5) and on a different test set (Appendix F.4). Overall, this result shows us what we expect: that retro-fallback maximizes the metric it was specifically designed to maximize more effectively than baseline algorithms.
+
+We investigate the origin of these performance differences in Appendix F.3. Figure F.8 plots SSP over time for a small selection of molecules (repeated over several trials). It appears that, rather than retro-fallback being consistently a little bit better, the performance gap is driven by a larger difference for a small number of molecules. This is actually not surprising: the advantage of different approaches will vary depending on the graph, and for some graphs finding individual feasible plans is probably a promising strategy.
+
+A natural follow-up question is whether retro-fallback also performs well by metrics other than SSP. In Figures F.6-F.7 we plot SSP of the _single_ best synthesis plan plus two metrics frequently used by previous papers: the fraction of molecules with _any_ synthesis plan (called "fraction solved" in prior works) and the length of the shortest synthesis plan found (a proxy for quality). The SSP of the single best plan is generally similar for all algorithms, especially when the SAscore heuristic is used. This suggests that in general all algorithms find similar "best" plans, and retro-fallback's extra success comes from finding more effective "backup" plans. Retro-fallback seems slightly better than other algorithms in terms of fraction solved and similar to other algorithms in terms of shortest plan length (although retro* is better in some cases). This suggests that it functions as an effective search algorithm even by the metrics from past papers.
+
+Figure 2: Results with optimistic heuristic on “non-trivial” molecules. C and R refer to constant and rank marginal probabilities, while I and G refer to independent and GP-induced correlations. Solid lines are sample means (averaged across molecules), with error bars representing standard errors.
+
+### Runtime and variability of retro-fallback
+
+Lastly, we analyze retro-fallback's empirical behaviour in Figure 3. The three leftmost subplots show how runtime scales with graph size for the experiments from section 6.2. Retro-fallback's scaling ranges from \(\approx O(N)\) to \(\approx O(N^{1.6})\) depending on the complexity of sampling from \(\xi_{f}/\xi_{b}\). In particular, the computational complexity is higher for \(\xi_{f}\) with GP-correlated outcomes, which require forming a covariance matrix in \(O(N^{2})\) time and inverting it in \(O(N^{3})\) time (although the empirical scaling suggests this step does not dominate the cost). Other algorithms draw samples for only small subsets of molecules and reactions and thereby exhibit linear scaling.
+
+To study the effect of the number of samples \(k\) from \(\xi_{f}\) and \(\xi_{b}\), we run the algorithm 10 times on a sub-sample of 25 molecules with a variety of different sample sizes. The rightmost subplot shows that as \(k\) decreases, the mean SSP value achieved by retro-fallback decreases and the variance of SSP increases. This is not surprising, since when the number of samples is small the internal estimates of SSP used by retro-fallback deviate more from their expected values, enabling sub-optimal decisions. Empirically, \(k\geq 1000\) seems sufficient (minimal further improvement is seen for higher \(k\)).
+
+## 7 Discussion, Limitations, and Future Work
+
+In this paper we presented a novel evaluation metric for retrosynthesis algorithms called "successful synthesis probability" (SSP), proposed a novel algorithm called retro-fallback to greedily maximize SSP, and showed experimentally that retro-fallback is more effective than previously-proposed algorithms. Together, these contributions compensate for the limited ability of existing algorithms to explicitly account for reaction failure and propose backup plans.
+
+One challenge for deploying retro-fallback in practice is the lack of established feasibility and buyability models. To our knowledge, retro-fallback is the first algorithm which can fully utilize uncertainty on the _function_ level, so it is not surprising that not much work has been done in this area before. We therefore do not view this as a limitation of our work, but rather as motivation for subsequent research into quantifying the uncertainty of reaction models (especially by domain experts).
+
+Our experiments showed that retro-fallback is slower than other algorithms, both in absolute runtime and in scaling behaviour. We believe this can be improved using more efficient algorithms to sample from \(\xi_{f},\xi_{b}\) and update \(\psi,\rho\). However, we note that if retro-fallback is used with a more complex reaction model (e.g. a transformer) then the computational cost of the search algorithm will be less significant. We therefore do not expect this to limit the long-term potential of the algorithm.
+
+Our contributions also have some important conceptual limitations. First, chemists care about the cost and length of synthesis plans in addition to whether they will work, and we do not see a way to incorporate these directly into either our stochastic process formalism or retro-fallback. However, one of the main justifications for preferring short plans is that there are fewer steps that can go wrong, and therefore we expect retro-fallback to have a strong bias towards short plans regardless. Second, while our definition of SSP considers an arbitrary number of plans, in practice chemists are unlikely to try more than \(\approx 10\) plans before moving on to something else.
+
+Finally, since retro-fallback uses a search heuristic there is potential to learn this heuristic using the results of past searches ("self-play"). We naturally expect this to improve performance and view this as an exciting direction for future work.
+
+Figure 3: Left 3 plots: runtime of algorithms with various feasibility models. Right: SSP of retro-fallback with R,G feasibility model as a function of the number of samples \(k\).
+
+### Ethics
+
+Our work is foundational algorithm development and we do not see any direct ethical implications. The most likely use case for our algorithm is to automate the production of synthesis plans in drug discovery, which we hope can ease the development of new medicines. We acknowledge the possibility that such algorithms could be used by bad actors to develop harmful chemicals, but do not see this as a probable outcome: countless harmful chemicals already exist and can be readily obtained. It is therefore hard to imagine why bad actors would expend significant effort to develop new harmful chemicals with complicated synthesis processes.
+
+#### Reproducibility
+
+We aim for a high standard of reproducibility in this work. We explicitly state our proposed algorithm in the paper (Algorithm 1) and dedicate Appendix E to discussing its minor (but still important) details, including guidance for future implementations (E.4). Proofs of all theorems are given in Appendix D. The experimental setup is described in more detail in Appendix F (including hyper-parameters, etc). Code to reproduce all experiments6 is included in the supplementary information. Our code was thoroughly tested with unit tests and builds on libraries which are widely-used, minimizing the chance that our results are corrupted by software errors. We include the results generated by our code in json format, and also include code to read the results and reproduce the plots7 from the paper. The inclusion of raw data will freely allow future researchers to perform alternative analyses.
+
+Footnote 6: Note that because all algorithms in the paper use randomness, re-running the code is unlikely to reproduce our _exact_ results.
+
+Footnote 7: Because we include the exact data, the reproduction of the plots will be exact.
+
+## References
+
+* Bradshaw et al. (2019) John Bradshaw, Brooks Paige, Matt J Kusner, Marwin Segler, and Jose Miguel Hernandez-Lobato. A model to search for synthesizable molecules. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Bradshaw et al. (2020) John Bradshaw, Brooks Paige, Matt J Kusner, Marwin Segler, and Jose Miguel Hernandez-Lobato. Barking up the right tree: an approach to search over molecule synthesis dags. _Advances in neural information processing systems_, 33:6852-6866, 2020.
+* Brown et al. (2019) Nathan Brown, Marco Fiscato, Marwin HS Segler, and Alain C Vaucher. Guacamol: benchmarking models for de novo molecular design. _Journal of chemical information and modeling_, 59(3):1096-1108, 2019.
+* Chakrabarti (1994) PP Chakrabarti. Algorithms for searching explicit and/or graphs and their applications to problem reduction search. _Artificial Intelligence_, 65(2):329-345, 1994.
+* Chen et al. (2020) Binghong Chen, Chengtao Li, Hanjun Dai, and Le Song. Retro*: learning retrosynthetic planning with neural guided a* search. In _International Conference on Machine Learning_, pp. 1608-1616. PMLR, 2020.
+* Chen & Jung (2021) Shuan Chen and Yousung Jung. Deep retrosynthetic reaction prediction using local reactivity and global attention. _JACS Au_, 1(10):1612-1620, 2021.
+* Coley et al. (2018) Connor W Coley, Luke Rogers, William H Green, and Klavs F Jensen. Scscore: synthetic complexity learned from a reaction corpus. _Journal of chemical information and modeling_, 58(2):252-261, 2018.
+* Coley et al. (2019) Connor W Coley, William H Green, and Klavs F Jensen. Rdchiral: An rdkit wrapper for handling stereochemistry in retrosynthetic template extraction and application. _Journal of chemical information and modeling_, 59(6):2529-2537, 2019a.
+* Coley et al. (2019) Connor W Coley, Dale A Thomas III, Justin AM Lummiss, Jonathan N Jaworski, Christopher P Breen, Victor Schultz, Travis Hart, Joshua S Fishman, Luke Rogers, Hanyu Gao, et al. A robotic platform for flow synthesis of organic compounds informed by ai planning. _Science_, 365(6453):eaax1566, 2019b.
+
+* Corey and Wipke (1969) Elias James Corey and W Todd Wipke. Computer-assisted design of complex organic syntheses: Pathways for molecular synthesis can be devised with a computer and equipment for graphical communication. _Science_, 166(3902):178-192, 1969.
+* Dai et al. (2019) Hanjun Dai, Chengtao Li, Connor Coley, Bo Dai, and Le Song. Retrosynthesis prediction with conditional graph logic network. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Ertl and Schuffenhauer (2009) Peter Ertl and Ansgar Schuffenhauer. Estimation of synthetic accessibility score of drug-like molecules based on molecular complexity and fragment contributions. _Journal of cheminformatics_, 1:1-11, 2009.
+* Gao et al. (2021) Wenhao Gao, Rocio Mercado, and Connor W Coley. Amortized tree generation for bottom-up synthesis planning and synthesizable molecular design. In _International Conference on Learning Representations_, 2021.
+* Genheden et al. (2020) Samuel Genheden, Amol Thakkar, Veronika Chadimova, Jean-Louis Reymond, Ola Engkvist, and Esben Bjerrum. Aizynthfinder: a fast, robust and flexible open-source software for retrosynthetic planning. _Journal of cheminformatics_, 12(1):70, 2020.
+* Gottipati et al. (2020) Sai Krishna Gottipati, Boris Sattarov, Sufeng Niu, Yashaswi Pathak, Haoran Wei, Shengchao Liu, Simon Blackburn, Karam Thomas, Connor Coley, Jian Tang, et al. Learning to navigate the synthetically accessible chemical space using reinforcement learning. In _International conference on machine learning_, pp. 3668-3679. PMLR, 2020.
+* Hagberg et al. (2008) Aric Hagberg, Pieter Swart, and Daniel S Chult. Exploring network structure, dynamics, and function using networkx. Technical report, Los Alamos National Lab.(LANL), Los Alamos, NM (United States), 2008.
+* Harris et al. (2020) Charles R Harris, K Jarrod Millman, Stefan J Van Der Walt, Ralf Gommers, Pauli Virtanen, David Cournapeau, Eric Wieser, Julian Taylor, Sebastian Berg, Nathaniel J Smith, et al. Array programming with numpy. _Nature_, 585(7825):357-362, 2020.
+* Heifets and Jurisica (2012) Abraham Heifets and Igor Jurisica. Construction of new medicines via game proof search. In _Proceedings of the AAAI Conference on Artificial Intelligence_, volume 26, pp. 1564-1570, 2012.
+* Irwin et al. (2022) Ross Irwin, Spyridon Dimitriadis, Jiazhen He, and Esben Jannik Bjerrum. Chemformer: a pre-trained transformer for computational chemistry. _Machine Learning: Science and Technology_, 3(1):015022, 2022.
+* Jimenez and Torras (2000) Pablo Jimenez and Carme Torras. An efficient algorithm for searching implicit and/or graphs with cycles. _Artificial Intelligence_, 124(1):1-30, 2000.
+* Karp (1972) Richard M. Karp. _Reducibility among Combinatorial Problems_, pp. 85-103. Springer US, Boston, MA, 1972. ISBN 978-1-4684-2001-2. doi: 10.1007/978-1-4684-2001-2.9.
+* Kim et al. (2021) Junsu Kim, Sungsoo Ahn, Hankook Lee, and Jinwoo Shin. Self-improved retrosynthetic planning. In _International Conference on Machine Learning_, pp. 5486-5495. PMLR, 2021.
+* Kishimoto et al. (2019) Akihiro Kishimoto, Beat Buesser, Bei Chen, and Adi Botea. Depth-first proof-number search with heuristic edge cost and application to chemical synthesis planning. _Advances in Neural Information Processing Systems_, 32, 2019.
+* Landrum et al. (2023) Greg Landrum, Paolo Tosco, Brian Kelley, Ric, sriniker, gedeck, Riccardo Vianello, David Cosgrove, NadineSchneider, Eisuke Kawashima, Dan N, Andrew Dalke, Gareth Jones, Brian Cole, Matt Swain, Samo Turk, AlexanderSavelyev, Alain Vaucher, Maciej Wojcikowski, Ichiru Take, Daniel Probst, Vincent F. Scalfani, Kazuya Ujihara, guillaume godin, Axel Pahl, Francois Berenger, JLVarjo, jasondbiggs, streets123, and JP. rdkit/rdkit: 2022.09.4 (q3 2022) release, January 2023.
+* Li and Chen (2022) Baiqing Li and Hongming Chen. Prediction of compound synthesis accessibility based on reaction knowledge graph. _Molecules_, 27(3):1039, 2022.
+
+* Liu et al. (2022) Cheng-Hao Liu, Maksym Korablyov, Stanislaw Jastrzebski, Pawel Wlodarczyk-Pruszynski, Yoshua Bengio, and Marwin Segler. Retrognn: fast estimation of synthesizability for virtual screening and de novo design by learning from slow retrosynthesis software. _Journal of Chemical Information and Modeling_, 62(10):2293-2300, 2022.
+* Liu et al. (2021) Guoqing Liu, Di Xue, Shufang Xie, Yingce Xia, Austin Tripp, Krzysztof Maziarz, Marwin Segler, Tao Qin, Zongzhang Zhang, and Tie-Yan Liu. Retrosynthetic planning with dual value networks. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett (eds.), _Proceedings of the 40th International Conference on Machine Learning_, volume 202 of _Proceedings of Machine Learning Research_, pp. 22266-22276. PMLR, 23-29 Jul 2023a.
+* Liu et al. (2021) Songtao Liu, Zhengkai Tu, Minkai Xu, Zuboai Zhang, Lu Lin, Rex Ying, Jian Tang, Peilin Zhao, and Dinghao Wu. FusionRetro: Molecule representation fusion via in-context learning for retrosynthetic planning. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett (eds.), _Proceedings of the 40th International Conference on Machine Learning_, volume 202 of _Proceedings of Machine Learning Research_, pp. 22028-22041. PMLR, 23-29 Jul 2023b. URL [https://proceedings.mlr.press/v202/liu23ah.html](https://proceedings.mlr.press/v202/liu23ah.html).
+* MacKay (1992) David JC MacKay. A practical bayesian framework for backpropagation networks. _Neural computation_, 4(3):448-472, 1992.
+* Maziarz et al. (2023) Krzysztof Maziarz, Austin Tripp, Guoqing Liu, Megan Stanley, Shufang Xie, Piotr Gainski, Philipp Seidl, and Marwin Segler. Re-evaluating retrosynthesis algorithms with synthesues. _arXiv preprint arXiv:2310.19796_, 2023.
+* OpenAI (2023) OpenAI. Gpt-4 technical report, 2023.
+* Papadimitriou and Yannakakis (1991) Christos H Papadimitriou and Mihalis Yannakakis. Shortest paths without a map. _Theoretical Computer Science_, 84(1):127-150, 1991.
+* Paszke et al. (2019) Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-performance deep learning library. _Advances in neural information processing systems_, 32, 2019.
+* Pearl (1984) Judea Pearl. _Heuristics: intelligent search strategies for computer problem solving_. Addison-Wesley Longman Publishing Co., Inc., 1984.
+* Pedregosa et al. (2011) F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel, B. Thirion, O. Grisel, M. Blondel, P. Prettenhofer, R. Weiss, V. Dubourg, J. Vanderplas, A. Passos, D. Cournapeau, M. Brucher, M. Perrot, and E. Duchesnay. Scikit-learn: Machine learning in Python. _Journal of Machine Learning Research_, 12:2825-2830, 2011.
+* Rogers and Hahn (2010) David Rogers and Mathew Hahn. Extended-connectivity fingerprints. _Journal of chemical information and modeling_, 50(5):742-754, 2010.
+* Sacha et al. (2021) Mikolaj Sacha, Mikolaj Blaz, Piotr Byrski, Pawel Dabrowski-Tumanski, Mikolaj Chrominski, Rafal Loska, Pawel Wlodarczyk-Pruszynski, and Stanislaw Jastrzebski. Molecule edit graph attention network: modeling chemical reactions as sequences of graph edits. _Journal of Chemical Information and Modeling_, 61(7):3273-3284, 2021.
+* Schwaller et al. (2020) Philippe Schwaller, Riccardo Petraglia, Valerio Zullo, Vishnu H Nair, Rico Andreas Haeuselmann, Riccardo Pisoni, Costas Bekas, Anna Iuliano, and Teodoro Laino. Predicting retrosynthetic pathways using transformer-based models and a hyper-graph exploration strategy. _Chemical science_, 11(12):3316-3325, 2020.
+* Segler and Waller (2017) Marwin HS Segler and Mark P Waller. Neural-symbolic machine learning for retrosynthesis and reaction prediction. _Chemistry-A European Journal_, 23(25):5966-5971, 2017.
+* Segler et al. (2018) Marwin HS Segler, Mike Preuss, and Mark P Waller. Planning chemical syntheses with deep neural networks and symbolic ai. _Nature_, 555(7698):604-610, 2018.
+* Schwaller et al. (2019)Philipp Seidl, Philipp Renz, Natalia Dyubankova, Paulo Neves, Jonas Verhoeven, Marwin Segler, Jorg K Wegner, Sepp Hochreiter, and Gunter Klambauer. Modern hopfield networks for few-and zero-shot reaction template prediction. _arXiv preprint arXiv:2104.03279_, 2021.
+* Shibukawa et al. (2020) Ryosuke Shibukawa, Shoichi Ishida, Kazuki Yoshizoe, Kunihiro Wasa, Kiyosei Takasu, Yasushi Okuno, Kei Terayama, and Koji Tsuda. Compret: a comprehensive recommendation framework for chemical synthesis planning with algorithmic enumeration. _Journal of cheminformatics_, 12(1):1-14, 2020.
+* Skoraczynski et al. (2023) Grzegorz Skoraczynski, Mateusz Kitlas, Blazej Miasojedow, and Anna Gambin. Critical assessment of synthetic accessibility scores in computer-assisted synthesis planning. _Journal of Cheminformatics_, 15(1):6, 2023.
+* Stanley & Segler (2023) Megan Stanley and Marwin Segler. Fake it until you make it? generative de novo design and virtual screening of synthesizable molecules. _Current Opinion in Structural Biology_, 82:102658, 2023.
+* Strieth-Kalthoff et al. (2020) Felix Strieth-Kalthoff, Frederik Sandfort, Marwin HS Segler, and Frank Glorius. Machine learning the ropes: principles, applications and directions in synthetic chemistry. _Chemical Society Reviews_, 49(17):6154-6168, 2020.
+* Thakkar et al. (2021) Amol Thakkar, Veronika Chadimova, Esben Jannik Bjerrum, Ola Engkvist, and Jean-Louis Reymond. Retrosynthetic accessibility score (rascore)-rapid machine learned synthesizability classification from ai driven retrosynthetic planning. _Chemical Science_, 12(9):3339-3349, 2021.
+* Tu et al. (2023) Zhengkai Tu, Thijs Stuyver, and Connor W Coley. Predictive chemistry: machine learning for reaction deployment, reaction development, and reaction discovery. _Chemical Science_, 2023.
+* Virtanen et al. (2020) Pauli Virtanen, Ralf Gommers, Travis E Oliphant, Matt Haberland, Tyler Reddy, David Cournapeau, Evgeni Burovski, Pearu Peterson, Warren Weckesser, Jonathan Bright, et al. Scipy 1.0: fundamental algorithms for scientific computing in python. _Nature methods_, 17(3):261-272, 2020.
+* Vleduts (1963) GE Vleduts. Concerning one system of classification and codification of organic reactions. _Information Storage and Retrieval_, 1(2-3):117-146, 1963.
+* Williams & Rasmussen (2006) Christopher KI Williams and Carl Edward Rasmussen. _Gaussian processes for machine learning_. MIT press Cambridge, MA, 2006.
+* Xie et al. (2022) Shufang Xie, Rui Yan, Peng Han, Yingce Xia, Lijun Wu, Chenjuan Guo, Bin Yang, and Tao Qin. Retrograph: Retrosynthetic planning with graph search. In _Proceedings of the 28th ACM SIGKDD Conference on Knowledge Discovery and Data Mining_, pp. 2120-2129, 2022.
+* Yu et al. (2022) Yemin Yu, Ying Wei, Kun Kuang, Zhengxing Huang, Huaxiu Yao, and Fei Wu. Grasp: Navigating retrosynthetic planning with goal-driven policy. _Advances in Neural Information Processing Systems_, 35:10257-10268, 2022.
+* Zhong et al. (2023) Weihe Zhong, Ziduo Yang, and Calvin Yu-Chian Chen. Retrosynthesis prediction using an end-to-end graph generative architecture for molecular graph editing. _Nature Communications_, 14(1):3009, 2023.
+* Zhong et al. (2022) Zipeng Zhong, Jie Song, Zunlei Feng, Tiantao Liu, Lingxiang Jia, Shaolun Yao, Min Wu, Tingjun Hou, and Mingli Song. Root-aligned smiles: a tight representation for chemical reaction prediction. _Chemical Science_, 13(31):9023-9034, 2022.
+
+## Appendix
+
+### Table of Contents
+
+* A Summary of Notation
+* B Details of AND/OR graphs
+* C Configuring existing algorithms to optimize SSP
+* C.1 Breadth-first search
+* C.2 Monte-Carlo Tree Search (MCTS)
+* C.3 Depth-first proof number search (with heuristic edge initialization)
+* C.4 Retro
+* C.5 RetroGraph
+* D Proofs and Theoretical Results
+* D.1 Proof of Theorem 3.1
+* D.2 Computing "success" quantities in polynomial time
+* D.3 Errors for estimating Bernoulli random variables
+* E Further details of retro-fallback
+* E.1 Elaboration on definition of \(\psi\) and \(\rho\)
+* E.2 Justification of node selection
+* E.3 Rejected alternative algorithms
+* E.4 Practical implementation details
+* F Extended experiment section
+* F.1 Details of experimental setup
+* F.2 Additional plots for section 6.2
+* F.3 Case studies
+* F.4 Results on retro
+* 190 hard molecules
+* F.5 Results on FusionRetro benchmark
+* G Extended related work
+* G.1 Search heuristics for retrosynthesis
+* G.2 Generative models
+* G.3 Single-step retrosynthesis
+* G.4 FusionRetro
+* H Future workSummary of Notation
+
+Although we endeavoured to introduce all notation in the main text of the paper in the section where it is first used, we re-state the notation here for clarity.
+
+**General Math**
+
+\begin{tabular}{l l} \(2^{S}\) & Power set of set \(S\) (set of all subsets of \(S\)) \\
+**1\({}_{\text{event}}\)** & Indicator function: 1 if "event" is True, otherwise 0 \\ \(O(N^{p})\) & Big-O notation (describing scaling of an algorithm) \\ \(\tilde{O}(N^{p})\) & Big-O notation, omitting poly-logarithmic factors (e.g. \\ \(O(N\log N)\) is equivalent to \(\tilde{O}(N)\)) \\
+**Molecules and reactions** \\ \(m\) & a molecule \\ \(r\) & a reaction (assumed to be single-product) \\ \(\mathcal{M}\) & space of molecules \\ \(\mathcal{R}\) & space of reactions \\ \(\mathcal{I}\) & Inventory of buyable molecules \\ \(B\) & backward reaction model \\ \(\rightarrow\) & Forward reaction arrow (e.g. \(A+B\to C\)) \\ \(\Rightarrow\) & Backward reaction arrow (e.g. \(C\Rightarrow A+B\)) \\
+**Search Graphs** \\ \(\mathcal{G}\) & _implicit_ search graph with molecule (OR) nodes in \(\mathcal{M}\) and reaction (AND) nodes in \(\mathcal{R}\) \\ \(\mathcal{G}^{\prime}\) & _explicit_ graph stored and expanded for search. \(\mathcal{G}^{\prime}\subseteq\mathcal{G}\) \\ \(Pa_{\mathcal{G}^{\prime}}(x)\) & The parents of molecule or reaction \(x\) in \(\mathcal{G}^{\prime}\). \\ \(Ch_{\mathcal{G}^{\prime}}(x)\) & The children of molecule or reaction \(x\) in \(\mathcal{G}^{\prime}\). \\ \(T\) & A synthesis plan in \(\mathcal{G}\) or \(\mathcal{G}^{\prime}\) (conditions in Appendix B). \\ \end{tabular}
+
+**Feasibility and Buyability**
+
+\begin{tabular}{l l} \(f\) & Feasible function (assigns whether a reaction is feasible) \\ \(b\) & Buyable function (assigns whether a molecule is buyable) \\ \(\xi_{f}\) & feasibility stochastic process (distribution over \(f\)) \\ \(\xi_{b}\) & buyability stochastic process (distribution over \(b\)) \\ \(f_{\xi}(r)\) & Marginal feasibility of reaction \(r\) under \(\xi_{f}\) \\ \(\bar{b}_{\xi}(m)\) & Marginal buyability of molecule \(m\) under \(\xi_{b}\) \\ s(\(m;\mathcal{G}^{\prime},f,b\)) & Whether a molecule is synthesizable using reactions/starting molecules in \(\mathcal{G}^{\prime}\), with feasible/buyable outcomes given by \(f,b\). Takes values in \(\{0,1\}\). Defined in equations 2-3 \\ s(\(m\)) & Shorthand for \(\text{s}(m;\mathcal{G}^{\prime},f,b)\) when \(\mathcal{G}^{\prime},f,b\) are clear from context. \\ \(\bar{\text{s}}(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b})\) & Expected value of \(\text{s}(m;\mathcal{G}^{\prime},f,b)\) when \(f\sim\xi_{f},b\sim\xi_{b}\). Defined in equation 1. \\ \(\bar{\text{s}}(m)\) & Shorthand for \(\bar{\text{s}}(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b})\) when \(\mathcal{G}^{\prime},\xi_{f},\xi_{b}\) are clear from context \\ \(\hat{\text{s}}(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b})\) & Estimate of \(\bar{\text{s}}(m)\) from samples (equation 4) \\  & **Retro-fallback** \\ \(m_{t}\) & the target molecule (at the root of \(\mathcal{G}^{\prime}\)) \\ \(h\) & Search heuristic function \(\mathcal{M}\mapsto[0,1]\) \\ \(\psi(m;\mathcal{G}^{\prime},f,b,h)\) & Estimate of potential \(\text{s}(m)\) if one plan under \(m\) is expanded. Defined in equations 5-6 \\ \(\rho(m;\mathcal{G}^{\prime},f,b,h)\) & Estimate of potential for \(\text{s}(m_{t})\) if one plan under \(m\) is expanded. Defined in equations 7-8 \\ \end{tabular}
+
+We also use the following mathematical conventions throughout the paper:
+
+* \(\log 0=-\infty\)
+* \(\max_{x\in\emptyset}f(x)=-\infty\) (the maximum of an empty set is always \(-\infty\))Details of AND/OR graphs
+
+We make the following additional assumptions about AND/OR graphs:
+
+1. Edges only exist between molecules and reactions producing them, and between reactions and their reactant molecules. This makes the graph _bipartite_.
+2. All reactions have at least one reactant (you cannot make something from nothing). This assumption is used implicitly below.
+3. Although we explicitly store only a subgraph \(\mathcal{G}^{\prime}\subseteq\mathcal{G}\), we assume that \(\mathcal{G}^{\prime}\) is _connected_ and that every node is reachable from the target molecule \(m_{t}\). Only molecule nodes are tip nodes: if a reaction \(r\in\mathcal{G}^{\prime}\), then \(\mathcal{G}^{\prime}\) must also contain all its reactant molecules.
+4. All reaction nodes _must_ be connected to their product and reaction molecule nodes.
+5. Reactions only exactly one product molecule. This assumption is used for example in equation 8 which uses the _single_ parent of a reaction. Although this may seem restrictive, the reaction \(A+B\to C+D\) could simply be encoded as two reactions: \(A+B\to C\) and \(A+B\to D\).
+
+We do _not_ assume in general that the molecules and reactions in \(\mathcal{G}^{\prime}\) are unique: for example, to make a tree previous works have repeated nodes (Kishimoto et al., 2019; Chen et al., 2020).
+
+A synthesis plan is a subgraph \(T\subseteq\mathcal{G}^{\prime}\) which conforms with all the aforementioned assumptions of \(\mathcal{G}^{\prime}\) stated above (connected, all tip nodes are molecules, etc) with the extra restrictions:
+
+1. \(m_{t}\in T\) (the target molecule must be part of the synthesis plan)
+2. Each molecule node in \(T\) has at most one reaction child in \(T\).
+3. \(T\) contains no cycles.
+
+We refer the reader to Jimenez & Torras (2000) for a more thorough discussion of these conditions.
+
+An example of an AND/OR graph is given in Figure B.1.
+
+Figure B.1: An example of an AND/OR graph. Molecule (OR) nodes are denoted with circles, while reaction (AND) nodes are denoted with rectangles. This graph represents the reactions \(r_{1}:m_{a}+m_{b}\to m_{t}\), \(r_{2}:m_{b}+m_{c}+m_{d}\to m_{t}\), \(r_{3}:m_{e}\to m_{d}\). Note that the direction of the edges in the graph is from products to reactants, even though a reaction goes from products to reactants (the arrows are defined in the _retrosynthetic_ direction). Also note that this graph is _not_ a tree because \(m_{b}\) has two parents. It could be made into a tree by having two copies of node \(m_{b}\): one under \(r_{1}\) and one under \(r_{2}\).
+
+C Configuring existing algorithms to optimize SSP
+
+In this section we examine all existing retrosynthesis algorithms which we are aware of and explain why we think they cannot be configured to directly maximize SSP, and what the closest proxy likely is. We also try to give a series of "hacks" that we thought of to modify the algorithms, and explained their disadvantages.
+
+### Breadth-first search
+
+Description of algorithmA very basic search algorithm: expand tip nodes in the order they were added.
+
+Directly maximizing SSPThis algorithm has no parameters and therefore has no kind of objective which could be set to maximize SSP.
+
+Closest proxy to SSPN/A, nothing can be done.
+
+"Hacks" that could be done?Nothing we can think of.
+
+### Monte-Carlo Tree Search (MCTS)
+
+Description of algorithmUsed in (Segler et al., 2018; Coley et al., 2019; Genheden et al., 2020). Create a MDP where "states" are set of molecules and "actions" are reactions which react one molecule in a state and replace it with other molecules. At each step, descend the tree choosing nodes which maximize
+
+\[\frac{W(s_{t},a)}{N(s_{t},a)}+cP(s_{t},a)\frac{\sqrt{N(s_{t-1},a_{t-1})}}{1+N( s_{t},a)}\, \tag{10}\]
+
+where \(W(s_{t},a)\) is the total reward accumulated while taking action \(a\) to reach state \(s_{t}\), \(N(s_{t},a)\) is the number of times where the algorithm has performed action \(a\) to reach state \(s_{t}\) and \(P(s_{t},a)\) is some sort of prior probability of performing action \(a\) to reach \(s_{t}\), and \(c\) is a constant. The algorithm is designed to eventually converge to the action sequence which maximizes reward.
+
+Directly maximizing SSPThe algorithm uses the "prior" function \(P\) (also called a policy), a reward function \(R\), and a value function estimator \(V\) to estimate the value of leaf nodes (e.g. rollouts). However, _all of these functions depend on individual states/actions instead of the graph as a whole!_
+
+Closest proxy to SSPThe reward function \(R\) can be set to the SSP of an individual plan (estimated with samples).
+
+"Hacks" that could be done?One option is to make the reward and policy change over time. For example, one could have the reward be the _additional_ SSP gained from discovering a new plan. However, it is possible that MCTS will not behave well in this scenario: the principle of MCTS is to narrow down on the best sequence of actions by slowly tightening a confidence interval around their expected return. However, if the rewards change over time then these interval estimates will likely become inaccurate. Although the intervals could be widened (e.g. by increasing \(c\)) this will result in MCTS behaving more randomly and not searching as efficiently. Also, we note that there are many possible design choices here, and further probing of alternative options might yield improved results.
+
+### Depth-first proof number search (with heuristic edge initialization)
+
+Description of algorithmProposed in Kishimoto et al. (2019). Basic proof number search assigns "proof numbers" and "disproof numbers" which represent the number of nodes needed to prove or disprove whether there exist a synthesis plan to synthesize a given molecule and selects nodes using this information. The heuristic edge initialization Kishimoto et al. (2019) uses a heuristic to initialize the proof and disproof numbers for each reaction.
+
+Directly maximizing SSPThis algorithm inherently takes a very binary view of retrosynthesis (seeing nodes as either proven or disproven), and therefore is not very amenable to maximizing SSP. At best one could change the heuristic values to reflect feasibilities, but since the heuristic values are only used for tip nodes this would likely not be effective.
+
+Closest proxy to SSPWe believe there is not much that can be done, and for this reason we do not perform experiments with this algorithm.
+
+"Hacks" that could be done?Aside from changing the definitions of proof/disproof numbers, we do not see any options here.
+
+### Retro*
+
+Description of algorithmAn algorithm for minimum cost search in AND/OR trees (Chen et al., 2020). At each step, the algorithm selects a potential synthesis plan \(T\) whose cost is \(\sum_{r\in T}c_{R}(r)+\sum_{m\in T}c_{M}(m)\) (i.e. a sum of individual costs for each reaction and molecule), then expands one tip node on \(T\). A heuristic is used to guide plan selection by replacing \(c_{M}\) on tip molecule nodes.
+
+Directly maximizing SSPThe parameters of retro* are the costs of each molecule and reaction and the heuristic functions. None of these can simply be set as the SSP because the SSP cannot be decomposed into a separate factor for each node.
+
+Closest proxy to SSPA cost for each molecule and reaction could be determined with \(\xi_{f}\) and \(\xi_{b}\). One option is to set the cost of each reaction/molecule to the negative log of its marginal feasibility/buyability:
+
+\[c_{M}(m) =-\log\mathbb{E}_{b\sim\xi_{b}}\left[b(m)\right]\] \[c_{R}(r) =-\log\mathbb{E}_{f\sim\xi_{f}}\left[f(r)\right]\,.\]
+
+This option does have a somewhat principled interpretation: if all feasibility/buyability outcomes are independent then the cost of a plan is just the negative log of its joint SSP. Of course, this relationship does not hold in the general non-independent case. However, we do not see a way to adjust this formula to account for non-independence in general, so we choose to apply it in all cases.
+
+"Hacks" that could be done?One could potentially change the reaction and molecule costs with time to account for changes elsewhere in the search graph. For example, reactions/molecules which are already part of a feasible plan could be re-assigned higher costs to make the algorithm search for non-overlapping plans. However, this strategy seems unlikely to work in general: for some search graphs it is possible that the best backup plans will share some reactions (either those likely to be feasible). We were unable to come up with a strategy that did not have obvious and foreseeable failure modes, so we decided not to pursue this direction.
+
+### RetroGraph
+
+Description of algorithmProposed in Xie et al. (2022), this algorithm functions like a modified version of retro* but on a minimal AND/OR graph instead of a tree. A graph neural network is used to prioritize nodes.
+
+Directly maximizing SSPLike retro*, this method uses additive costs across reactions, and we do not believe these costs can be modified to represent SSP.
+
+Closest proxy to SSPSimilar to retro*, we believe the closest proxy is to set costs equal to the negative log marginal feasibility/buyability and minimize this.
+
+"Hacks" that could be done?We could not think of anything.
+
+Proofs and Theoretical Results
+
+This appendix contains proofs of theoretical results from the paper.
+
+### Proof of Theorem 3.1
+
+Theorem 3.1 is a corollary of the following theorem, which we prove below.
+
+**Theorem D.1**.: _Unless \(P=NP\), there does not exist a polynomial time algorithm to determine whether \(\bar{\mathrm{s}}(m_{t};\mathcal{G}^{\prime},\xi_{f},\xi_{b})>0\) whose time complexity grows polynomially with the number of nodes in \(\mathcal{G}^{\prime}\) for arbitrary \(\xi_{f},\xi_{b}\)._
+
+Note that Theorem D.1 is distinct from Theorem 3.1: the latter is a hardness result about computing SSP, while the former considers only the binary problem of determining whether SSP is zero or non-zero. We now state a proof of Theorem D.1:
+
+Proof.: We will show a reduction from the Boolean 3-Satisfiability Problem (3-SAT) to the problem of determining whether SSP is non-zero. As 3-SAT is known to be NP-hard (Karp, 1972), this will imply the latter is also NP-hard, completing the proof.
+
+To construct the reduction, assume an instance \(I\) of 3-SAT with \(n\) variables \(x_{1}\),..., \(x_{n}\), and \(m\) clauses \(c_{1}\),..., \(c_{m}\), each \(c_{j}\) consisting of three literals (where a literal is either a variable or its negation) We will construct an AND-OR graph \(\mathcal{G}(I)\) with size \(O(n+m)\), alongside with distributions \(\xi_{f}(I)\) and \(\xi_{b}(I)\), such that the SSP in the constructed instance is non-zero if and only if \(I\) is satisfiable.
+
+In our construction we first set \(\xi_{f}\equiv 1\), i.e. assume all reactions described below are always feasible.
+
+We then construct a set \(P\) of \(2n\) potentially buyable molecules, corresponding to variables \(x_{i}\) as well as their negations \(\neg x_{i}\); to simplify notation, we will refer to these molecules as \(x_{i}\) or \(\neg x_{i}\). We then set \(\xi_{b}(I)\) to a uniform distribution over all subsets \(S\subseteq P\) such that \(\forall_{i}|S\cap\{x_{i},\neg x_{i}\}|=1\); in other words, either \(x_{i}\) or \(\neg x_{i}\) can be bought, but never both at the same time. Note that with this construction it is easy to support all necessary operations on \(\xi_{b}\), such as (conditional) sampling or computing marginals.
+
+It remains to translate \(I\) to \(\mathcal{G}(I)\) in a way that encodes the clauses \(c_{j}\). We start by creating a root OR-node \(r\), with a single AND-node child \(r^{\prime}\). Under \(r^{\prime}\) we build \(m\) OR-node children, corresponding to clauses \(c_{j}\); again, we refer to these nodes as \(c_{j}\) for simplicity. Finally, for each \(c_{j}\), we attach \(3\) children, corresponding to the literals in \(c_{j}\). Intuitively these \(3\) children would map to three molecules from the potentially buyable set \(P\), but formally the children of \(c_{j}\) should be AND-nodes (while \(P\) contains molecules, i.e. OR-nodes); however, this can be resolved by adding dummy single-reactant reaction nodes.
+
+To see that the reduction is valid, first note that \(r\) is synthesizable only if all \(c_{j}\) are, which reflects the fact that \(I\) is a binary AND of clauses \(c_{j}\). Moreover, each \(c_{j}\) is synthesizable if at least one of its \(3\) children is, which translates to at least one of the literals being satisfied. Our construction of \(\xi_{b}\) allows any setting of variables \(x_{i}\) as long as it's consistent with negations \(\neg x_{i}\). Taken together, this means the SSP for \(\mathcal{G}(I)\) is non-zero if and only if there exists an assignment of variables \(x_{i}\) that satisfies \(I\), and thus the reduction is sound. 
+
+**Corollary D.2**.: _If a polynomial time algorithm did exist to compute the exact value of \(\bar{\mathrm{s}}(m_{t};\mathcal{G}^{\prime},\xi_{f},\xi_{b})\), this algorithm would clearly also determine whether \(\bar{\mathrm{s}}(m_{t};\mathcal{G}^{\prime},\xi_{f},\xi_{b})>0\) in polynomial time, violating Theorem D.1. This proves Theorem 3.1._
+
+### Computing "success" quantities in polynomial time
+
+Retro-fallback, and more generally the calculation of SSP rely on solving a system of recursively-defined equations: equations 2-3 for \(\mathrm{s}\), equations 5-6 for \(\psi\), and equations 7-8 for \(\rho\). Exactly how these equations are solved is detached from the actual algorithms: all that matters is that they are solved. Depending on the structure of \(\mathcal{G}^{\prime}\), different algorithms with different scaling properties may be applicable. Currently we are uncertain about what the overall "best" algorithm is, and therefore do not advocate for a particular method in this paper. In this section we merely aim to prove a minimal result: that these quantities can always be computed in polynomial time (with respect to the size of the graphs).
+
+First, we state a general theorem applicable to all graphs.
+
+**Theorem D.3**.: _Let \(|\mathcal{G}^{\prime}|=N\) (i.e. \(\mathcal{G}^{\prime}\) has \(N\) nodes) and that the number of outgoing edges from any node is at most \(K<N\). There exists an algorithm with \(\tilde{O}(N^{2})\) time complexity to compute \(\mathrm{s}\), \(\psi\), and \(\rho\)._
+
+Proof.: Our proof builds on a result from Chakrabarti (1994) which gives an algorithm to compute minimum costs in an algorithm called AO*, which performs minimum-cost search on AND/OR graphs. Let \(c_{t}(n)\) denote the _terminal_ cost of a node (analogous to its purchase cost). This will generally be \(\infty\) for nodes which are non-terminal (e.g. non-purchasable molecules), and a non-negative real number otherwise. Let \(c^{*}\) denote the optimal cost of a node, and \(c_{e}\) denote the edge cost between two nodes. AO* defines the following cost function:
+
+\[c^{*}(n) =\min\left[c_{t}(n),\min_{n^{\prime}\in Ch_{\mathcal{G}^{\prime} }(n)}\left[c^{*}(n^{\prime})+c_{e}(n,n^{\prime})\right]\right]\quad\text{( OR node)} \tag{11}\] \[c^{*}(n) =\sum_{n^{\prime}\in Ch_{\mathcal{G}^{\prime}}(n)}\left[c^{*}(n^ {\prime})+c_{e}(n,n^{\prime})\right]\quad\text{(AND node)} \tag{12}\]
+
+Chakrabarti (1994) presents an algorithm called Iterative_revise whose worst case time complexity is \(\tilde{O}(N^{2})\). Critically, unlike previous algorithms for AO*, the algorithm from Chakrabarti (1994) does _not_ assume a tree or acyclic graph, making it very general. Our proof strategy is to transform the equations for \(\mathrm{s}\), \(\psi\), and \(\rho\) to resemble equations 11-12, making Iterative_revise applicable and proving our result.
+
+First, define \(\mathrm{s}^{\prime}(\cdot;\mathcal{G}^{\prime},f,b)=-\log\mathrm{s}(\cdot; \mathcal{G}^{\prime},f,b)\). The resulting recursive equations are:
+
+\[\mathrm{s}^{\prime}(m;\mathcal{G}^{\prime},f,b) =\min\left[\underbrace{-\log b(m)}_{c_{t}(m)},\min_{r\in Ch_{ \mathcal{G}^{\prime}}(m)}\mathrm{s}^{\prime}(r;\mathcal{G}^{\prime},f,b)\right]\] \[\mathrm{s}^{\prime}(r;\mathcal{G}^{\prime},f,b) =\underbrace{-\log f(r)}_{c_{e}(r,m)}+\sum_{m\in Ch_{\mathcal{G }^{\prime}}(r)}\mathrm{s}^{\prime}(m;\mathcal{G}^{\prime},f,b)\]
+
+These correspond to equations 11-12 using \(c_{e}(m,r)=0\) and the substitutions for \(c_{t}\) and \(c_{e}(r,m)\) shown above.8 The same transformation and correspondence can be achieved for \(\psi\) by defining \(\psi^{\prime}(\cdot;\mathcal{G}^{\prime},f,b,h)=-\log\psi(\cdot;\mathcal{G}^ {\prime},f,b,h)\) and defining \(c_{t}(m)=-\log\max\left[b(m),h(m)\right]\).
+
+Footnote 8: Note that using the convention that \(\log 0=-\infty\) the costs are guaranteed to be non-negative.
+
+Second, define \(\rho^{\prime}(\cdot;\mathcal{G}^{\prime},f,b,h)=\log\frac{\psi(m_{t};\mathcal{ G}^{\prime},f,b,h)}{\rho(\cdot;\mathcal{G}^{\prime},f,b,h)}\). This results in the recursive equations:
+
+\[\rho^{\prime}(m;\mathcal{G}^{\prime},f,b,h) =\begin{cases}0&m=m_{t}\\ \min_{r\in Pa_{\mathcal{G}^{\prime}}(m)}\rho^{\prime}(r;\mathcal{G}^{\prime}, f,b,h)&\text{all other $m$}\end{cases}\] \[\rho(r;\mathcal{G}^{\prime},f,b,h) =\begin{cases}\infty&\psi(r;\mathcal{G}^{\prime},f,b,h)=0\\ \rho^{\prime}(Pa_{\mathcal{G}^{\prime}}(r))+\log\frac{\psi(Pa_{\mathcal{G}^{ \prime}}(r))}{\psi(r)}&\psi(r;\mathcal{G}^{\prime},f,b,h)>0\end{cases}\]
+
+If the directions of all edges are flipped (so parents become children and children become parents), then these equations correspond to equations 11-12 with \(c_{t}(n)=0\) for \(m_{t}\) only, \(c_{e}(m,r)=0\), and \(c_{e}(r,m)=\log\frac{\psi(m)}{\psi(r)}\) (which is non-negative because of the \(\max\) in equation 5).
+
+This completes the proof for all three quantities. 
+
+Theorem D.3 assumes that the number of outgoing edges in each node is bounded. This is a realistic assumption in retrosynthesis: most reactions involve 1-2 reactants. Reactions with 3 or more reactants are less common, and more than \(\approx 10\) is essentially unheard of. Although there may be a large number of possible reactions that can be done on a given molecule, a backward reaction model \(B\) usually limits the number of reactions which are added to the graph. Many previous works have used a limit of 50 (Segler et al., 2018; Chen et al., 2020). Therefore we think this assumption is realistic in practice.
+
+One implication of Theorem D.3 is that Iterative_revise could be used to directly compute \(\mathrm{s},\psi\), and \(\rho\). However, in some cases this is likely sub-optimal: for example, if \(\mathcal{G}^{\prime}\) is acyclic then these quantities can be computed in linear time using a single pass over all nodes. Although the presence of reversible reaction (e.g. \(A\to B\) and \(B\to A\)) make it unlikely that strictly acyclic graphs will be encountered in practice during retrosynthesis, cyclic plans will _not_ yield optimal plans we expect very few cycles to be explored in \(\mathcal{G}^{\prime}\). Therefore we propose in practice to initialize \(\mathrm{s},\psi,\rho\) to 0 and then iterate their recursive relations until convergence. At this time we do not have any proofs for the time complexity of this procedure, but in practice it appears to be sub-linear (e.g. see Figure 3). However, in Corollary D.4 we show that computing \(\rho\), which is the last phase of the algorithm, can indeed be done in linearithmic time. As this optimization is not applicable to computing \(\psi\), it does not improve the overall complexity of the algorithm.
+
+**Corollary D.4**.: _Let \(|\mathcal{G}^{\prime}|=N\) (i.e. \(\mathcal{G}^{\prime}\) has \(N\) nodes) and that the number of outgoing edges from any node is at most \(K<N\). There exists an algorithm with \(O(N\log N)\) time complexity to compute \(\rho\) from \(\psi\)._
+
+Proof.: Recall the reduction of computing \(\rho\) to minimum-cost search in an AND/OR graph from the proof of Theorem D.3. Note that the AND nodes in the resulting graph always have _at most one child_ (corresponding to the node parent in the original tree), thus the sum-over-children component seen for AND nodes in general AND/OR graph search does not appear. Consequently, it is easy to see this particular search problem is equivalent to finding a shortest path from \(m_{t}\) to every other node, which can be done using Dijkstra's algorithm in \(O(N\log N)\) time. 
+
+### Errors for estimating Bernoulli random variables
+
+Errors of i.i.d random variables are well-studied. The rate at which the sample mean "concentrates" around its expected value can be bounded using any number of concentration bounds. For example, applying the Chernoff bound using \(k=10\,000\) yields:
+
+\[P\left(|\mathrm{\bar{s}}(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b},k)-\mathrm{ \bar{s}}(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b})|>0.025\right)<10^{-5}\quad \forall\mathcal{G}^{\prime},\xi_{f},\xi_{b}\]
+
+This means that with \(10\,000\) samples, the SSP can be placed within a 5% interval with near-certainty in all settings. We believe that a higher level of accuracy is not likely to be useful for chemists: if \(\mathrm{\bar{s}}(m)\) is reasonably large than a 5% error is relatively small, while if \(\mathrm{\bar{s}}(m)\) is near zero then a chemist will probably just choose not try to make the molecule (and therefore the distinction between 0.1% and 5% is not actually that important).
+
+Further details of retro-fallback
+
+### Elaboration on definition of \(\psi\) and \(\rho\)
+
+Although the definition of \(\psi\) is fairly self-explanatory, there is one caveat: if a given molecule occurs multiple times within a synthesis plan then the value of \(h(m)\) will implicitly be used multiple times. For example, if a synthesis plan \(T\) contained reactions \(A+B\Rightarrow C\), \(A+D\Rightarrow E\), and \(C+E\Rightarrow m_{t}\) then \(\psi(m_{t};T)\) would represent the SSP of a hypothetical synthesis plan where the success outcome of \(A\) was sampled independently for the two reactions it is involved in. Obviously this does not make sense. However, if \(\psi\) is modified to not double count such cases, then its value would no longer simply depend on the \(\psi\) values of neighbouring nodes, eliminating the recursive definition which enabled efficient polynomial time computation! In practice we expect synthesis plans which use the same molecule multiple times to be uncommon, so we choose to just proceed with this quirk of the definition of \(\psi\). We also note that retro*'s definition of "reaction number" has the same property (Chen et al., 2020), so this assumption has precedent in the literature.
+
+We believe the easiest way to understand the equations for \(\rho\) is to consider "descending" the tree from the root node \(m_{t}\). Because \(\psi\) is defined as the maximum success of any synthesis root upon expansion, and \(\rho(m)\) is essentially \(\psi(m_{t})\) when this root is restricted to contain both \(m\) and \(m_{t}\), the root node is a special case where \(m=m_{t}\) and therefore \(\rho(m_{t})=\psi(m_{t})\). If the root node is a tip node, then there are no children and we are done.
+
+Next, consider a reaction child \(r\) of \(m_{t}\). Here it is important to recall that we only consider graphs with _single-product_ reactions (c.f. B), meaning that \(r\) will only have a single parent. There are two cases to consider:
+
+1. \(\psi(r)=\psi(m_{t})\). This implies that \(r\) lies on an optimal expansion plan (note: not _the_ optimal expansion plan because there could be multiple equally-promising expansion plans). Therefore we should have \(\rho(r)=\rho(m_{t})\).
+2. \(\psi(r)<\psi(m_{t})\). In this case \(\rho(r)\) can be achieved by "substituting" the plan which caused \(\psi(m_{t})\) with the optimal plan containing \(r\). In this case, because we are substituting the entire synthesis plan we have \(\rho(r)=\psi(r)\)
+
+Equation 8 yields this answer in every case.
+
+Now consider a child \(m\) of \(r\) (a grandchild of the root node). If this child has only one parent reaction, clearly \(\rho(m)=\rho(r)\) (since any synthesis plan containing \(r\) would need to contain \(m\)). However, if \(m\) has multiple parents, it can effectively "choose" which plan to be a part of, and the definition of \(\rho\) implies considering only the maximum plan. Hence we would choose the parent on the best plan, which justifies the \(\max\) in equation 7.
+
+Finally, the most complex case: a reaction child \(r^{\prime}\) of \(m\) (a great-grandchild of the root node). Again there are two cases to consider:
+
+1. \(\psi(r^{\prime})=\psi(m)\). The same logic applies as for the root node: \(r^{\prime}\) is part of an optimal plan for \(m\), so \(\rho(r^{\prime})=\rho(m)\).
+2. \(\psi(r^{\prime})<\psi(m)\). This is the more complex case. Clearly \(\rho(r^{\prime})\) would be achieved by "substituting" the sub-plan under \(m\) which allows it to achieve \(\psi(m)\) with an optimal subtree containing \(r^{\prime}\), but unlike for direct children of the plan (e.g. \(r\)) we cannot simply set \(\rho(r^{\prime})=\psi(r^{\prime})\) because \(\psi(r^{\prime})\) only accounts for a sub-plan under \(r^{\prime}\), and not \(r\) or other children \(m^{\prime}\) of \(r\) (recall that reactions can have multiple reactants and we descended the tree only under a single reactant \(m\), ignoring its siblings). Thankfully, the additional parts of the plan are already accounted for in \(\rho(m)\). Because \(\rho(m)\) will be a product of probabilities of many sub-plans, and we know that the sub-plan we wish to remove has probability \(\psi(m)\), we can calculate \(\rho(r^{\prime})\) by starting with \(\rho(m)\), _dividing_ by \(\psi(m)\), then _multiplying_ by \(\psi(r^{\prime})\).
+
+In both cases this is exactly what equation 8 yields.
+
+The argument can be continued, but as this covers all of the cases we will conclude the explanation here.
+
+### Justification of node selection
+
+In this section we offer some further thoughts/justification of equation 9. When designing the algorithm, our first intuition was to instead select nodes by maximizing \(\alpha^{\prime}\):
+
+\[\alpha^{\prime}(m;\mathcal{G}^{\prime},\xi_{f},\xi_{b},h)=\mathbb{E}_{f\sim\xi_{ f},b\sim\xi_{b}}\left[\rho(m;\mathcal{G}^{\prime},f,b,h)\right]\.\]
+
+This is effectively choosing nodes which lie on synthesis plans that are predicted to be successful. However, we anticipated the following failure mode: in cases where \(\mathrm{s}(m_{t};\mathcal{G}^{\prime},f,b,h)=1\), in general \(\rho(m;\mathcal{G}^{\prime},f,b,h)<\rho(m_{t};\mathcal{G}^{\prime},f,b,h)\) for tip nodes \(m\). This is because the optimal synthesis plan for \(m_{t}\) will contain nodes _already shown to be a solution_. In this case, \(\rho(m;\mathcal{G}^{\prime},f,b,h)\) represents a SSP for an alternative plan which is not likely to be used. It seemed odd to select a node on this basis. By excluding such nodes in equation 9 we were able to only select nodes on their ability to form _alternative_ synthesis plans.
+
+Of course, equation 9 is clearly not the only sensible option for node selection. For example, the expected value \(\mathbb{E}\) could presumably be replaced with a median or some other quantile. If the \(\mathbf{1}\) operator is interpreted as a _weight_ for each sample from \(\xi_{f},\xi_{b}\), it might also make sense to use some sort of non-binary weighting instead of a binary weight. Ultimately, although these alternatives all seem sensible, we decided to just choose the expected value and did not investigate other options further.
+
+### Rejected alternative algorithms
+
+The first iteration of retro-fallback (_proto retro-fallback_) used a search tree instead of a search graph, and assumed that the feasibility/buyability of all reactions/molecules was _independent_. In this special case, the values of \(\mathrm{s},\psi,rho\) can all be computed analytically using dynamic programming. However, a major weakness of this algorithm is that forcing \(\mathcal{G}^{\prime}\) to be a tree required duplicating some molecules and reactions in the graph (e.g. if both the reactions \(A+B\Rightarrow C\) and \(A+D\Rightarrow C\) are possible then the molecule \(A\) and any reactions under it would be duplicated). The assumption of independence meant that the feasibility of the _same reactions_ would be sampled multiple times independently, leading to "backup plans" that actually used the same reaction. In practice this was often not an issue, but it did mean that the internal estimates of \(\mathrm{s}\) used by proto retro-fallback did not have a clear relationship to true SSP. Hence we decided to proceed using samples, which provided a natural avenue to remove the independence assumption. More details about proto retro-fallback can be given upon request to the authors.
+
+When designing the version of retro-fallback presented in this paper, we first considered _sampling_ outcomes for tip nodes using the heuristic function, and updating using the standard equations for \(\mathrm{s}\). This would effectively be a random heuristic, and although other algorithms use random heuristics (e.g. rollouts in MCTS) we decided that it would be an extra source of variance, and upon realizing that the expected value of such a heuristic can be computed analytically if the outcomes are assumed to be independent then we developed the equation for \(\psi\) and used that. However, if in the future other researchers wish to remove the independence assumption in the heuristic then probably its outcomes would also need to be sampled.
+
+### Practical implementation details
+
+Here we give further details of how retro-fallback can be implemented. This section is _not_ a description of our specific software implementation used in this paper: that is in Appendix F.1.7. Instead, we try to give general guidance that would be applicable for alternative implementations and alleviate potential sources of confusing or ambiguities.
+
+Graph initializationIn Algorithm 1 we start by initializing \(\mathcal{G}^{\prime}\) to contain just the target molecule. Strictly speaking this is not required: any starting graph can be used (as long as it satisfies the assumptions about AND/OR graphs in Appendix B, e.g. not having reactions as tip nodes or edges between molecules and reactions that should not be connected). All that is needed is to properly initialize the variables (\(\mathrm{s},\psi,\rho\)) before entering the main loop.
+
+Functional vs object-oriented implementationAlgorithm 1 is written implying a _functional_ implementation (e.g. accessing functions \(f_{i},b_{i}\) as needed). This was done for clarity and concisenessof presentation. In practice we recommend an _object-oriented_ implementation where the values of \(f_{i},b_{i},s_{i},\psi_{i},\rho_{i}\) are stored for each molecule/reaction. This allows for the main update steps of the algorithm to be vectorized (which is sensible because the same update equations are used for all samples) and allows \(f,b\) to have simpler interfaces.
+
+Samples from stochastic processesUsing the object-oriented implementation described above, algorithm 1 requires computing samples from the posterior stochastic process whenever new nodes are added to \(\mathcal{G}^{\prime}\). For processes where this is inexpensive (e.g. processes with independent outcomes) this is fast and the implementation is not important. However, when it is slow it is likely very important to use caching. For example, drawing samples from a GP posterior scales with \(O(N^{3})\): if \(\xi_{f}\) or \(\xi_{b}\) use a GP, this \(O(N^{3})\) operation at every step will result in an overall algorithm speed of \(O(N^{4})\)! To avoid this, we cached a Cholesky decomposition of the GP covariance matrix at every step and used incremental updating of the Cholesky decomposition to bring the overall complexity to at most \(O(N^{3})\). For other stochastic processes different techniques may be applicable, but in general for non-independent stochastic processes we anticipate some form of caching may be necessary.
+
+Priority QueuesIn each iteration of algorithm 1 all tip nodes of \(\mathcal{G}^{\prime}\) are found, and \(m_{e}\) is chosen by maximizing \(\alpha\) over all tip nodes. This operation in general scales as \(O(N)\), bringing the potential scaling of the algorithm to \(O(N^{2})\). In practice a different implementation is desirable. Because expanding the graph usually only results in a small number of nodes being updated, in practice the values of \(\alpha\) for many tip nodes does not change in most iterations. Therefore, we recommend storing all tip nodes in a priority queue (sorted by \(\alpha\)). When \(\rho\) is updated, all tip nodes for which at least one value of \(\rho\) changes would be removed and re-added with updated \(\alpha\) values. This procedure still has worst case \(O(N)\) complexity (because some updates could affect all tip nodes), but in we imagine its average complexity would be \(\tilde{O}(1)\), leading to overall \(\tilde{O}(N)\) scaling of the algorithm (neglecting potential worse scaling from other steps).
+
+Backward reaction modelAlgorithm 1 requires a backward reaction model \(B\). This is also not necessary: all that is needed is some way to decide what reactions to add to the graph. For example, if it was possible to obtain a list of reactions from \(\xi_{f}\) whose marginal feasibility is non-zero, this could be used as a replacement for \(B\).
+
+Termination conditionsAlgorithm 1 uses several termination conditions, some of which may not be necessary or could be modified:
+
+1. No nodes are left to expand. We believe this one is necessary.
+2. \(L\) iterations of expansion are done. This is not necessary: the algorithm alternatively terminate after a fixed wallclock time, or simply never terminate until it is killed by the user.
+3. All \(\mathrm{s}_{i}(m_{t})\) are 1: this is a sensible point to terminate because it means that \(\alpha(m)=0\) for all tip nodes \(m\). However, the algorithm could easily keep running past this point; it would just expand nodes arbitrarily because all nodes would have an equivalent value of \(\alpha(m)\). This condition could also be loosened: for example the algorithm could terminate when \(\hat{s}(m_{t})>1-\epsilon\) for some small \(\epsilon>0\). This is sensible if one believes that improvement beyond a certain point is redundant.
+
+## Appendix F Extended experiment section
+
+### Details of experimental setup
+
+#### f.1.1 Feasibility models
+
+As stated in section 6, we examined four feasibility models for this work, which assign different marginal feasibility values and different correlations between feasibility outcomes. The starting point for our feasibility models was the opinion of a trained organic chemist that around 25% of the reactions outputted by the pre-trained template classification model from Chen et al. (2020) were "obviously wrong". From this, we proposed the following two marginal values for feasibility:
+
+1. (C) A constant value of \(1/2\) for all reactions. This is an attempt to account for the 25% of reactions which were "obviously wrong", plus an additional unknown fraction of reactions which seemed plausible but may not work in practice. Ultimately anything in the interval \([0.2,0.6]\) seemed sensible to use, and we chose \(1/2\) as a nice number.
+2. (R) Based on previous work with template classifiers suggesting that the quality of the proposed reaction decreases with the softmax value (Segler & Waller, 2017; Segler et al., 2018), we decided to assign higher feasibility values to reactions with high softmax values. To avoid overly high or low feasibility values, we decided to values based on the _rank_ of the outputted reaction, designed the following function which outputs a high feasibility (\(\approx\)75%) for the top reaction and decreases to (\(\approx\)10%) for lower-ranked reactions: \[p(\mathrm{rank})=\frac{0.75}{1+\mathrm{rank}/10}\;.\] (13) Note that "rank" in the above equation starts from 0.
+
+We then added correlations on top of these marginal feasibility values. The independent model (I) is simple: reaction outcomes are sampled independently using the marginal feasibility values described above. To introduce some correlations without changing the marginal probabilities, we created the following probabilistic model which assigns feasibility outcomes by applying a threshold to the value of a latent Gaussian process (Williams & Rasmussen, 2006):
+
+\[\mathrm{outcome}(z) =\mathbf{1}_{z>0} \tag{14}\] \[z(r) \sim\mathcal{GP}\left(\mu(\cdot),K(\cdot,\cdot)\right)\] (15) \[\mu(r) =\Phi^{-1}\left(p(r)\right)\] (16) \[K(r,r) =1\quad\forall r \tag{17}\]
+
+Here, \(\Phi\) represents the CDF of the standard normal distribution and \(p(r)\) represents the desired marginal probability function. Because of equation 17, the marginal distribution of each reaction's \(z\) value is \(\mathcal{N}(\Phi^{-1}(p(r)),1)\) which will be positive with probability \(p(r)\). This ensures consistency with any desired marginal distribution for any kernel \(K\) with diagonal values of 1. If \(K\) is the identity kernel (i.e. \(K(r_{1},r_{2})=\mathbf{1}_{r_{1}=r_{2}}\)) then this model implies all outcomes are independent. However, non-zero off-diagonal values of \(K\) will induce correlations (positive or negative).
+
+We aimed to design a model which assigns correlations very conservatively: only reactions involving similar molecules _and_ which induce similar changes in the reactant molecules will be given a high positive correlation; all other correlations will be near zero. We therefore chose a kernel as a product of two simpler kernels:
+
+\[K_{\text{total}}(r_{1},r_{2})=K_{\text{mol}}(r_{1},r_{2})K_{\text{mech}}(r_{1 },r_{2})\;.\]
+
+We chose \(K_{\text{mol}}(r_{1},r_{2})\) to be the Jaccard kernel \(k(x,x^{\prime})=\frac{\sum_{i}\min(x_{i},x^{\prime}_{i})}{\sum_{i}\min(x_{i},x ^{\prime}_{i})}\) between the Morgan fingerprints (Rogers & Hahn, 2010) with radius 1 of the entire set of product and reactant molecules.9 We chose \(K_{\text{mech}}(r_{1},r_{2})\) to be the Jaccard kernel of the _difference_ between the product and reactant fingerprints individually. This is sensible because the difference between fingerprint vectors corresponds to a set of subgraphs which are added/removed as part of the reaction. Reactions which perform the same kinds of transformation will induce the same kinds of difference vectors.
+
+We illustrate some outputs of this kernel in Figures F.1-F.3. Figure F.1 shows that reactions with a high kernel value (\(>0.8\)) are generally quite similar, both in product and in mechanism. Figure F.2 shows that reactions with modest similarity values in \([0.4,0.6]\) have some similarities but are clearly less related. Figure F.3 shows that reactions with low similarity values in \([0.05,0.1]\) are generally quite different. After a modest amount of exploratory analysis we were satisfied that this kernel behaved as we intended, and therefore used it in our experiments without considering further alternatives. However, we imagine there is room for improvement of the kernel in future work to better align with the beliefs of chemists.
+
+#### f.1.2 Buxability Models
+
+Following Chen et al. (2020) we based our buyability models on the inventory of eMolecules: a chemical supplier which acts as a middleman between more specialized suppliers and consumers. According to eMolecule's promotional material they offer 6 "tiers" of molecules:
+
+1. _(Accelerated Tier)_. "Delivered in 2 days or less, guaranteed. Most reliable delivery service. Compound price is inclusive of a small service fee, credited back if not delivered on time. Available in the US only."
+2. "Shipped within 1- 5 business days. Compounds from suppliers proven to ship from their location in \(<5\) days."
+3. "Shipped within 10 business days. Compounds from suppliers proven to ship from across the globe in \(<10\) days"
+4. "Shipped within 4 weeks. Shipped from suppliers further from your site and often with more complex logistics. Synthesis may be required using proven reactions."
+5. "Shipped within 12 weeks. Usually requires custom synthesis on demand."
+6. "Varied ship times. Requires custom synthesis for which a quote can be provided on request."
+
+Much like machine learning researchers, chemists usually want to complete experiments as quickly as possible and probably would prefer not to wait 12 weeks for a rare molecule to be shipped to them. Such molecules could arguably be considered less "buyable" on this subjective basis alone,
+
+Figure F.1: Sample pairs of reactions where \(K_{\text{total}}>0.8\). **Top:** both reactions join a COCI group to an NH group in a ring to form molecules which differ only by the location of the CI atom on the right side ring (far away from the reaction site). **Middle:** two reactions transforming a tert-butyl ester into a ketone with a fluorine-containing ring (difference between reactions is the location of the CI atom on the ring far away from the reaction site). **Bottom:** two reactions removing a fluorine atom from an aromatic ring on similar molecules (difference is between the CI and OH groups). **Summary:** these pairs of reactions are all very similar.
+
+Figure F.2: Examples of reactions where \(0.4\leq K_{\text{total}}\leq 0.6\). **Top:** similar conjugation reactions, but the reactant on the right side is now a COO\({}^{-}\) anion instead of a COCl group. **Middle:** similar reaction, although on the right reaction has a Zn\({}^{+}\) on the ring instead of F. **Bottom:** two reactions which remove a fluorine atom from an aromatic ring but on molecules which are much less similar than Figure F.1. **Summary:** these pairs of reactions have similarities but are less similar than the reactions in Figure F.1.
+
+Figure F.3: Examples of reactions where \(0.05\leq K_{\text{total}}\leq 0.1\). The pairs of reactions are generally quite different.
+
+Figure F.2: Examples of reactions where \(0.4\leq K_{\text{total}}\leq 0.6\). **Top:** similar conjugation reactions, but the reactant on the right side is now a COO\({}^{-}\) anion instead of a COCl group. **Middle:** similar reaction, although on the right reaction has a Zn\({}^{+}\) on the ring instead of F. **Bottom:** two reactions which remove a fluorine atom from an aromatic ring but on molecules which are much less similar than Figure F.1. **Summary:** these pairs of reactions have similarities but are less similar than the reactions in Figure F.1.
+
+so we decided to create buyability models based on the tier of molecule. Unfortunately, the public repository for retro* does not contain any information on the tier of each molecule, and because their inventory was downloaded in 2019 this information is no longer available on eMolecules' website. Therefore we decided to re-make the inventory using the latest data.
+
+We downloaded data from eMolecules downloads page10, specifically their "orderable" molecules and "building blocks" with quotes. After filtering out a small number of molecules (31407) whose SMILES were not correctly parsed by rdkit we were left with 14903392 molecules with their associated purchase tiers. Based on this we created 2 buyability models:
+
+Footnote 10: Downloaded 2023-09-08.
+
+* **Basic:** all molecules in tiers 0-2 are purchasable with 100% probability. Corresponds to realistic scenario where chemists want to do a synthesis and promptly.
+* **Complex:** molecules are independently purchasable with probability that depends on the tier (100% for tiers 0-2, 50% for tier 3, 20% for tier 4, 5% for tier 5). These numbers were chosen as subjective probabilities that the compounds would be delivered within just 2 weeks (shorter than the longer times advertised). This still corresponds to a chemist wanting to do the synthesis within 2 weeks, but being willing to risk ordering a molecule whose stated delivery time is longer.
+
+_The experiments in section 6 use only the **basic** buyability model_. We performed some preliminary experiments with the **complex** buyability model but found that in most cases there was no difference. This makes sense: eMolecules is a real, profit-driven company and there is a clear financial incentive to quickly ship molecules which are useful for a wide range of syntheses. Molecules with longer shipping times are used more rarely, so one would expect them to only be useful in a smaller number of cases. Because of the page limit for conference papers, we decided to prioritize other experiments for this manuscript, and therefore do not show any results for this buyability model.
+
+In the future, we believe that better buyability models could be formed by introducing correlations between molecules coming from the same supplier, but we do not investigate that here (chiefly because the eMolecules data we downloaded does not contain information about suppliers).
+
+#### f.1.3 Test molecules
+
+The test molecules were generated with the following procedure:
+
+1. Download the publicly available test set from Brown et al. (2019)
+2. Filter our all molecules available in the eMolecules inventory (F.1.2)
+3. Shuffle all molecules and take the first 500
+
+Code to reproduce this process, and the entire test set in shuffled order is included in our supplementary material.
+
+We note that although many previous works have evaluated their methods on the 190 molecule test set from Chen et al. (2020), this test set is small and contains only molecules where finding any single synthesis plan is difficult, which only occurs for a small minority of molecules. It was unclear to us whether this would be a good test set: in particular, it is likely that the set of molecules where finding one synthesis plan is hard does not completely overlap with the set of molecules where finding _multiple_ synthesis plans is hard. By using a more "typical" set of molecules we avoid this bias. However, we do report results for the retro* 190 test set in Appendix F.4.
+
+#### f.1.4 Algorithm configuration
+
+Retro-fallback was run with \(k=1000\) samples from \(\xi_{f},\xi_{b}\). All other algorithms were run as per the "best proxy" description in Appendix C. In particular, this means:
+
+* Breadth-first search was run with no modifications.
+* retro* was run using \(-\log\mathbb{E}_{f}[f(r)]\) as the reaction cost and \(-\log\mathbb{E}_{b}[b(m)]\)* MCTS was run using \(\hat{\mathrm{s}}(m;T,\xi_{f},\xi_{b})\) as the reward for finding synthesis plan \(T\) (i.e. the empirical SSP for individual synthesis plans). To allow the algorithm to best make use of its budget of reaction model calls, we only expanded nodes after they were visited 10 times. The marginal feasibility value of reach reaction was used as the policy in the upper-confidence bound. We used an exploration constant of \(c=0.01\) to avoid "wasting" reaction model calls on exploration, and only gave non-zero rewards for up to 100 visits to the same synthesis plan to avoid endlessly re-visiting the same solutions.
+
+We chose _not_ to compare with proof-number search (Kishimoto et al., 2019) because we did not see a way to configure it to optimize SSP (see Appendix C.3). We chose not to compare with algorithms requiring some degree of learning from self-play (including RetroGraph and the methods discussed in Appendix G.1) due to computational constraints, and because it seemed inappropriate to compare with self-play methods without also learning a heuristic for retro-fallback with self-play.
+
+Because retro-fallback runs on a minimal AND/OR graph, we used a modified version of retro(r) which also operates on an AND/OR graph. This modified version is not our original creation (it is explained in section 3.5 of Chen et al. (2020)) and is fully consistent with the original tree-based version in that it estimates the same costs and expands the same nodes, it just does not store large duplicate subtrees and uses an alternative shortest-path algorithm to perform updating. We also run breadth-first search on the minimal AND/OR graph (although this requires no special modifications).
+
+#### f.1.5 Heuristic functions
+
+The heuristic obviously plays a critical role in heuristic-guided search algorithms! Ideally one would control for the effect of the heuristic by using the same heuristic for different methods. However, this is not possible when comparing algorithms from different families because the heuristics are interpreted differently! For example, in retro-fallback the heuristic is interpreted as a SSP in \([0,1]\) (higher is better), while in retro(r) it is interpreted as a cost between \([0,\infty)\) (lower is better). If we used literally the same heuristic it would give opposite signals to both of these algorithms, which is clearly not desirable or meaningful. Therefore, we tried our best to design heuristics which were "as similar as possible."
+
+Optimistic heuristicHeuristics which predict the best possible value are a common choice of naive heuristic. Besides being an important baseline, optimistic heuristics are always _admissible_ (i.e. they never overestimate search difficulty), which is a requirement for some algorithms like A* to converge to the optimal solution (Pearl, 1984). For retro-fallback, the most optimistic heuristic is \(h_{\text{rfb}}(m)=1\), while for retro(r) it is \(h_{\text{r*}}(m)=0\), as these represent the best possible values for SSP and cost respectively. For MCTS, the heuristics is a function of a _partial plan_\(T^{\prime}\) rather than a single molecule. We choose the heuristic to be \(\mathbb{E}_{f\sim\xi_{f}}[\min_{r\in T^{\prime}}f(r)]\), which is the expected SSP of the plan \(T^{\prime}\) if it were completed by making every tip molecule buyable.11 In practice this quantity was estimated from \(k\) samples (same as retro-fallback).
+
+Footnote 11: Note that the \(\min\) function will be 1 if _all_ reactions are feasible, otherwise 0. Using \(\prod_{r}\) instead of \(\min_{r}\) would yield the same output.
+
+SA score heuristicSA score gives a molecule a score between 1 and 10 based on a dictionary assigning synthetic difficulties to different subgraphs of a molecule (Ertl and Schuffenhauer, 2009). A score of 1 means easy to synthesize, while a score of 10 means difficult to synthesize. For retro-fallback, we let the estimated SSP decrease linearly with the SA score:
+
+\[h_{\text{rfb}}(m)=1-\frac{\text{SA}(m)-1}{10}\;.\]
+
+Because the reaction costs in retro(r) were set to negative log feasibility values, we thought a natural extension to retro(r) would be to use \(h_{\text{r*}}(m)=-\log h_{\text{rfb}}(m)\). This choice has the advantage of preserving the interpretation of total cost as the negative log joint probability, which also perfectly matches retro-fallback's interpretation of the heuristic (recall that in section 4.2 the heuristic values were assumed to be independent). We designed MCTS's heuristic to also match the interpretation of "joint probability":
+
+\[h_{\text{MCTS}}(T^{\prime})=\mathbb{E}_{f\sim\xi_{f}}\left[\left(\underbrace{ \min_{\begin{subarray}{c}\xi\in T\\ \text{reactions feasible}\end{subarray}}f(r)}_{\text{reactions feasible}} \right)\prod_{m\in\operatorname{tip}(T^{\prime}),b(m)=0}h_{\text{rfb}}(m)\right]\]
+
+which is the expected SSP of the plan if all non-purchasable molecules are made purchasable independently with probability \(h_{\text{rfb}}(m)\).
+
+#### f.1.6 Analysis
+
+Our primary analysis metric was the SSP. For algorithms that use AND/OR graphs (e.g. retro-fallback, retro*), we computed the SSP using equations 2-3 with \(k=10\,000\) samples from \(\xi_{f},\xi_{b}\).
+
+For algorithms which use OR trees the best method for analysis is somewhat ambiguous. One option is to extract all plans \(T\subseteq\mathcal{G}^{\prime}\) and calculate whether each plan succeeds on a series of samples \(f_{i},b_{i}\). A second option is to convert \(\mathcal{G}^{\prime}\) into an AND/OR graph and analyze it like other AND/OR graphs. Although they seem similar, these options are subtly different: an OR graph may contain reactions in different locations which are not connected to form a synthesis plan, but _could_ form a synthesis plan if connected. The process of converting into an AND/OR graph would effectively form all possible synthesis plans which could be made using reactions in the original graph, even if they are not actually present in the original graph. We did implement both methods and found that converting to an AND/OR graph tends to increase performance, so this choice does make a meaningful difference. We think the most "realistic" option is unclear, so for consistency with other algorithms we chose to just convert to an AND/OR graph.
+
+All analysis metrics involving individual synthesis routes were calculated by enumerating the routes in best-first order using a priority queue. More complex algorithms could also be used to do this (Shibukawa et al., 2020).
+
+#### f.1.7 Software Implementation
+
+Our code is included in the supplementary material of this paper. We built our code around the open-source library synthesus12(Maziar et al., 2023) and used its implementations of retro* and MCTS in our experiments. The exact template classifier from Chen et al. (2020) was used by copying their code and using their model weights. Our code benefitted from the following libraries:
+
+Footnote 12: [https://github.com/microsoft/syntheseus/](https://github.com/microsoft/syntheseus/)
+
+* pytorch(Paszke et al., 2019), rdkit13 and rdchiral(Coley et al., 2019). Used in the template classifier. Footnote 13: Specifically version 2022.09.4 (Landrum et al., 2023).
+* networkx(Hagberg et al., 2008). Used to store search graphs and for analysis.
+* numpy(Harris et al., 2020), scipy(Virtanen et al., 2020), and scikit-learn(Pedregosa et al., 2011). Used for array programming and linear algebra (e.g. in the feasibility models).
+
+### Additional plots for section 6.2
+
+See Figures F.4, F.5, F.6, F.7. These figures are discussed in section 6.2.
+
+Figure F.4: Extension of Figure 2: results for trivial molecules and all molecules.
+
+Figure F.5: Average SSP for algorithms using SAscore heuristic (interpretation is the same as Figure 2).
+
+Figure F.6: Alternative success metrics for algorithms with optimistic heuristic.
+
+Figure F.7: Alternative success metrics for algorithms with SAscore heuristic.
+
+### Case studies
+
+See Figure F.8 and its caption.
+
+Figure F.8: Success probability for some individual molecules. Solid lines represent the median value across 10 runs, and boundaries of the shaded region are the 25th and 75th percentiles.
+
+### Results on retro* 190 hard molecules
+
+Figure F.9 shows the success probability over time for harder molecules from Chen et al. (2020). All details of the setup are identical to those in section 6.2 except for the test molecules and the runtime (we extended it to 500 reaction model calls to match Chen et al. (2020)). Qualitatively, the results are very similar to those on the GuacaMol test set. Quantitatively, it appears that the SSP values are on average lower (which makes sense because these molecules are chosen to be challenging to solve) and that the difference between retro-fallback and the other algorithms is larger. These results clearly support the claim that retro-fallback outperforms other algorithms at maximizing SSP.
+
+Figure F.9: Average success probability over time for 190 "hard" molecules from Chen et al. (2020) using the optimistic heuristic (top) and SAscore heuristic (bottom).
+
+### Results on FusionRetro benchmark
+
+Here we present results on the benchmark dataset from FusionRetro, which is derived from USPTO routes and contains 5838 test molecules (Liu et al., 2023b). In addition to SSP and the fraction solved, we also evaluate performance by checking whether the outputted synthesis plans use the same starting molecules as a known ground-truth synthesis route. Liu et al. (2023b) call this metric "exact set-wise matching," but we will call it _precursor matching_ because we think this name is less ambiguous. Because this metric depends on the purchasable molecules, we use a buyability model derived from the inventory of Liu et al. (2023b) instead of the model derived from eMolecules used for all other experiments. This is a deterministic model: molecules in the inventory are independently buyable with probability 1, and all other molecules are not buyable. We use the rank-independent feasibility model from section 6.2. All other details are kept the same.
+
+The results after 50 reaction model calls are tabulated in Table F.1. As expected, retro-fallback attains higher SSP scores than the baseline retro* and breadth-first search methods, regardless of the heuristic. Just like on the GuacaMol test set from section 6.2, retro-fallback also finds at least one potential synthesis route for a higher fraction of molecules than the baselines. Finally, the precursor matching for the single most feasible synthesis plan is extremely similar for all methods (around 18%, with differences between the methods not being statistically significant).14 This is what one would expect: the best synthesis plans found by all methods will likely be similar; the difference between retro-fallback and the other algorithms is in the secondary synthesis plans that it finds. Overall, these results show that retro-fallback outperforms baseline algorithms on the SSP metric while being no worse than the baselines on metrics which involve only single synthesis plans.
+
+Footnote 14: Readers familiar with Liu et al. (2023b) may wonder why the precursor matching scores are much lower than what is reported in Table 1 of Liu et al. (2023b). This is because we used the same pre-trained reaction model from Chen et al. (2020) as our single-step model, whereas Liu et al. (2023b) retrains the models using their training dataset. We did not re-train the model because it also forms the basis for our feasibility model, which was loosely calibrated with the inspections of an expert chemist.
+
+\begin{table}
+\begin{tabular}{l l l l l} \hline \hline Algorithm & Heuristic & Mean SSP (\%) & Solved (\%) & Precursor Match (\%) \\ \hline BFS & N/A & 68.38\(\pm\)0.55 & 76.14\(\pm\)0.56 & 17.75\(\pm\)0.50 \\ retro* & optimistic & 73.73\(\pm\)0.52 & 80.22\(\pm\)0.52 & 18.24\(\pm\)0.51 \\ retro* & SAScore & 74.66\(\pm\)0.52 & 80.56\(\pm\)0.52 & 18.14\(\pm\)0.50 \\ \hline retro-fallback & optimistic & 75.88\(\pm\)0.50 & 82.67\(\pm\)0.50 & 17.85\(\pm\)0.50 \\ retro-fallback & SAScore & **78.32\(\pm\)**0.48 & **84.31\(\pm\)**0.48 & 18.14\(\pm\)0.50 \\ \hline \hline \end{tabular}
+\end{table}
+Table F.1: Results on 5838 test molecules FusionRetro benchmark (Liu et al., 2023b). Experimental details and metrics are explained in section F.5. Larger values are better for all metrics. \(\pm\) values indicate standard error of the mean estimate. The largest value within each column is marked in **bold** (when not within the standard error of any other values).
+
+Extended related work
+
+Here we cite and discuss papers which are worth commenting on, but were not discussed in the main text.
+
+### Search heuristics for retrosynthesis
+
+Many papers propose search heuristics for retrosynthesis algorithms, including rollouts (Segler et al., 2018), parametric models (Chen et al., 2020), and a variety of heuristics informed by chemical knowledge (Schwaller et al., 2020; Ertl and Schuffenhauer, 2009; Thakkar et al., 2021; Li and Chen, 2022). Many papers also propose to learn heuristics using techniques from machine or reinforcement learning, where a heuristic is learned based on previous searches or data (Coley et al., 2018; Liu et al., 2022; Kim et al., 2021; Yu et al., 2022; Liu et al., 2023a). A potential point of confusion is that some of these works describe their contribution as a "retrosynthesis algorithm" or "retrosynthetic planning algorithm." Given that the end product of these papers is a value function that is plugged into a previously proposed algorithm (typically MCTS or retro*), we think these papers should be more accurately viewed as proposing heuristics. The heuristic is orthogonal to the underlying search algorithm, so we view these works as complementary rather than competitive. We hope in the future to investigate learning heuristics for retro-fallback using similar principles.
+
+### Generative models
+
+Several works propose parametric generative models of synthesis plans (Bradshaw et al., 2019; Gottipati et al., 2020; Gao et al., 2021). Although this resembles the goal of explicit search algorithms, such generative models are fundamentally limited by their parametrization: they have no guarantee to find a synthesis plan if it exists, and are often observed to fail to produce a valid synthesis plan in practice (Gao et al., 2021). We think such models are best viewed as trying to _amortize_ the output of an explicit planning algorithms, making them more similar in spirit to search heuristics (G.1).
+
+### Single-step retrosynthesis
+
+Many models have been proposed to predict possible chemical reactions, including template classifiers (Segler and Waller, 2017; Seidl et al., 2021), graph editing methods (Dai et al., 2019; Sacha et al., 2021; Chen and Jung, 2021), and transformers (Irwin et al., 2022; Zhong et al., 2022; Liu et al., 2023b). Such models are a useful component of a retrosynthesis algorithm, but do not themselves perform _multi-step_ retrosynthesis.
+
+### FusionRetro
+
+One work which does not fit nicely into any of the previous subsections is FusionRetro (Liu et al., 2023b). On one level, the paper describes a reaction prediction model based on a transformer, which is essentially a single-step reaction prediction model (G.3). However, unlike other models which just condition on a single input molecule, in FusionRetro the predictions are conditioned on all predecessor molecules in a multi-step search graph. The paper describes an inference procedure to make predictions from the model autoregressively, which resembles both a generative model for synthesis routes (G.2) or a pruning heuristic for breadth-first search (G.1). A significant portion of the paper also describes benchmarking and evaluation of route quality.
+
+We think that FusionRetro and retro-fallback can both be viewed as responses to unrealistically lenient evaluation metrics used in prior works on retrosynthesis (chiefly reporting success if a "solution" is found without any regard to whether the solution is realistic). Liu et al. (2023b)'s general response is to evaluate the quality of entire routes rather than individual steps, and perform this evaluation using entire synthesis routes from the literature. The advantage of this approach is that it is close to ground-truth data, but has the disadvantage that high-quality ground truth data is fairly scarce, especially for long routes involving rare reactions. In contrast, our response is to model uncertainty about reactions and use this uncertainty in evaluation (to define SSP). The advantage of our approach is that it does not [necessarily] require any data, while the disadvantage is that it requiresa good model of reaction uncertainty, which we currently do not have (and creating such a model is likely to be difficult).
+
+Critically, the approaches described in these papers are _not_ mutually exclusive: a backward reaction model which depends on the entire search graph \(\mathcal{G}^{\prime}\) (such as FusionRetro) could be used in retro-fallback, while the quality of synthesis routes proposed by a method like FusionRetro could be evaluated using SSP. We leave combining and building upon these works in more realistic retrosynthesis programs to future work.
+
+Future work
+
+Relaxing assumptionsIf one wishes to re-insert the "nuance" lost by defining feasibility and buyability as binary outcomes, one could potentially explicitly model factors such as yields and shipping times and build a binary stochastic process on top of this. We do not have a clear idea of how retro-fallback or SSP could be generalized into some sort of continuous "degree of success", but imagine future work in this area could be useful. Relaxing the independence assumption of the heuristic function was discussed in Appendix E.3. The heuristic could potentially also be modified to depend on the remaining compute budget. Finally, using a separate feasibility and buyability model implicitly assumes that these outcomes are independent. We think this is a reasonable assumption because reaction feasibility is uncertain due to not fully understanding the physical system or not having a reliable model \(B\), while uncertainty in buyability would originate from issues of shipping, etc. That being said, "virtual libraries" are one area where a molecule not being buyable meant that somebody else was unable to synthesize it. This may impact which reactions a chemist would consider feasible (although it seems unlikely in practice that a vendor would tell you the reactions that they tried). Nonetheless, if one wanted to account for this \(\xi_{f}\) and \(\xi_{b}\) could be merged into a joint feasibility-buyability model \(\xi_{fb}\) from which functions \(f\) and \(b\) are simultaneously sampled.
+
+Further ProofsWe suspect that it is possible to give a theoretical guarantee that retro-fallback's worst-case performance is better than that of retro* by formalizing the scenario in section 4.1. However, we were unable to complete such a proof at the time of submission. We also expect it could be possible (and useful) to theoretically characterize how the behaviour retro-fallback with a finite number of samples \(k\) deviates from the behaviour of "exact" retro-fallback in the limit of \(k\rightarrow\infty\) where all estimates of SSP are exact. Such analysis might provide insight into how large \(k\) should be set to for more general feasibility models.

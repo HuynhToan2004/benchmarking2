@@ -1,0 +1,400 @@
+# Stochastic Gradient Descent
+
+for Gaussian Processes Done Right
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+We study the optimisation problem associated with Gaussian process regression using squared loss. The most common approach to this problem is to apply an exact solver, such as conjugate gradient descent, either directly, or to a reduced-order version of the problem. Recently, driven by successes in deep learning, stochastic gradient descent has gained traction as an alternative. In this paper, we show that when _done right_--by which we mean using specific insights from the optimisation and kernel communities--this approach is highly effective. We thus introduce a particular stochastic dual gradient descent algorithm, that may be implemented with a few lines of code using any deep learning framework. We explain our design decisions by illustrating their advantage against alternatives with ablation studies and show that the new method is highly competitive. Our evaluations on standard regression benchmarks and a Bayesian optimisation task set our approach apart from preconditioned conjugate gradients, variational Gaussian process approximations, and a previous version of stochastic gradient descent for Gaussian processes. On a molecular binding affinity prediction task, our method places Gaussian process regression on par in terms of performance with state-of-the-art graph neural networks.
+
+## 1 Introduction
+
+Gaussian processes are a probabilistic framework for learning unknown functions. They are the de facto standard model of choice in areas like Bayesian optimisation, where uncertainty-aware decision making is required to gather data in an efficient manner. The main limitation of Gaussian process models is that computing their posterior mean or producing a posterior sample requires solving a large quadratic optimisation problem--minimising the kernel ridge regression objective--which, using direct methods, has a cost cubic in the number of observations. Standard approaches to reduce this cost typically apply approximations which reduce the complexity of the quadratic optimisation problem, such as Nystrom and related variational approximations (Williams and Seeger, 2000; Titsias, 2009; Hensman et al., 2013), or use carefully engineered iterative solvers, such as preconditioned conjugate gradients (Wang et al., 2019), or employ a combination of both (Rudi et al., 2017).
+
+Alternatively, one can approach the problem using stochastic optimisation: Lin et al. (2023) and Dai et al. (2014) show that a variant of stochastic gradient descent outperforms preconditioned conjugate gradients whenever the data set is too large for convergence of the latter. Indeed, Lin et al. (2023) show that while stopping conjugate gradients prior to convergence may yield very poor results, the performance of stochastic gradient methods degrades gracefully, both in terms of the Gaussian process mean predictions and the associated error bar estimates. This makes stochastic optimisation methods attractive in large-scale or low-compute settings.
+
+In this paper, we introduce _stochastic dual descent_, a stochastic gradient descent method based on insights from the kernel and optimisation communities, where the application of stochastic gradient descent to quadratic problems has been studied in depth. Stochastic dual descent is very simple, and may be implemented in a few lines of code using standard deep learning libraries. It combines (i) a dual objective in place of the (primal) kernel ridge regression objective, (ii) stochastic approximation entirely via random subsampling of the data instead of random features, (iii) Nesterov's momentum, and (iv) geometric, rather than arithmetic, iterate averaging. Stochastic dual descent can be seen as an adaptation of the stochastic dual coordinate ascent (SDCA) algorithm of Shalev-Shwartz and Zhang(2013) to the large-scale deep-learning-type gradient descent framework, combined with insights on stochastic approximation from the theoretical work of Dieuleveut et al. (2017) and Varre et al. (2021).
+
+As a result of the careful choices behind our method, we significantly improve upon the results of Lin et al. (2023) for stochastic gradient descent in the fixed kernel setting. For this, we present the following experimental evidence:
+
+1. On standard UCI regression benchmarks with up to 2 million observations, stochastic dual descent either matches or improves upon the performance of conjugate gradients.
+2. On the large-scale Bayesian optimisation task considered by Lin et al. (2023), stochastic dual descent is shown to be superior to their stochastic gradient descent method and other baselines, both against the number of iterations and against wall-clock time.
+3. On a molecular binding affinity prediction task, where Gaussian processes have not previously been shown to be competitive with deep learning approaches, the performance of stochastic dual descent matches that of state-of-the-art graph neural networks.
+
+In short, we show that a simple-but-well-designed stochastic gradient method for Gaussian processes can be very competitive with other approaches for Gaussian processes, and may make Gaussian processes competitive with graph neural networks on tasks on which the latter are state-of-the-art.
+
+## 2 Gaussian Process Regression
+
+We consider Gaussian process regression over a domain \(\mathcal{X}\subset\mathbb{R}^{d}\), assuming a Gaussian process prior associated with a continuous, bounded, positive-definite kernel function \(k:\mathcal{X}\times\mathcal{X}\rightarrow\mathbb{R}\). The goal is either (i) to produce a sample from the Gaussian process posterior given some observations or (ii) to compute the mean of such a posterior.
+
+To formalise these goals, let some observed inputs \(x_{1},\ldots,x_{n}\in\mathcal{X}\) be collected in a matrix \(X\in\mathbb{R}^{n\times d}\) and let \(y\in\mathbb{R}^{n}\) denote the corresponding observed real-valued targets. We say that a random function \(f_{n}\colon\mathcal{X}\rightarrow\mathbb{R}\) is a sample from the _posterior Gaussian process_ associated with the kernel \(k\), data set \((X,y)\), and likelihood variance parameter \(\lambda>0\), if the distribution of any finite set of its marginals is jointly multivariate Gaussian, and the mean and covariance between the marginals of \(f_{n}\) at any \(a\) and \(a^{\prime}\) in \(\mathcal{X}\) are given by
+
+\[m_{n}(a)=\mathbb{E}[f_{n}(a)] =k(a,X)(K+\lambda I)^{-1}y\quad\text{and}\] \[\operatorname{Cov}(f_{n}(a),f_{n}(a^{\prime})) =k(a,a^{\prime})-k(a,X)(K+\lambda I)^{-1}k(X,a^{\prime})\]
+
+respectively, where \(K\in\mathbb{R}^{n\times n}\) is the \(n\times n\) matrix whose \((i,j)\) entry is given by \(k(x_{i},x_{j})\), \(I\) is the \(n\times n\) identity matrix, \(k(a,X)\) is a row vector in \(\mathbb{R}^{n}\) with entries \(k(a,x_{1}),\ldots,k(a,x_{n})\) and \(k(X,a^{\prime})\) is a column vector defined likewise (per the notation of Rasmussen and Williams, 2006).
+
+For two vectors \(a,b\in\mathbb{R}^{p}\), with \(p\in\mathbb{N}^{+}\), we write \(a^{\mathsf{T}}b\) for their usual inner product and \(\|a\|\) for the 2-norm of \(a\). For a symmetric positive semidefinite matrix \(M\in\mathbb{R}^{p\times p}\), we write \(\|a\|_{M}\) for the \(M\)-weighted 2-norm of \(a\), given by \(\|a\|_{M}^{2}=a^{\mathsf{T}}Ma\). For a symmetric matrix \(S\), we write \(\|S\|\) for the operator norm of \(S\), and \(\lambda_{i}(S)\) for the \(i\)th largest eigenvalue of \(S\), such that \(\lambda_{1}(S)=\|S\|\).
+
+## 3 Stochastic Dual Descent for Regression and Sampling
+
+We show our proposed algorithm, _stochastic dual descent_, in Algorithm 1. The algorithm can be used for two purposes: regression, where the goal is to produce a good approximation to the posterior mean function \(m_{n}\), and sampling, that is, drawing a sample from the Gaussian process posterior.
+
+The algorithm takes as input a kernel matrix \(K\), the entries of which can be computed online using \(k\) and \(x_{1},\ldots,x_{n}\) as needed, a likelihood variance \(\lambda>0\), and a target vector \(b\in\mathbb{R}^{n}\). It produces a vector of coefficients \(\overline{\alpha}_{T}\in\mathbb{R}^{n}\), which approximates
+
+\[\alpha^{\star}(b) =(K+\lambda I)^{-1}b. \tag{1}\]
+
+Now, given a \(\alpha\in\mathbb{R}^{n}\), let
+
+\[h_{\alpha}(\cdot) =\sum_{i=1}^{n}\alpha_{i}k(x_{i},\cdot).\]Then \(h_{\alpha^{*}(y)}\) gives the mean function \(m_{n}\). Furthermore, when \(f_{0}\) is a sample from the Gaussian process prior associated with \(k\), and \(\zeta\sim\mathcal{N}(0,\lambda I)\), we have that
+
+\[f_{0}+h_{\alpha^{*}(y-(f_{0}(X)+\zeta))}\]
+
+is a sample from the Gaussian process posterior; this approach is termed _pathwise conditioning_ by Wilson et al. (2020, 2021). To produce \(f_{0}\), we use random features (as done in Wilson et al., 2020, 2021; Lin et al., 2023).
+
+In the following subsections, we examine and justify each of the choices behind the algorithm design, and illustrate these on the UCI data set pol (Dua and Graff, 2017)--chosen for its small size, which helps us to compare against more alternatives, including those less effective. Since what we present here has appeared in bits and pieces across multiple communities, we delay bibliographical information and comparisons until Section 3.4.
+
+### Gradient Descent: Primal versus Dual Objectives
+
+For any \(b\in\mathbb{R}^{n}\), computing the vector \(\alpha^{\star}(b)\) of equation (1) directly, using naive Cholesky factorisation, takes on the order of \(n^{3}\) operations. People familiar with regression estimation will, however, recognise that \(\alpha^{\star}(b)\) is the minimiser of the quadratic
+
+\[L(\alpha)=\frac{1}{2}\|b-K\alpha\|^{2}+\frac{\lambda}{2}\|\alpha\|_{K}^{2}\]
+
+over \(\alpha\in\mathbb{R}^{n}\). In the literature, \(L\) is known as the kernel ridge regression objective (Smola and Scholkopf, 1998); we call \(L\) the _primal_ objective in the context of this work.
+
+Consider using gradient descent to minimise \(L(\alpha)\). This entails constructing a sequence \((\alpha_{t})\) of elements in \(\mathbb{R}^{n}\), which we initialise at the standard but otherwise arbitrary choice \(\alpha_{0}=0\), and setting
+
+\[\alpha_{t+1}=\alpha_{t}-\beta\nabla L(\alpha_{t}),\]
+
+where \(\beta>0\) is a step-size and \(\nabla L\) is the gradient function of \(L\). The _primal_ gradient and Hessian are
+
+\[\nabla L(\alpha)=K(\lambda\alpha-b+K\alpha)\quad\text{and}\quad\nabla^{2}L( \alpha)=K(K+\lambda I) \tag{2}\]
+
+respectively. Recall that the speed at which \(\alpha_{t}\) approaches \(\alpha^{\star}(b)\) is determined by the condition number of the Hessian: the larger the condition number, the slower the convergence speed. The intuitive reason for this correspondence is that, to guarantee convergence, the step-size needs to scale inversely with the largest eigenvalue of the Hessian, while progress in the direction of an eigenvector underlying an eigenvalue is governed by the step-size multiplied with the corresponding eigenvalue. For the primal objective, the tight bounds on the relevant eigenvalues are
+
+\[0\leq\lambda_{n}(K(K+\lambda I))\leq\lambda_{1}(K(K+\lambda I))\leq\kappa n( \kappa n+\lambda),\]
+
+where \(\kappa=\sup_{x\in\mathcal{X}}k(x,x)\) is finite by assumption. These bounds only allow for a step-size \(\beta\) on the order of \((\kappa n(\kappa n+\lambda))^{-1}\) and, since they do not bound the minimum eigenvalue away from zero, we do not have a priori guarantees for the performance of gradient descent.
+
+Consider, instead, minimising the _dual objective_
+
+\[L^{*}(\alpha)=\frac{1}{2}\|\alpha\|_{K+\lambda I}^{2}-\alpha^{\mathsf{T}}b.\]
+
+The dual \(L^{*}\) has the same unique minimiser as \(L\), namely \(\alpha^{*}(b)\)--indeed, we show in Appendix A that \((L,\lambda L^{*})\) ares, in a certain sense, a dual pair of optimisation objectives; the factor of \(\lambda\) is immaterial. The _dual gradient_ and Hessian are given by
+
+\[g(\alpha):=\nabla L^{*}(\alpha)=\lambda\alpha-b+K\alpha\quad\text{and}\quad \nabla^{2}L^{*}(\alpha)=K+\lambda I. \tag{3}\]
+
+Observe that running gradient descent on the dual objective \(L^{*}\), that is, using the gradient function \(g\) in place of \(\nabla L\), we can use a step-size of up to an order of \(\kappa n\) higher than before. Moreover, since the condition number of the dual satisfies \(\mathrm{cond}(K+\lambda I)\leq 1+\kappa n/\lambda\) and \(\lambda\) is positive, we have faster convergence, and can provide an a priori bound on the number of iterations required for any fixed error level for any length \(n\) sequence of observations.
+
+To illustrate the discussion so far, we compare the progress of dual and the primal gradient descent on the UCI pol regression task, with results shown in Figure 1. There, for the step-sizes we tried, gradient descent with the primal objective was only stable up to \(\beta n=0.1\), and diverged for larger step-sizes. In contrast, gradient descent with the dual objective is stable with a step-size as much as \(500\times\) higher, converges faster and to a better solution. We show this on three evaluation metrics: distance to \(\alpha^{*}(y)\) measured in \(\|\cdot\|_{K}^{2}\), the \(K\)-norm (squared) and in \(\|\cdot\|_{K^{2}}^{2}\), the \(K^{2}\)-norm (squared), and test set root mean square error (RMSE). To understand the difference between the two norms, note that the \(K\)-norm error bounds the error of approximating \(h_{\alpha^{*}(b)}\) uniformly. Indeed, as shown in Appendix A, we have the bound
+
+\[\|h_{\alpha}-h_{\alpha^{*}(b)}\|_{\infty}\leq\sqrt{\kappa}\|\alpha-\alpha^{*}( b)\|_{K}^{2}\,, \tag{4}\]
+
+where \(\kappa=\sup_{x\in\mathcal{X}}k(x,x)\). Uniform norm guarantees of this type are crucial for sequential decision making tasks, such as Bayesian optimisation, where test input locations may be arbitrary. The \(K^{2}\)-norm metric, on the other hand, reflects training error. Examining the gradients, its immediate that the primal gradient optimises for the \(K^{2}\)-norm, while the dual for the \(K\)-norm. And indeed, we see in Figure 1 that when both methods use \(\beta n=0.1\), up to \(70\)k iterations, the dual method is better on the \(K\)-norm metric and the primal on \(K^{2}\). Later, the dual gradient method performs better on all metrics. This, too, is to be expected, as the minimum eigenvalue of the Hessian of the dual loss is higher than that of the primal loss.
+
+### Randomised Gradients: Random Features versus Random Coordinates
+
+To compute either the primal or the dual gradients, presented in equations (2) and (3), we need to evaluate matrix-vector products of the form \(K\alpha\), which require \(n^{2}\) computations. We now look at two ways that use a noisy gradient estimate to reduce this cost to order \(n\) computations. Observe that this needs to be done carefully: when stochasticity is introduced into the gradient, more iterations are
+
+Figure 1: Comparison of full-batch primal and dual gradient descent on pol with varying step-sizes. Primal gradient descent becomes unstable and diverges for \(\beta n\) greater than \(0.1\). Dual gradient descent is stable with larger step-sizes, allowing for markedly faster convergence than the primal. For \(\beta n=0.1\), the dual method makes more progress in the \(K\)-norm, whereas the primal in the \(K^{2}\)-norm.
+
+needed to average out the resulting noise. This increase in the number of iterations will depend on the magnitude of the noise and how this magnitude changes as \(\alpha\) approaches \(\alpha^{\star}(b)\).
+
+We show the two types of randomised gradient calculations for the dual gradient \(g(\alpha)\). For the sake of exposition (and exposition only, this is not an assumption of our algorithm), we assume that we are in a \(m\)-dimensional (finite) linear model setting, such that \(K\) is of the form \(\sum_{j=1}^{m}z_{j}z_{j}^{\mathsf{T}}\), where \(z_{j}\in\mathbb{R}^{n}\) collects the values of the \(j\)th feature of the \(n\) observations, \(x_{1},\ldots,x_{n}\). Then, \(K\alpha=\sum_{j=1}^{m}z_{j}z_{j}^{\mathsf{T}}\alpha\). It follows that
+
+\[\widetilde{g}(\alpha)=\lambda\alpha-b+mz_{j}z_{j}^{\mathsf{T}}\alpha\quad\text {where}\quad j\sim\mathrm{Uniform}(\{1,\ldots,m\})\]
+
+gives an unbiased estimate of \(g(\alpha)\), since \(\mathbb{E}[mz_{j}z_{j}^{\mathsf{T}}]=K\). An alternative is to use
+
+\[\widehat{g}(\alpha)=ne_{i}e_{i}^{\mathsf{T}}g(\alpha)=ne_{i}(\lambda\alpha_{i }-b_{i}+K_{i}\alpha)\quad\text{with}\quad i\sim\mathrm{Uniform}(\{1,\ldots,n\}).\]
+
+Thanks to \(\mathbb{E}[ne_{i}e_{i}^{\mathsf{T}}]=I\), this is also an unbiased estimate of \(g(\alpha)\). Note that the cost of calculating either \(\widetilde{g}(\alpha)\) or \(\widehat{g}(\alpha)\) is linear in \(n\), achieving our goal of reduced computation time. Also, note that while \(\widetilde{g}(\alpha)\), which we call the random feature estimate, is generally a dense vector, \(\widehat{g}(\alpha)\), which we call the random coordinate estimate, is sparse. In particular, all but one coordinates of \(\widehat{g}(\alpha)\) are zero.
+
+While so far \(\widetilde{g}\) and \(\widehat{g}\) may appear similarly appealing, the nature of the noise introduced by these, and thus their qualities, are quite different. In particular, one can show that
+
+\[\|\widehat{g}(\alpha)-g(\alpha)\|\leq\|(M-I)(K+\lambda I)\|\|\alpha-\alpha^{ \star}(b)\|\,,\]
+
+where \(M=ne_{i}e_{i}\) is the random coordinate approximation to the identity matrix. As such, the noise introduced by \(\widehat{g}(\alpha)\) is proportional to the distance between the current iterate \(\alpha\), and the target \(\alpha^{\star}\). For \(\widetilde{g}(\alpha)\), letting \(\widetilde{K}=mz_{j}z_{j}^{\mathsf{T}}\), we have
+
+\[\|\widetilde{g}(\alpha)-g(\alpha)\|=\|(\widetilde{K}-K)\alpha\|\,.\]
+
+As such, the error in \(\widetilde{g}(\alpha)\) is _not reduced_ as \(\alpha^{\star}(b)\). In the optimisation literature, \(\widetilde{g}\) would be classed as an _additive noise_ gradient oracle, whereas \(\widehat{g}\) as a _multiplicative noise_ oracle (Dieuleveut et al., 2017). Intuitively, multiplicative noise oracles automatically reduce the amount of noise injected as the iterates get closer to their target. While harder to analyse, multiplicative noise oracles often yield better performance: see, for example, Varre et al. (2021).
+
+When \(m\), the number of features, is larger than \(n\), individual features \(z_{j}\) may also be less informative than individual gradient coordinates \(e_{i}e_{i}^{\mathsf{T}}g(\alpha)\). Thus, picking features uniformly at random, as in \(\widetilde{g}\), may yield a poorer estimate. While this can be addressed by introducing an importance sampling
+
+Figure 2: A comparison of dual (stochastic) gradient descent on the pol data set with either random Fourier features or random coordinates, using batch size \(B=512\), momentum \(\rho=0.9\) and averaging parameter \(r=0.001\) (see Section 3.3 for explanation of latter two). Random features converge with \(\beta n=5\times 10^{-4}\) but perform poorly, and diverge with a higher step-size. Random coordinates are stable with \(\beta n=50\) and show much stronger performance on all metrics. We include a version of random coordinates where only the \(K\alpha\) term is subsampled: this breaks the multiplicative noise property, and results in an estimate which is worse on both the \(K\)-norm and the \(K^{2}\)-norm metric.
+
+distribution for the features \(z_{j}\) (per Li et al., 2019), this adds implementation complexity, and could likewise be used to improve the random coordinate estimate.
+
+In Figure 2, we compare variants of stochastic dual descent with either random (Fourier) features or random coordinates. We see that random features, which produce high-variance additive noise, can only be used with very small step-sizes and have poor asymptotic performance. We test two versions of random coordinates: \(\widehat{g}(\alpha)\), where, as presented, we subsample the whole gradient, and an alternative, \(ne_{i}e_{i}^{\mathrm{T}}(K\alpha)-y-\lambda\alpha\), where only the \(K\alpha\) term is subsampled. While both are stable with much higher step-sizes than random features, the latter has worse asymptotic performance. This is a kind of _Rao-Blackwellisation trap:_ introducing the known value of \(-y+\lambda\alpha\) in place of its estimate \(ne_{i}e_{i}^{\mathrm{T}}(-y+\lambda\alpha)\) destroys the multiplicative property of the noise, making things worse, not better.
+
+There are many other possibilities for constructing randomised gradient estimates. For example, Dai et al. (2014) applied the random coordinate method on top of the random feature method, in an effort to further reduce the order \(n\) cost per iteration of gradient computation. However, based on the above discussion, we generally recommend estimates that produce multiplicative noise, and our randomised coordinate gradient estimates as the simplest of such estimates.
+
+### Connections to Literature & Theory
+
+The dual formulation for the kernel ridge regression objective was first pointed out in the kernel literature in Saunders et al. (1998). It features in textbooks on the topic (see equations (10.95) and (10.98) in Smola and Scholkopf, 1998), albeit with no mention of its better conditioning. Gradient descent on the dual objective is equivalent to applying the _kernel adatron_ update rule of Frie et al. (1998), stated there for the hinge loss, and to the _kernel least-mean-square_ algorithm of Liu et al. (2008), analysed theoretically in Dieuleveut et al. (2017). Shalev-Shwartz and Zhang (2013) introduce _stochastic dual coordinate ascent_ (SDCA), which uses the dual objective with random coordinates and analytic line search, and provide convergence results. Tu et al. (2016) implement a block (minibatched) verison of SDCA. Bo and Sminchisescu (2008) propose a method similar to SDCA, but with coordinates chosen by active learning, later reimplemented by Wu et al. (2023).
+
+Stochastic gradient descent was used, amongst others, by Dai et al. (2014) for kernel regression with the primal objective and random Fourier features; by Kivinen et al. (2004) for online learning with the primal objective with random sampling of training data; by Antoran et al. (2023) for for large-scale Bayesian linear models with the dual objective; and by Lin et al. (2023) for Gaussian processes with the primal objective and a mixture of random coordinates and random features. The work of Lin et al. (2023) is closest in application to ours, and will serve as the SGD baseline in our experiments.
+
+The convergence of our method (in a range of senses) follows from standard results in the optimisation and theory literature. Some of the more interesting results are as follows. _Stochastic dual gradient descent:_ the convergence of stochastic dual gradient descent methods with arithmetic iterate averaging, under multiplicative noise, for least squares, was established by Dieuleveut et al. (2017). _Last iterate convergence:_ that iterate averaging is not necessary for the convergence of stochastic gradient descent for least squares under multiplicative gradient noise was demonstrated in Varre et al. (2021) (in an online setting, under an interpolation assumption, but the result follows by the same logic for the fixed data-set setting). The result was foreshadowed by the work of Schmidt and Roux (2013), who showed last iterate convergence under a related strong growth condition for the stochastic gradient oracle. It is immediate that geometric iterate averaging, as implemented here, could only, at worst, slow convergence by a polylogarithmic factor. _Momentum:_ it is well established that deterministic gradient descent with Nesterov's momentum has the optimal rate of convergence for convex problems with Lipschitz gradients (Nesterov, 2003). Convergence in the stochastic setting is shown, for example, in Hu et al. (2009). Much more recently, Jain et al. (2018) showed that a certain form of Nesterov's momentum provably provides acceleration (i.e., achievement of the optimal first-order rate) for stochastic gradient descent on quadratic problems.
+
+## 4 Experiments and Benchmarks
+
+We now demonstrate the effectiveness of stochastic dual descent on three experiments.1 The first two replicate those of Lin et al. (2023)--regression on standard UCI regression tasks, also used by Wang et al. (2019), and large-scale Bayesian optimisation--and compare against their SGD method, as well as preconditioned conjugate gradients (CG, Wang et al., 2019) and stochastic variational Gaussian processes (SVGP, Hensman et al., 2013). Unless indicated otherwise, we use the code, setup and hyperparameters of Lin et al. (2023). Our third experiment tests stochastic dual descent on five molecule-protein binding affinity prediction benchmarks of Garcia-Ortegon et al. (2022).
+
+Footnote 1: Anonymised source code can be found at [https://anonymous.4open.science/r/sdd-gps-5486](https://anonymous.4open.science/r/sdd-gps-5486)
+
+### UCI Regression Baselines
+
+We benchmark on the 9 UCI repository regression data sets (Dua and Graff, 2017) used by Wang et al. (2019) and Lin et al. (2023). We run SDD for \(100\) iterations, the same number used by Lin et al. (2023) for SGD. We use step-sizes \(100\times\) larger than Lin et al. (2023), except for Elevators, kegsdirected and buzz, where this causes divergence and we use \(10\times\) larger step-sizes instead. Like Lin et al. (2023), we run CG to a tolerance of \(0.01\), except for the 4 largest data sets, where we stop CG after 100 iterations--this still provides CG with a larger compute budget than first-order methods. CG uses a pivoted Cholesky preconditioner of rank \(100\). For SVGP, we use \(3,000\) inducingpoints for the smaller five data sets and \(9,000\) for the larger four, so as to match the runtime of the other methods. See Appendix B for full details.
+
+The results, reported in Table 1, show that SDD matches or outperforms all baselines on all UCI data sets in terms of root mean square error of the mean prediction across test data. SDD strictly outperforms SGD on all data sets and metrics, matches CG on the five smaller data sets, where the latter reaches tolerance, and outperforms CG on the four larger data sets. The same holds for the negative log-likelihood metric (NLL), computed using \(64\) posterior function samples, except on bike, where CG marginally outperforms SDD. Since SDD requires only one matrix-vector multiplication per step, as opposed to two for SGD, it provides about \(30\%\) wall-clock time speed-up relative to SGD. We run SDD for 100k iterations to match the SGD baseline, SDD often converges earlier than that.
+
+### Large-scale Thompson Sampling
+
+Next, we replicate the synthetic large-scale black-box function optimisation experiments of Lin et al. (2023), which consist of finding the maxima of functions mapping \([0,1]^{8}\rightarrow\mathbb{R}\) sampled from Matern-\(3/2\) Gaussian process priors with 5 different length-scales and 10 random functions per length-scale, using parallel Thompson sampling (Hernandez-Lobato et al., 2017). We set the kernel used by each model to match that of the unknown function. All methods are warm-started with the same 50k points chosen uniformly at random on the domain. We then run 30 iterations of the parallel Thompson sampling, acquiring 1000 points at each iteration. We include two variants of the experiment, one with a small compute budget, where SGD and SDD are run for 15k steps, SVGP
+
+\begin{table}
+\begin{tabular}{c c c c c c c c c c c} \hline \hline  & Data & POL & ELEVTIONS & bike & PROTEIN & KEGGDR & 3DRoad & sONG & buzz & HOUSEELEC \\ Size & 15k & 17k & 17k & 46k & 49k & 435k & 515k & 583k & 2M \\ \hline \multirow{4}{*}{\begin{tabular}{} \end{tabular} } & SDD\({}^{*}\) & **0.08\(\pm\)0.00** & **0.35\(\pm\)0.00** & **0.04\(\pm\)0.00** & **0.50\(\pm\)0.01** & **0.08\(\pm\)0.00** & **0.04\(\pm\)0.00** & **0.75\(\pm\)0.00** & **0.28\(\pm\)0.00** & **0.04\(\pm\)0.00** \\  & SDD & 0.13 \(\pm\)0.00 & 0.38\(\pm\)0.00 & 0.11 \(\pm\)0.00 & 0.51 \(\pm\)0.00 & 0.12 \(\pm\)0.00 & 0.11 \(\pm\)0.00 & 0.80 \(\pm\)0.00 & 0.24 \(\pm\)0.01 & 0.09 \(\pm\)0.00 \\  & CG & **0.08\(\pm\)0.00** & **0.35\(\pm\)0.00** & **0.04\(\pm\)0.00** & **0.50\(\pm\)0.00** & **0.08\(\pm\)0.00** & 0.18 \(\pm\)0.02 & 0.87 \(\pm\)0.05 & 1.88 \(\pm\)0.19 & 0.87 \(\pm\)0.14 \\  & SVGP & 0.10\(\pm\)0.00 & 0.37 \(\pm\)0.00 & 0.08 \(\pm\)0.00 & 0.57 \(\pm\)0.00 & 0.10 \(\pm\)0.00 & 0.47 \(\pm\)0.01 & 0.80 \(\pm\)0.00 & 0.32 \(\pm\)0.00 & 0.12 \(\pm\)0.00 \\ \hline \multirow{4}{*}{\begin{tabular}{} \end{tabular} } & SDD\({}^{*}\) & 1.88\(\pm\)0.01 & 1.13 \(\pm\)0.02 & 1.15 \(\pm\)0.02 & 1.36 \(\pm\) 0.01 & 1.70 \(\pm\)0.00 & **3.32\(\pm\) 0.01** & **185\(\pm\)0.56** & **207\(\pm\)0.10** & **47.8\(\pm\)0.02** \\  & SGD & 2.80\(\pm\)0.01 & 2.07 \(\pm\)0.03 & 2.12 \(\pm\)0.04 & 2.87 \(\pm\)0.01 & 3.30 \(\pm\)0.12 & 6.68 \(\pm\)0.02 & 190\(\pm\)0.61 & 212\(\pm\)0.15 & 69\(\pm\)0.06 \\  & CG & **0.17\(\pm\)0.00** & **0.40\(\pm\)0.00** & **0.11\(\pm\)0.04** & **1.16\(\pm\)0.01** & **0.17\(\pm\)0.00** & 1.34 \(\pm\)0.01 & 1.34 \(\pm\)0.01 & 192\(\pm\)0.77 & 24\(\pm\)0.04 & 157\(\pm\)0.01 \\  & SVGP & 11.5\(\pm\)0.01 & 11.3\(\pm\)0.06 & 11.12 \(\pm\)0.02 & 11.11 \(\pm\)0.02 & 11.55 \(\pm\)0.04 & 152\(\pm\)0.15 & 213\(\pm\)0.13 & 209\(\pm\)0.37 & 154\(\pm\)0.12 \\ \hline \multirow{4}{*}{
+\begin{tabular}{} \end{tabular} } & SDD\({}^{*}\) & **1.18\(\pm\)0.01** & **0.38\(\pm\)0.01** & 2.49 \(\pm\) 0.09 & **0.63\(\pm\)0.02** & **-0.92\(\pm\)0.11** & **-1.70\(\pm\)0.01** & **1.13\(\pm\)0.01** & **0.17\(\pm\)0.06** & **-1.46\(\pm\)0.10** \\  & SGD & -0.70\(\pm\)0.02 & 0.47 \(\pm\)0.00 & -0.48 \(\pm\)0.08 & 0.64 \(\pm\)0.01 & -0.62 \(\pm\)0.07 & -0.60 \(\pm\)0.00 & 1.21 \(\pm\)0.00 & 0.83 \(\pm\)0.07 & -1.09 \(\pm\)0.04 \\  & CG & **-1.17\(\pm\)0.01** & **0.38\(\pm\)0.00** & **-2.62\(\pm\)0.06** & **0.62\(\pm\)0.01** & **-0.92\(\pm\)0.10** & 16.3 \(\pm\)0.45 & 1.36 \(\pm\)0.07 & 2.38 \(\pm\)0.08 & 2.07 \(\pm\)0.58 \\  & SVGP & -0.67\(\pm\)0.01 & 0.43 \(\pm\)0.00 & -1.21 \(\pm\)0.01 & 0.85 \(\pm\)0.01 & -0.54 \(\pm\)0.02 & 0.60 \(\pm\)0.00 & 1.21 \(\pm\)0.00 & 0.22 \(\pm\)0.03 & -0.61 \(\pm\)0.01 \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Root mean square error (RMSE), compute time (on an A100 GPU), and negative log-likelihood (NLL), for 9 UCI regression tasks for all methods considered. We report mean values and standard error across five \(90\%\)-train \(10\%\)-test splits for all data sets, except the largest, where three splits are used. Targets are normalised to zero mean and unit variance. This work denoted by SDD\({}^{*}\).
+
+Figure 4: Results for the Thompson sampling task. Plots show mean and standard error of the maximum function values identified, across \(5\) length scales and \(10\) seeds, against both the number of observations acquired and the corresponding compute time on an A100 GPU. The compute time includes drawing posterior function samples and finding their maxima. All methods share an initial data set of 50k points, and take 30 steps of parallel Thompson sampling, acquiring \(1\)k points at each.
+
+is given 20k steps and CG is run for 10 steps, and one with a large budget, where all methods are run for 5 times as many steps. We present the results on this task in Figure 4, averaged over both length-scales and seeds, and a detailed breakdown in Appendix B. In both large and small compute settings, SDD makes the most progress, in terms of maximum value found, while using the least compute. The performance of SDD and SGD degrades gracefully when compute budget is limited.
+
+### Molecule-protein Binding Affinity Prediction for Drug Discovery
+
+The binding affinity between a molecule and certain proteins is a widely used preliminary filter in drug discovery (Pinzi and Rastelli, 2019), and machine learning is increasingly used to estimate this quantity (Yang et al., 2021). In this final experiment, we show that Gaussian processes with SDD are competitive with graph neural networks for binding affinity prediction.
+
+We use the dockstring regression benchmark of Garcia-Ortegon et al. (2022), which contains five tasks, corresponding to five different proteins. The inputs are the graph structures of \(250\)k candidate molecules, and the targets are real-valued affinity scores from the docking simulator _AutoDock Vina_(Trott and Olson, 2010). For each protein, we use a standard train-test splits of \(210\)k and \(40\)k molecules, respectively. We use Morgan fingerprints of dimension \(1024\)(Rogers and Hahn, 2010) to represent the molecules, and use a Gaussian process model based on the Tanimoto kernel of Ralaivola et al. (2005) with the hyperparameters of Tripp et al. (2023). For more details, see Appendix B.3.
+
+In Table 2, following Garcia-Ortegon et al. (2022), we report \(R^{2}\) values. Alongside results for SDD and SGD, we include results from Garcia-Ortegon et al. (2022) for XGBoost, and for two graph neural networks, MPNN (Gilmer et al., 2017) and Attentive FP (Xiong et al., 2019), the latter of which is the state-of-the-art for this task. We also include the results for SVGP reported by Tripp et al. (2023). These results show that SDD matches the performance of Attentive FP on the ESR2 and FP2 proteins, and comes close on the others. To the best of our knowledge, this is the first time Gaussian processes have been shown to be competitive on a large-scale molecular prediction task.
+
+## 5 Conclusion
+
+We introduced stochastic dual descent, a specialised first-order stochastic optimisation algorithm for computing Gaussian process predictions and posterior samples. To design this algorithm, we combined a number of ideas from the optimisation literature with Gaussian-process-specific ablations, arriving at an algorithm which is simultaneously simple and matches or exceeds the performance of relevant baselines. We showed that stochastic dual descent yields strong performance on standard regression benchmarks and on a large-scale Bayesian optimisation benchmark, and matches the performance of state-of-the-art graph neural networks on a molecular binding affinity prediction task.
+
+\begin{table}
+\begin{tabular}{l c c c c c} \hline \hline Method & ESR2 & F2 & KIT & PARP1 & PGR \\ \hline \hline Adaptive FP\({}^{\dagger}\) & **0.627** & **0.880** & **0.806** & **0.910** & **0.678** \\ MPNN\({}^{\dagger}\) & 0.506 & 0.798 & 0.755 & 0.815 & 0.324 \\ XGBoost\({}^{\dagger}\) & 0.497 & 0.688 & 0.674 & 0.723 & 0.345 \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Test set \(R^{2}\) scores obtained for each target protein on the dockstring molecular binding affinity prediction task. Results with (\(\cdot\))\({}^{\dagger}\) are from García-Ortegon et al. (2022), those with (\(\cdot\))\({}^{\ddagger}\) are from Tripp et al. (2023). SVGP uses 1000 inducing points. SDD\({}^{*}\) denotes this work.
+
+## References
+
+* Antoran et al. (2023) J. Antoran, S. Padhy, R. Barbano, E. T. Nalisnick, D. Janz, and J. M. Hernandez-Lobato. Sampling-based inference for large linear models, with application to linearised Laplace. In _International Conference on Learning Representations_, 2023. Cited on pages 7, 14.
+* Bo and Sminchisescu (2008)Greedy Block Coordinate Descent for Large Scale Gaussian Process Regression. In _Uncertainty in Artificial Intelligence (UAI)_, 2008. Cited on page 7.
+* Boyd and Vandenberghe (2004)Convex Optimization. Cambridge University Press, 2004. Cited on page 13.
+* Bradbury et al. (2018)J. Bradbury, R. Frostig, P. Hawkins, M. J. Johnson, C. Leary, D. Maclaurin, G. Necula, A. Paszke, J. van der Plas, S. Wanderman-Milne, and Q. Zhang. JAX: composable transformations of Python+NumPy programs, 2018. Cited on page 14.
+* Dai et al. (2014)B. Dai, B. Xie, N. He, Y. Liang, A. Raj, M. F. Balcan, and L. Song. Scalable Kernel Methods via Doubly Stochastic Gradients. _Advances in Neural Information Processing Systems_, 2014. Cited on pages 1, 6.
+* Dieuleveut et al. (2017)A. Dieuleveut, N. Flammarion, and F. Bach. Harder, B. Better, Faster, Stronger Convergence Rates for Least-Squares Regression. _Journal of Machine Learning Research_, 2017. Cited on pages 2, 5.
+* Dua and Graff (2017)UCI Machine Learning Repository, 2017. Cited on pages 3, 7.
+* Frie et al. (1998)T.-T. Frie, N. Cristianini, and C. Campbell. The Kernel-Adatron Algorithm: a Fast and Simple Learning Procedure for Support Vector Machines. In _International Conference on Machine Learning_, 1998. Cited on page 7.
+* Garcia-Ortegon et al. (2022)M. Garcia-Ortegon, G. N. C. Simm, A. J. Tripp, J. M. Hernandez-Lobato, A. Bender, and S. Bacallado. DOCKSTRING: Easy Molecular Docking Yields Better Benchmarks for Ligand Design. _Journal of Chemical Information and Modeling_, 2022. Cited on pages 7, 9, 15.
+* Gilmer et al. (2017)J. Gilmer, S. S. Schoenholz, P. F. Riley, O. Vinyals, and G. E. Dahl. Neural Message Passing for Quantum Chemistry. In _International Conference on Machine Learning_, 2017. Cited on page 9.
+* Hensman et al. (2013)J. Hensman, N. Fusi, and N. D. Lawrence. Gaussian Processes for Big Data. In _Uncertainty in Artificial Intelligence_, 2013. Cited on pages 1, 7.
+* Hernandez-Lobato et al. (2017)J. M. Hernandez-Lobato, J. Requeima, E. O. Pyzer-Knapp, and A. Aspuru-Guzik. Parallel and Distributed Thompson Sampling for Large-scale Accelerated Exploration of Chemical Space. In _International Conference on Machine Learning_, 2017. Cited on pages 8, 14.
+* Hu et al. (2009)C. Hu, W. Pan, and J. Kwok. Accelerated gradient methods for stochastic optimization and online learning. _Advances in Neural Information Processing Systems_, 22, 2009. Cited on page 7.
+* Ioffe (2010)Improved Consistent Sampling, Weighted Minhash and L1 Sketching. In _International Conference on Data Mining_, 2010. Cited on page 16.
+* Jain et al. (2018)P. Jain, S. M. Kakade, R. Kidambi, P. Netrapalli, and A. Sidford. Accelerating Stochastic Gradient Descent for Least Squares Regression. In _Conference On Learning Theory_, 2018. Cited on page 7.
+* Kivinen et al. (2004)J. Kivinen, A. J. Smola, and R. C. Williamson. Online Learning with Kernels. _IEEE Transactions on Signal Processing_, 2004. Cited on page 7.
+* Li et al. (2019)Z. Li, J.-F. Ton, D. Oglic, and D. Sejdinovic. Towards a Unified Analysis of Random Fourier Features. In _International Conference on Machine Learning_, 2019. Cited on page 6.
+* Lin et al. (2023)J. A. Lin, J. Antoran, S. Padhy, D. Janz, J. M. Hernandez-Lobato, and A. Terenin. Sampling from Gaussian Process Posteriors using Stochastic Gradient Descent. _arXiv:2306.11589_, 2023. Cited on pages 1-3, 7, 8.
+* Liu et al. (2008)W. Liu, P. P. Pokharel, and J. C. Principe. The Kernel Least-Mean-Square Algorithm. _IEEE Transactions on Signal Processing_, 2008. Cited on page 7.
+
+Y. Nesterov. A method for unconstrained convex minimization problem with the rate of convergence \(O(1/k^{2})\). In _Doklady Akademii Nauk SSSR_, 1983. Cited on page 1.
+* Y. Nesterov (2003)Introductory lectures on convex optimization: a basic course. Vol. 87, Springer Science & Business Media. Cited on page 1.
+* T. Pinder and D. Dodd (2022)GPJax: a Gaussian Process Framework in JAX. Journal of Open Source Software. Cited on page 1.
+* L. Pinzi and G. Rastelli (2019)Molecular Docking: shifting Paradigms in Drug Discovery. International Journal of Molecular Sciences. Cited on page 1.
+* B. T. Polyak (1990)New stochastic approximation type procedures. Avtomatika i Telemekhanika. Cited on page 1.
+* B. T. Polyak (1964)Some methods of speeding up the convergence of iteration methods. USSR Computational Mathematics and Mathematical Physics. Cited on page 1.
+* B. T. Polyak and A. B. Juditsky (1992)Acceleration of Stochastic Approximation by Averaging. SIAM Journal on Control and Optimization. Cited on page 1.
+* L. Ralaivola, S. J. Swamidass, H. Saigo, and P. Baldi (2005)Graph kernels for chemical informatics. Neural Networks. Cited on page 1.
+* C. E. Rasmussen and C. K. Williams (2006)Gaussian processes for machine learning. MIT Press. Cited on page 1.
+* D. Rogers and M. Hahn (2010)Extended-Connectivity Fingerprints. Journal of Chemical Information and Modeling. Cited on pages 1.
+* A. Rudi, L. Carratino, and L. Rosasco (2017)Falkon: an Optimal Large Scale Kernel Method. Advances in Neural Information Processing Systems. Cited on page 1.
+* D. Ruppert (1988)Efficient Estimations from a Slowly Convergent Robbins-Monro Process. Technical report Cornell University. Cited on page 1.
+* C. Saunders, A. Gammerman, and V. Vovk (1998)Ridge Regression Learning Algorithm in Dual Variables. In International Conference on Machine Learning, Cited on page 1.
+* M. Schmidt and N. L. Roux (2013)Fast convergence of stochastic gradient descent under a strong growth condition. arXiv preprint arXiv:1308.6370. Cited on page 1.
+* S. Shalev-Shwartz and T. Zhang (2013)Stochastic Dual Coordinate Ascent Methods for Regularized Loss Minimization. Journal of Machine Learning Research. Cited on pages 1.
+* A. J. Smola and B. Scholkopf (1998)Learning with kernels. MIT Press. Cited on pages 1.
+* I. Sutskever, J. Martens, G. Dahl, and G. Hinton (2013)On the importance of initialization and momentum in deep learning. In International Conference on Machine Learning, Cited on page 1.
+* M. K. Titsias (2009)Variational Learning of Inducing Variables in Sparse Gaussian Processes. In Artificial Intelligence and Statistics, Cited on page 1.
+* A. Tripp, S. Bacallado, S. Singh, and J. M. Hernandez-Lobato (2023)Tanimoto Random Features for Scalable Molecular Machine Learning. arXiv:2306.14809. Cited on pages 1.
+* O. Trott and A. J. Olson (2010)AutoDock Vina: Improving the Speed and Accuracy of Docking with a New Scoring Function. Efficient Optimization, and Multithreading. Journal of Computational Chemistry. Cited on page 1.
+* S. Tu, R. Roelofs, S. Venkataraman, and B. Recht (2016)Large Scale Kernel Learning using Block Coordinate Descent. arXiv:1602.05310. Cited on page 1.
+
+A. V. Varre, L. Pillaud-Vivien, and N. Flammarion. Last iterate convergence of SGD for Least-Squares in the Interpolation regime. _Advances in Neural Information Processing Systems_, 2021. Cited on pages 2, 5-7.
+* K. A. Wang, G. Pleiss, J. R. Gardner, S. Tyree, K. Q. Weinberger, and A. G. Wilson (2019)Exact Gaussian Processes on a Million Data Points. In Advances in Neural Information Processing Systems, Cited on pages 1, 7.
+* C. Williams and M. Seeger (2000)Using the Nystrom Method to Speed Up Kernel Machines. Advances in Neural Information Processing Systems2000. Cited on page 1.
+* J. T. Wilson, V. Borovitskiy, A. Terenin, P. Mostowsky, and M. P. Deisenroth (2020)Efficiently Sampling Functions from Gaussian Process Posteriors. In International Conference on Machine Learning, Cited on page 3.
+* J. T. Wilson, V. Borovitskiy, A. Terenin, P. Mostowsky, and M. P. Deisenroth (2021)Pathwise Conditioning of Gaussian Processes. Journal of Machine Learning Research. Cited on pages 3, 14.
+* K. Wu, J. Wenger, H. Jones, G. Pleiss, and J. R. Gardner (2023)Large-Scale Gaussian Processes via Alternating Projection. arXiv preprint arXiv:2310.17137. Cited on page 7.
+* Z. Xiong, D. Wang, X. Liu, F. Zhong, X. Wan, X. Li, Z. Li, X. Luo, K. Chen, H. Jiang, et al. (2019)Pushing the Boundaries of Molecular Representation for Drug Discovery with the Graph Attention Mechanism. Journal of Medicinal Chemistry2019. Cited on page 9.
+* Y. Yang, K. Yao, M. P. Repasky, K. Leswing, R. Abel, B. K. Shoichet, and S. V. Jerome (2021)Efficient Exploration of Chemical Space with Docking and Deep Learning. Journal of Chemical Theory and Computation2021. Cited on page 9.
+
+## Appendix A Convex Duality and Uniform Approximation Bounds
+
+**Claim 1** (Strong duality).: _We have that_
+
+\[\min_{\alpha\in\mathbb{R}^{n}}L(\alpha)=-\lambda\min_{\alpha\in\mathbb{R}^{n}}L^{*} (\alpha),\]
+
+_with \(\alpha^{*}(b)\) minimising both \(L\) and \(L^{*}\)._
+
+Proof.: That \(\alpha^{*}(b)\) minimises both \(L\) and \(L^{*}\) can be established from the first order optimality conditions. Now, for the duality, observe that we can write \(\min_{\alpha\in\mathbb{R}^{n}}L(\alpha)\) equivalently as the constrained optimisation problem
+
+\[\min_{u\in\mathbb{R}^{n}}\min_{\alpha\in\mathbb{R}^{n}}\frac{1}{2}\|u\|^{2}+ \frac{\lambda}{2}\|\alpha\|_{K}^{2}\quad\text{subject to}\quad u=K\alpha-b\,.\]
+
+Observe that this is quadratic in both \(u\) and \(\alpha\). Introducing Lagrange multipliers \(\beta\in\mathbb{R}^{n}\), in the form \(\lambda\beta\), where we recall that \(\lambda>0\), the solution of the above is equal to that of
+
+\[\min_{u\in\mathbb{R}^{n}}\min_{\alpha\in\mathbb{R}^{n}}\sup_{\beta\in\mathbb{R }^{n}}\frac{1}{2}\|u\|^{2}+\frac{\lambda}{2}\|\alpha\|_{K}^{2}+\lambda\beta^ {\mathsf{T}}(b-K\alpha-u)\,.\]
+
+This is a finite-dimensional quadratic problem, and thus we have strong duality (see, e.g., Examples 5.2.4 in Boyd and Vandenberghe, 2004). We can therefore exchange the order of the minimum operators and the supremum, yielding the again equivalent problem
+
+\[\sup_{\beta\in\mathbb{R}^{n}}\left\{\min_{u\in\mathbb{R}^{n}}\frac{1}{2}\|u\|^ {2}-\lambda\beta^{\mathsf{T}}u\right\}+\left\{\min_{\alpha\in\mathbb{R}^{n}} \frac{\lambda}{2}\|\alpha\|_{K}^{2}-\lambda\beta^{\mathsf{T}}K\alpha\right\} +\lambda\beta^{\mathsf{T}}b.\]
+
+Noting that the two inner minimisation problems are quadratic, we solve these analytically using the first order optimality conditions, that is \(\alpha=\beta\) and \(u=\lambda\beta\), to obtain that the above is equivalent to
+
+\[\sup_{\beta\in\mathbb{R}^{n}}-\lambda\left(\frac{1}{2}\|\beta\|_{K+\lambda I}^ {2}-\beta^{\mathsf{T}}b\right)=-\lambda\min_{\beta\in\mathbb{R}^{n}}L^{*}( \beta)\,.\]
+
+The result follows by chaining the above equalities. 
+
+To show equation (4), the uniform approximation bound, we first need to define reproducing kernel Hilbert spaces (RKHSes). Let \(\mathcal{H}\) be a Hilbert space of functions \(\mathcal{X}\to\mathbb{R}\) with inner product \(\langle\cdot,\cdot\rangle\) and corresponding norm \(\|\cdot\|_{\mathcal{H}}\). We say \(\mathcal{H}\) is the RKHS associated with a bounded kernel \(k\) if the reproducing property holds:
+
+\[\forall x\in\mathcal{X},\ \forall h\in\mathcal{H},\qquad\langle k(x,\cdot),h \rangle=h(x)\,.\]
+
+That is, \(k(x,\cdot)\) is the evaluation functional (at \(x\in\mathcal{X}\)) on \(\mathcal{H}\). For observations \(X\), let \(\Phi\colon\mathcal{H}\to\mathbb{R}^{n}\) be the linear operator mapping \(h\mapsto h(X)\), where \(h(X)=(h(x_{1}),\ldots,h(x_{n}))\). We will write \(\Phi^{*}\) for the adjoint of \(\Phi\), and observe that \(K\) is the matrix of the operator \(\Phi\Phi^{*}\) with respect to the standard basis.
+
+**Claim 2** (Uniform approximation).: _For any \(\alpha,\alpha^{\prime}\in\mathbb{R}^{n}\),_
+
+\[\|h_{\alpha}-h_{\alpha^{\prime}}\|_{\infty}\leq\sqrt{\kappa}\|\alpha-\alpha^{ \prime}\|_{K}\,,\]
+
+_where \(\kappa=\sup_{x\in\mathcal{X}}k(x,x)\)._
+
+Proof.: First, observe that,
+
+\[\|h_{\alpha}-h_{\alpha^{\prime}}\|_{\infty} =\sup_{x\in\mathcal{X}}|h_{\alpha}(x)-h_{\alpha^{\prime}}(x)| \text{(defn. of sup norm)}\] \[=\sup_{x\in\mathcal{X}}|\langle k(x,\cdot),h_{\alpha}-h_{\alpha^ {\prime}}\rangle| \text{(reproducing property)}\] \[\leq\sup_{x\in\mathcal{X}}\|k(x,\cdot)\|_{\mathcal{H}}\|h_{ \alpha}-h_{\alpha^{\prime}}\|_{\mathcal{H}}\] (CBS) \[\leq\sqrt{\kappa}\|h_{\alpha}-h_{\alpha^{\prime}}\|_{\mathcal{H}}\,, \text{(defn. of $\kappa$)}\]
+
+Now, observe that \(h_{\alpha}=\Phi^{*}\alpha\) and \(h_{\alpha^{\prime}}=\Phi^{*}\alpha^{\prime}\), and so we have the equalities
+
+\[\|h_{\alpha}-h_{\alpha^{\prime}}\|_{\mathcal{H}}^{2} =\langle\Phi^{*}(\alpha-\alpha^{\prime}),\Phi^{*}(\alpha-\alpha^{ \prime})\rangle\] (defn. norm) \[=\langle\alpha-\alpha^{\prime},\Phi\Phi^{*}(\alpha-\alpha^{ \prime})\rangle\] (defn. adjoint) \[=\|\alpha-\alpha^{\prime}\|_{K}^{2}\,, \text{(defn. $K$)}\]
+
+where for the final equality, we note that \(K\) is the matrix of the operator \(\Phi\Phi^{*}\) with respect to the standard basis. Combining the above two displays yields the claim.
+
+Additional Details on Experimental Setup and Results
+
+We use the implementation and hyperparameter configurations from Lin et al. (2023) for the SGD, SVGP and CG baselines,2 which uses the JAX library (Bradbury et al., 2018). Some more detail on the implementations is as follows.
+
+Footnote 2: [https://github.com/cambridge-mlg/SGD-gp](https://github.com/cambridge-mlg/SGD-gp)
+
+CGCG is implemented using the jax.scipy, with a pivoted Cholesky preconditioner of size 100. The preconditioner is computed using the TensorFlow Probability library.
+
+SgdThis method targets the primal objective \(L\) using the gradient estimate
+
+\[\nabla L(\alpha)\approx nK_{i}(K_{i}^{\mathsf{T}}\alpha-b_{i})+\lambda\!\!\sum_ {j=1}^{m}\!z_{j}z_{j}^{\mathsf{T}}\alpha, \tag{5}\]
+
+where \(i\sim\mathrm{Uniform}(\{1,\ldots,n\})\) is a random index and \(\sum_{j=1}^{m}z_{j}z_{j}^{\mathsf{T}}\) is a random Fourier feature approximation of \(K\). We use minibatches of 512 to estimate the fit term, and 100 random features for the regulariser. For UCI and Bayesian optimisation experiments, random Fourier features are used. For the molecule task, random hashes, as described in Tripp et al. (2023). SGD uses Nesterov's momentum of \(0.9\) and geometric iterate averaging, as implemented in optax, with \(r=100/T\), where \(T\) is the total number of SGD iterations, and clips the 2-norm of gradients to \(0.1\). These settings are replicated from Lin et al. (2023), which in turn takes these from Antoran et al. (2023).
+
+SvgpWe initialise inducing points using k-means and k-means++. We then optimise all variational parameters, including inducing point locations, by maximising the ELBO with the Adam optimiser until convergence, using the GPJax library (Pinder and Dodd, 2022).
+
+### UCI Regression
+
+For all methods, we use a Matern-\(3/2\) kernel with a fixed set of hyperparameters chosen by Lin et al. (2023) via maximum likelihood. To ease reproducibility, we make the full hyperparameter set available as a Python file in our source code here. SGD uses \(\beta n=0.5\) to estimate the mean function weights, and \(\beta n=0.1\) to draw samples. For SDD, we use step-sizes \(\beta n\) which are \(100\) times larger, except for elevators, keggdir and buzz, where this causes divergence; there, we use a \(10\times\) larger step-size instead. SDD and SGD are both run for \(100\)k steps with batch size \(B=512\) for both the mean function and posterior samples. For CG, we use a maximum of \(1000\) steps for data sets with \(N\leq 50\)k, and a tolerance of \(0.01\). On the four largest data sets, the per step cost of CG is too large to run \(1000\) steps, and we run \(100\) steps instead. For SVGP, the number of inducing points is chosen such that the compute cost approximately matches that of other methods: \(3000\) for the smaller five data sets and \(9000\) for the larger four. Negative log-likelihood computations are done by estimating the predictive variances using 64 posterior samples, with \(2000\) random Fourier features used to approximate the requisite prior samples.
+
+### Large-scale Thompson Sampling
+
+We draw target functions \(\mathcal{X}\rightarrow\mathbb{R}\) from a Gaussian process prior with a Matern-\(3/2\) kernel and length scales \((0.1,0.2,0.3,0.4,0.5)\), using \(2000\) random Fourier features. For each length scale, we repeat the experiment for 10 seeds. All methods use the same kernel that was used to generate the data.
+
+We optimise the target functions on \(\mathcal{X}=[0,1]^{8}\) using parallel Thompson sampling (Hernandez-Lobato et al., 2017). That is, we choose \(x_{\text{new}}=\arg\max_{x\in\mathcal{X}}f_{n}\) for a set of posterior function samples drawn in parallel. We compute these samples using pathwise conditioning (Wilson et al., 2021) with each respective Gaussian process method. We replicate the multi-start gradient optimisation maximisation strategy of Lin et al. (2023) (see therein). For each function sample maximum, we evaluate \(y_{\text{new}}=g(x_{\text{new}})+\varepsilon\) with \(\varepsilon\) drawn from a zero-mean Gaussian with variance of \(10^{-6}\). We then add the pair \((x_{\text{new}},y_{\text{new}})\) to the training data. We use an acquisition batch size of \(1000\). We initialise all methods with a data set of \(50\)k observations sampled uniformly at random from \(\mathcal{X}\).
+
+Here, SGD uses a step-size of \(\beta n=0.3\) for the mean and \(\beta n=0.0003\) for the samples. SDD uses step-sizes that are \(10\times\) larger: \(\beta n=3\) for the mean and \(\beta n=0.003\) for the samples.
+
+### Molecule-protein Binding Affinity Prediction
+
+We use the data set and standard train-test splits from Garcia-Ortegon et al. (2022), which were produced by structure-based clustering to avoid similar molecules from occurring both in the train and test set. We perform all of the preprocessing steps for this benchmark outlined by Garcia-Ortegon et al. (2022), including limiting the maximum docking score to \(5\).
+
+Fingerprints, Tanimoto Kernel and Random FeaturesMolecular fingerprints are a way to encode the structure of molecules by indexing sets of subgraphs present in a molecule. There are many
+
+Figure 5: Maximum function values, with mean and standard error across 10 seeds, obtained by parallel Thompson sampling, for functions with different length-scales \(l\), plotted as functions of acquisition steps and the compute time on an A100 GPU. All methods share an initial data set of 50k points, and take 30 Thompson steps, acquiring a batch of 1000 points in each. The algorithms perform differently across the length-scales: CG performs better in settings with smaller length-scales, which give better conditioning; SVGP tends to perform better in settings with larger length-scales and thus higher smoothness; SGD and SDD perform well in both settings.
+
+types of fingerprints. Morgan fingerprints represent the subgraphs up to a certain radius around each atom in a molecule (Rogers and Hahn, 2010). The fingerprint can be interpreted as a sparse vector of counts, analogous to a 'bag of words' representation of a document. Accordingly, the Tanimoto coefficient \(T(x,x^{\prime})\), also called the Jaccard index, is a way to measure similarity between fingerprints, given by
+
+\[T(x,x^{\prime})=\frac{\sum_{i}\min(x_{i},x^{\prime}_{i})}{\sum_{i}\max(x_{i},x ^{\prime}_{i})}.\]
+
+This function is a valid kernel and has a known random feature expansion using random hashes (Tripp et al., 2023). The feature expansion builds upon prior work for fast retrieval of documents using random hashes that approximate the Tanimoto coefficient; that is, a distribution \(P_{h}\) over hash functions \(h\) such that
+
+\[P_{h}(h(x)=h(x^{\prime}))=T(x,x^{\prime})\.\]
+
+Per Tripp et al. (2023), we extend such hashes into random _features_ by using them to index a random tensor whose entries are independent Rademacher random variables, and use the random hash of Ioffe (2010).
+
+Gaussian Process SetupThe results for the SVGP baseline are taken from Tripp et al. (2023). As the Tanimoto kernel itself has no hyperparameters, the only kernel hyperparameters are a constant scaling factor \(A>0\) for the kernel and the noise variance \(\lambda\), and a constant GP prior mean \(\mu_{0}\) (the Gaussian process regresses on \(y-\mu_{0}\) in place of \(y\)). These are chosen using an exact GP to a randomly chosen subset of the data and held constant during the optimisation of the inducing points. The values of these are given in Table 3. The same values are also used for SGD and SDD to ensure that the differences in accuracy are solely due to the quality of the GP posterior approximation. The SGD method uses 100-dimensional random features for the regulariser.
+
+## Appendix C Additional Experiments
+
+### Failure Modes of Baselines on Toy Setting
+
+We replicate the performance of SDD compared to CG and SVGP baselines on a toy example from Lin et al. (2023).
+
+\begin{table}
+\begin{tabular}{l l l l l l} \hline \hline Data & ESR2 & F2 & KIT & PARP1 & PGR \\ \hline \(A\) & 0.497 & 0.385 & 0.679 & 0.560 & 0.630 \\ \(\lambda\) & 0.373 & 0.049 & 0.112 & 0.024 & 0.332 \\ \(\mu_{0}\) & -6.79 & -6.33 & -6.39 & -6.95 & -7.08 \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: Hyperparameters for all Gaussian process methods used in the molecule-protein binding affinity experiments of Section 4.3.
+
+### Comparison with Other Optimisers
+
+We report the performance of different optimisers on the dual problem. While algorithms such as AdaGrad, RMSprop, and Adam are designed to tackle problems with a non-constant curvature, the dual problem possesses a constant curvature as a simple quadratic problem, for which Nesterov-type momentum is theoretically rate-optimal. For all optimisers, we tune the step-size in a range of \([0.01,100]\) and report the best performance; Adam with \(0.05\), AdaGrad with \(10\), RMSProp with \(0.05\), and Nesterov's momentum with \(50\).
+
+### Effects of Varying the Step-size
+
+We evaluate the effects of varying the step-size \(\beta n\) by conducting further experiments on pol, using a fixed momentum parameter \(\rho=0.9\), averaging parameter \(r=0.001\), batch size \(B=512\), and
+
+Figure 6: Comparison of SDD, CG (Wang et al., 2019) and SVGP (Hensman et al., 2013) for GP inference using a squared exponential kernel on \(10\)k datapoints from \(\sin(2x)+\cos(5x)\) with observation noise \(\mathcal{N}(0,0.5)\). _Infill asymptotics_ considers \(x_{i}\sim\mathcal{N}(0,1)\), which has a very ill-conditioned kernel matrix, preventing CG from converging. SDD converges everywhere except at the edges of the data, and SVGP easily summarises the data using 20 inducing points. _Large domain asymptotics_ considers data on a regular grid with fixed spacing, and is a well-conditioned problem. Both SDD and CG recover the exact solution, but SVGP struggles even with 1024 inducing points.
+
+Figure 7: Comparison of dual (stochastic) gradient descent on pol with batch size \(B=512\) and averaging parameter \(r=0.001\), using different optimisers. While Adam and Nesterov perform similarly on Test RMSE, the latter has much closer convergence in both \(K\)-norm and \(K^{2}\)-normdifferent step-sizes \(\beta n\in\{10,20,30,40,50\}\). Figure 8 compares the effects of varying the step-size for two different unbiased gradient estimators. The first estimator (top row) is only stochastic in the first term of the gradient, which introduces additive noise. The second estimator (bottom row) is stochastic in all gradient terms, which exhibits multiplicative noise. Due to the additive noise, the performance of the first estimator plateaus earlier as the step-size increases. Smaller step-sizes converge slower but eventually reach better solutions, such that a trade-off is necessary: the step-size is proportional to the speed of convergence but anti-proportional to the final performance. In contrast, the second estimator consistently improves both convergence speed and final performance as the step-size is increased, as long as the step-size is not large enough to cause divergence.
+
+### Effects of Varying the Batch Size
+
+We evaluate the effects of varying the batch size \(B\) by conducting further experiments on pol, using a fixed momentum parameter \(\rho=0.9\), averaging parameter \(r=0.001\), step-size \(\beta n=50\), and different batch sizes \(B\in\{64,128,256,512,1024\}\). Figure 9 compares the effects of varying the batch size for two different unbiased gradient estimators per optimiser iteration. The first estimator (top row) is only stochastic in the first term of the gradient, which introduces additive noise. The second estimator (bottom row) is stochastic in all gradient terms, which exhibits multiplicative noise. The final performance of the first estimator is determined by the amount of additive noise. Smaller batch sizes degrade the final performance because the amount of additive noise is inversely proportional to the batch size. In contrast, the second estimator produces nearly identical optimisation traces, as long as the batch size is not small enough to cause divergence. Therefore, increasing the batch size consistently improves the final performance of the first estimator while it does not impact the performance of the second estimator, given that the algorithm converges. A batch size of \(B=64\) causes both estimators to diverge due to too high gradient variance.
+
+Figure 8: Comparison of dual (stochastic) gradient descent on pol with fixed momentum parameter \(\rho=0.9\), averaging parameter \(r=0.001\), batch size \(B=512\), and different step-sizes \(\beta n\). For the additive noise gradient estimator (top row), the step-size is proportional to convergence speed but anti-proportional to final performance. For the multiplicative noise estimator (bottom row), the step-size is proportional to both convergence speed and final performance.
+
+However, we must consider that increasing the batch size also increases the computational costs. Figure 10 visualises the performance of both estimators for the same experiment with respect to compute time. While the performance per time of the additive noise estimator is proportional to the batch size, the multiplicative noise estimator performance per time is anti-proportional to the batch size, as long as the algorithm converges. Therefore, the multiplicative noise estimator should use the smallest batch size which does not cause divergence. Selecting such a batch size is, in general, non-trivial.
+
+Figure 10: Comparison of performance per time of dual (stochastic) gradient descent on pol with fixed momentum parameter \(\rho=0.9\), averaging parameter \(r=0.001\), step-size \(\beta n=50\), and different batch sizes \(B\). For the additive noise gradient estimator (top row), the batch size is proportional to the final performance. For the multiplicative noise estimator (bottom row), the smallest batch size which does not cause divergence achieves the best performance per time.
+
+Figure 9: Comparison of performance per iteration of dual (stochastic) gradient descent on pol with fixed momentum parameter \(\rho=0.9\), averaging parameter \(r=0.001\), step-size \(\beta n=50\), and different batch sizes \(B\). For the additive noise gradient estimator (top row), the batch size is proportional to the final performance. For the multiplicative noise estimator (bottom row), different batch sizes produce nearly identical optimisation traces, as long as the algorithm does not diverge.
+
+### Performance on Ill-conditioned Problems
+
+In this section, we replicate the _low noise_ problem setting from Lin et al. (2023), which demonstrates the sensitivity of CG to the conditioning of the problem. Figure 11 shows that CG makes consistent progress in the regular problem setting, eventually converging to the exact solution. However, in the ill-conditioned problem setting with low noise, CG struggles to make progress and is not able to converge. In contrast, SDD performs nearly identical in terms of test RMSE in both problem settings and converges significantly faster compared to CG, even in the regular problem setting.
+
+### Primal Gradient Divergence Behaviour
+
+Comparing primal and dual gradient descent, the dual version can converge faster because it facilitates the use of large step-sizes which would cause the primal version to diverge (see Figure 1). To visualise this divergence behaviour we illustrate the first few iterations of primal gradient descent with a slightly too large step-size. Figure 12 depicts the performance trace of primal gradient descent for the first 10 optimiser iterations using step-sizes \(\beta n\in\{0.1,0.2,0.3\}\). Using the two smaller step-sizes, the algorithm slowly starts to make progress. However, the slightly larger step-size immediately introduces quickly amplifying oscillating behaviour which foreshadows divergence after only 10 iterations. Figure 13 illustrates how primal gradient descent with a slightly too large step-size exhibits exponentially diverging behaviour after only 20 iterations. Continuing to run the algorithm rapidly exhausts standard numerical precision, resulting in arithmetic overflows and related issues.
+
+Figure 11: Convergence of SDD and CG as a function of time (on a single A100 GPU) on the pol data set while setting the noise standard deviation to (i) the maximum marginal likelihood solution, and (ii) to \(10^{-3}\), labelled _low noise_. SDD is remarkably robust in both situations, achieving nearly identical test RMSE performance. CG, on the other hand, does not converge to a reasonable solution in the low noise setting, given a fixed compute budget.
+
+Figure 12: Primal gradient descent with different step-sizes \(\beta n\). A step-size which is slightly too large introduces amplifying oscillations which quickly cause divergence.
+
+### Hyperparameter Optimisation
+
+In this section, we demonstrate a scalable algorithm to optimise the marginal log-likelihood (MLL) of the kernel, which is made possible through a tractable approximation of the gradient of the MLL. Namely, given the MLL
+
+\[\log p(y)=-\frac{1}{2}y^{\mathsf{T}}(K+\lambda I)^{-1}y-\frac{1}{2}\log\det(K+ \lambda I)-\frac{n}{2}\log 2\pi\]
+
+and the gradient w.r.t the kernel hyperparameters \(\theta\)
+
+\[\nabla_{\theta}\log p(y)=\frac{1}{2}y^{\mathsf{T}}(K+\lambda I)^{-1}\frac{ \partial(K+\lambda I)}{\partial\theta}(K+\lambda I)^{-1}y-\frac{1}{2}\operatorname {Tr}\left((K+\lambda I)^{-1}\frac{\partial(K+\lambda I)}{\partial\theta}\right) \tag{6}\]
+
+The SDD algorithm can be used to obtain approximate solutions \(\bar{\alpha}\) for \(\alpha^{\star}(y)=(K+\lambda I)^{-1}y\) and \(m\) zero-mean posterior samples \(\alpha_{i}\) for \(\alpha^{\star}(f_{0}(X)+\zeta)\). The samples \(\alpha_{i}\) are distributed as \(\mathcal{N}(0,(K+\lambda I)^{-1})\), and using Hutchinson's trace estimate, we obtain
+
+\[\nabla_{\theta}\log p(y)=\frac{1}{2}\bar{\alpha}^{\mathsf{T}}\frac{\partial(K +\lambda I)}{\partial\theta}\bar{\alpha}-\frac{1}{2m}\left[\alpha_{i}^{ \mathsf{T}}\frac{\partial(K+\lambda I)}{\partial\theta}\alpha_{i}\right] \tag{7}\]
+
+In Figure 14, we perform 100 steps of optimisation of the marginal log-likelihood for a Matern-\(3/2\) kernel on the pol data set using the Adam optimiser with a learning rate of 0.2. At each gradient step, the gradient is approximated using Equation 7, where \(\bar{\alpha}\) and \(m=64\,\alpha_{\mathrm{s}}\) are trained in parallel on a single A100 GPU using \(10k\) Nesterov steps with a batch size \(B=512\), averaging parameter \(r=0.001\), and \(\beta n=50\). At each subsequent SDD optimisation, we initialise at the solution of the previous SDD optimisation.
+
+Figure 14: Comparison of marginal log-likelihood estimation for hyperparameter learning, using an exact GP and our proposed sampling-based method.
+
+Figure 13: Primal gradient descent with different step-sizes \(\beta n\). A step-size which is slightly too large causes exponentially diverging behaviour which becomes visible after only 20 optimiser iterations.

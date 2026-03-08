@@ -1,0 +1,865 @@
+## Sample-Efficient Training for Diffusion
+
+**Anonymous authors**
+
+Paper under double-blind review
+
+## Abstract
+
+Score-based diffusion models have become the most popular approach to deep generative modeling of images, largely due to their empirical performance and reliability. Recently, a number of theoretical works (Chen et al.; 2022; 2023; Benton et al., 2023) have shown that diffusion models can efficiently sample, assuming \(L^{2}\)-accurate score estimates. The score-matching objective naturally approximates the true score in \(L^{2}\), but the sample complexity of existing bounds depends _polynomially_ on the data radius and desired Wasserstein accuracy. By contrast, the time complexity of sampling is only logarithmic in these parameters. We show that estimating the score in \(L^{2}\)_requires_ this polynomial dependence, but that a number of samples that scales polylogarithmically in the Wasserstein accuracy actually do suffice for sampling. We show that with a polylogarithmic number of samples, the ERM of the score-matching objective is \(L^{2}\) accurate on all but a probability \(\delta\) fraction of the true distribution, and that this weaker guarantee is sufficient for efficient sampling.
+
+## 1 Introduction
+
+Score-based diffusion models are currently the most successful methods for image generation, serving as the backbone for popular text-to-image models such as stable diffusion (Rombach et al., 2022), Midjourney, and DALL-E 2 (Ramesh et al., 2022) as well as achieving state-of-the-art performance on other audio and image generation tasks (Sohl-Dickstein et al., 2015; Ho et al., 2020; Jalal et al., 2021; Song et al., 2022; Dhariwal and Nichol, 2021).
+
+The goal of score-based diffusion is to sample from a (potentially complicated) distribution \(q_{0}\). This involves two components: _training estimates_ of score functions from samples, and _sampling_ using the trained estimates. To this end, consider the following stochastic differential equation, which is often referred to as the _forward_ SDE:
+
+\[\mathrm{d}x_{t}=-x_{t}\,\mathrm{d}t+\sqrt{2}\,\mathrm{d}B_{t},\quad x_{0}\sim q _{0} \tag{1}\]
+
+where \(B_{t}\) represents Brownian motion. Here, \(x_{0}\) is a sample from the original distribution \(q_{0}\) over \(\mathbb{R}^{d}\), while the distribution of \(x_{t}\) can be computed to be
+
+\[x_{t}\sim e^{-t}x_{0}+\mathcal{N}(0,\sigma_{t}^{2}I_{d})\]
+
+for \(\sigma_{t}^{2}=1-e^{-2t}\). Note that this distribution approaches \(\mathcal{N}(0,I_{d})\), the stationary distribution of (1), exponentially fast.
+
+Let \(q_{t}\) be the distribution of \(x_{t}\), and let \(s_{t}(y):=\nabla\log q_{t}(y)\) be the associated _score_ function. We refer to \(q_{t}\) as the _\(\sigma_{t}\)-smoothed_ version of \(q_{0}\). Then, starting from a sample \(x_{T}\sim q_{T}\), there is a reverse SDE associated with the above forward SDE in equation 1 (Anderson, 1982):
+
+\[\mathrm{d}x_{T-t}=(x_{T-t}+2s_{T-t}(x_{T-t}))\,\mathrm{d}t+\sqrt{2}\,\mathrm{d }B_{t}. \tag{2}\]
+
+That is to say, if we begin at a sample \(x_{T}\sim q_{T}\), following the reverse SDE in equation 2 back to time \(0\) will give us a sample from the _original_ distribution \(q_{0}\). This suggests a natural strategy to sample from \(q_{0}\): start at a time \(T\) large enough using a sample from \(\mathcal{N}(0,I_{d})\), and follow the reverse SDE back to time \(0\). Since \(x_{T}\) is distributed exponentially close in \(T\) to \(\mathcal{N}(0,I_{d})\), our samples at time \(0\) will end up being distributed close to \(q_{0}\). In particular, if \(T\) is large enough-logarithmic in \(\frac{m_{2}}{\varepsilon}\)-then our samples from this process will be \(\varepsilon\)-close in TV to being drawn from \(q_{0}\). Here \(m_{2}^{2}\) is the second moment of \(q_{0}\), given by
+
+\[m_{2}^{2}\coloneqq\mathop{\mathbb{E}}_{x\sim q_{0}}\left[\|x\|^{2}\right].\]Of course, to follow the reverse SDE from equation 2, we need access to the _score_ functions \(s_{t}\) at various times \(t\). A diffusion model _estimates_ these score functions using _score-matching_.
+
+Score-matching.One can show (Theorem 1, Hyvarinen (2005)) that the score function at time \(t\), \(s_{t}\), is the minimizer over functions \(s\) of the following "score matching objective":
+
+\[\operatorname*{\mathbb{E}}_{x\sim q_{0},z\sim\mathcal{N}(0,\sigma_{t}^{2}I_{d} )}\left[\left\|s(e^{-t}x+z)-\frac{-z}{\sigma_{t}^{2}}\right\|_{2}^{2}\right] \tag{3}\]
+
+This gives a natural method for estimating \(s_{t}\): minimize the _empirical_ value of equation 3 over samples \(x_{i}\sim q_{0}\) and independent Gaussian samples \(z_{i}\sim\mathcal{N}(0,\sigma_{t}^{2}I_{d})\). In other words, for a given function family \(\mathcal{H}\) of candidate score functions, estimate the empirical risk minimizer (ERM):
+
+\[\operatorname*{arg\,min}_{\widehat{s}_{t}\in\mathcal{H}}\quad\frac{1}{m}\sum _{i=1}^{m}\left\|\widehat{s}_{t}(e^{-t}x_{i}+z_{i})-\frac{-z_{i}}{\sigma_{t}^ {2}}\right\|_{2}^{2} \tag{4}\]
+
+Such a minimizer can be approximated in practice using deep neural networks, with the objective optimized by stochastic gradient descent (SGD).
+
+Sampling.Given the score estimates \(\widehat{s}_{t}\), one can sample from a distribution close to \(q_{0}\) by running the reverse SDE in equation 2.
+
+To practically implement the reverse SDE in equation 2, we discretize this process into \(N\) steps and choose a sequence of times \(0=t_{0}<t_{1}<\dots<t_{N}<T\). At each discretization time \(t_{k}\), we use our score estimates \(\widehat{s}_{t_{k}}\) and proceed with an _approximate_ reverse SDE using our score estimates, given by the following. For \(t\in[t_{k},t_{k+1}]\),
+
+\[\operatorname{d}\!x_{T-t}=(x_{T-t}+2\widehat{s}_{T-t_{k}}(x_{T-t_{k}})) \operatorname{d}\!t+\sqrt{2}\operatorname{d}\!B_{t}. \tag{5}\]
+
+Here, we will begin at \(x_{T}=x_{T-t_{0}}\sim\mathcal{N}(0,I_{d})\). We will let \(\widehat{q}_{t}\) be the distribution at time \(t\) from following the above SDE. This algorithm is referred to as "DDPM", as defined in (Ho et al., 2020).
+
+A number of recent theoretical works (Chen et al., 2022; Chen et al., 2023; Benton et al., 2023) have studied this sampling process: how many steps are needed, what is the right schedule of discretization times \(t\), and how accurately must the score be estimated? They have shown polynomial time algorithms in remarkable generality.
+
+For example, consider _any_\(d\)-dimensional distribution \(q_{0}\) supported in \(B(0,R)\) (or, more generally, subgaussian with parameter \(R^{2}\)). In Chen et al. it was shown that the SDE can sample from a distribution \(\varepsilon\)-close in \(\mathsf{TV}\) to a distribution (\(\gamma\cdot R\))-close in 2-Wasserstein to \(q_{0}\), in \(\operatorname{poly}(d,\frac{1}{\varepsilon},\frac{1}{\gamma})\) steps, as long as the score estimates are close in \(L^{2}\). That is, as long as:
+
+\[\operatorname*{\mathbb{E}}_{x\sim q_{t}}\left[\left\|s_{t}(x)-\widehat{s}_{t}( x)\right\|^{2}\right]\leq O^{*}\left(\varepsilon^{2}\right) \tag{6}\]
+
+where \(O^{*}(\cdot)\) hides factors logarithmic in \(d,\frac{1}{\varepsilon}\), and \(\frac{1}{\gamma}\).
+
+Moreover, in the same situation, Block et al. (2020) showed that _training_ with the score-matching objective achieves the desired \(L^{2}\) accuracy with a similar sample complexity to the above time complexity. The precise bound depends on the hypothesis class \(\mathcal{H}\); for finite hypothesis classes, it is \(\operatorname{poly}(d,\varepsilon,\frac{1}{\gamma},\log\left|\mathcal{H}\right|)\).
+
+On the _sampling_ side, more recent work (Chen et al., 2022; Benton et al., 2023) has given exponentially better dependence on the accuracy \(\gamma\), as well as replacing the uniform bound \(R\) by the second moment. In particular, Benton et al. (2023) show that \(\tilde{O}(\frac{d}{\varepsilon^{2}}\log^{2}\frac{1}{\gamma})\) steps suffice to sample from a distribution that is \(\gamma\cdot m_{2}\) close to \(q_{0}\) in 2-Wasserstein, as long as the score estimates \(\widehat{s}_{t}\) at these times \(t\) are accurate enough - that is, satisfy:
+
+\[\operatorname*{\mathbb{E}}_{x\sim q_{t}}\left[\left\|s_{t}(x)-\widehat{s}_{t}( x)\right\|^{2}\right]\leq O^{*}\left(\frac{\varepsilon^{2}}{\sigma_{t}^{2}} \right). \tag{7}\]This requirement is easier to satisfy than that of equation 6, because the schedule is such that \(\sigma_{t}\leq 1\) always.
+
+Thus, for _sampling_, recent work has replaced the \(\text{poly}(\frac{1}{\gamma})\) dependence with \(\text{poly}(\log\frac{1}{\gamma})\) to sample from a distribution \(\gamma\cdot m_{2}\) close to \(q_{0}\) in \(2\)-Wasserstein. Can we do the same for the sample complexity of _training_? That is the question we address in this work.
+
+**Our results.** Ideally, one would like to simply show that the ERM of the score matching objective will have bounded \(L^{2}\) error (7) with a number of samples that scales polylogarithmically in \(\frac{1}{\gamma}\). Unfortunately, this is _false_. In fact, it is information-theoretically impossible to achieve equation 7 in general without \(\text{poly}(\frac{1}{\gamma})\) samples. See Figure 1, or the discussion in Section 4, for a hard instance.
+
+In the example in Figure 1, score matching + DDPM still _works_ to sample from the distribution with sample complexity scaling with \(\text{poly}(\log\frac{1}{\gamma})\); the problem lies in the theoretical justification for it. Given that it is impossible to learn the score in \(L^{2}\) to sufficient accuracy with fewer than \(\text{poly}(\frac{1}{\gamma})\) samples, such a justification needs a different measure of estimation error. We will introduce such a measure, showing (1) that it will be small for all relevant times \(t\) after a number of samples that scales _polylogarithmically_ in \(\frac{1}{\gamma}\), and (2) that this measure suffices for fast sampling via the reverse SDE.
+
+The problem with measuring error in \(L^{2}\) comes from outliers: rare, large errors can increase the \(L^{2}\) error while not being observed on the training set. We propose a more robust measure of distance, the \(1-\delta\) quantile error. For distribution \(p\), and functions \(f,g\), we say that
+
+\[D^{\delta}_{p}(f,g)\leq\varepsilon\iff\Pr_{x\sim p}\left[\|f(x)-g(x)\|_{2}\geq \varepsilon\right]\leq\delta. \tag{8}\]
+
+Our main result shows that for a finite-size function class \(\mathcal{H}\) containing a sufficiently accurate score estimate, we can estimate the score function at a given time \(t\) in our robust distance measure using a number of samples that is independent of the domain size or the maximum value of the score.
+
+**Theorem 1.1** (Score Estimation for Finite Function Class).: _For any distribution \(q_{0}\) and time \(t>0\), consider the \(\sigma_{t}\)-smoothed version \(q_{t}\) with associated score \(s_{t}\). For any finite set \(\mathcal{H}\) of candidate score functions. If there exists some \(s^{*}\in\mathcal{H}\) such that_
+
+\[\operatorname*{\mathbb{E}}_{x\sim q_{t}}\left[\|s^{*}(x)-s_{t}(x)\|_{2}^{2} \right]\leq\frac{\delta_{\text{score}}\cdot\delta_{\text{train}}\cdot \varepsilon^{2}}{100\cdot\sigma_{t}^{2}}, \tag{9}\]
+
+_for a sufficiently large constant \(C\), then using \(m>\widetilde{O}\left(\frac{1}{\varepsilon^{2}\delta_{\text{train}}}(d+\log \frac{1}{\delta_{\text{train}}})\log\frac{|\mathcal{H}|}{\delta_{\text{train} }}\right)\) samples, the empirical minimizer \(\hat{s}\) of the score matching objective as described in equation 4 used to estimate \(s_{t}\) satisfies_
+
+\[D^{\delta_{\text{train}}}_{q_{t}}(\hat{s},s_{t})\leq\varepsilon/\sigma_{t}\]
+
+_with probability \(1-\delta_{\text{train}}\)._Theorem 1.1 supposes that \(\mathcal{H}\) is a finite hypothesis class. One can extend this to infinite classes by taking a union bound over a net; see Theorem 1.5 for an application to neural networks, getting a bound polynomial in the number of parameters and logarithmic in the maximum weight and \(m_{2}\).
+
+Note that for distributions supported in \(B(0,R)\), the final step of the sampling process has \(\sigma_{t}=\gamma\), for which the score can be as large as \(\frac{R}{\gamma^{2}}\). Prior work (Block et al., 2020) requires \(\text{poly}(\frac{R}{\gamma})\) samples to learn the score in \(L^{2}\) in this setting. In contrast, the sample complexity in Theorem 1.1 is independent of the domain size and smoothing level.
+
+Previous results like (Benton et al., 2023; Chen et al.) show that learning a score estimate in \(L^{2}\) suffices for efficient sampling via DDPM (described in equation 5). We adapt (Benton et al., 2023) to show that learning the score in our new outlier-robust sense also suffices for sampling, if we have accurate score estimates at each relevant discretization time.
+
+**Theorem 1.2**.: _Let \(q\) be a distribution over \(\mathbb{R}^{d}\) with second moment \(m_{2}^{2}\) between \(1/\text{poly}(d)\) and \(\text{poly}(d)\). For any \(\gamma>0\), there exist \(N=\widetilde{O}(\frac{1}{\varepsilon^{d}+\delta^{2}}\log^{2}\frac{1}{\gamma})\) discretization times \(0=t_{0}<t_{1}<\cdots<t_{N}<T\) such that if the following holds for every \(k\in\{0,\ldots,N-1\}\):_
+
+\[D^{\delta/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon}{\sigma_{T-t_{k}}}\]
+
+_then the SDE process in equation 5 can produce a sample from a distribution that is within \(\widetilde{O}(\delta+\varepsilon\sqrt{\log\left(d/\gamma\right)})\) in \(\mathsf{TV}\) distance to \(q_{\gamma}\) in \(N\) steps._
+
+Applying Theorem 1.1 with a union bound, and combining with Theorem 1.2, we have the end-to-end guarantee:
+
+**Corollary 1.3** (End-to-end Guarantee).: _Let \(q\) be a distribution over \(\mathbb{R}^{d}\) with second moment \(m_{2}^{2}\) between \(1/\text{poly}(d)\) and \(\text{poly}(d)\). For any \(\gamma>0\), there exist \(N=\widetilde{O}(\frac{d}{\varepsilon^{d}+\delta^{2}}\log^{2}\frac{1}{\gamma})\) discretization times \(0=t_{0}<\cdots<t_{N}<T\) such that if \(\mathcal{H}\) contain approximations \(h_{T-t_{k}}\) that satisfy_
+
+\[\operatorname*{\mathbb{E}}_{x\sim q_{t}}\left[\|h_{T-t_{k}}(x)-s_{T-t_{k}}(x) \|^{2}\right]\leq\frac{\delta\cdot\varepsilon^{3}}{CN^{2}\sigma_{T-t_{k}}^{2} }\cdot\frac{1}{\log\frac{d}{\gamma}}\]
+
+_for sufficiently large constant \(C\), then given \(m=\widetilde{O}\left(\frac{N}{\varepsilon^{3}}(d+\log\frac{1}{\delta})\log \frac{|\mathcal{H}|}{\delta}\log\frac{1}{\gamma}\right)\) samples, with \(1-\delta\) probability the SDE process in equation 5 can sample from a distribution \(\varepsilon\)-close in \(\mathsf{TV}\) to a distribution \(\gamma m_{2}\)-close in 2-Wasserstein to \(q\) in \(N\) steps._
+
+The sample complexity required for the end-to-end guarantee above depends polynomially on \(N\), the number of discretization times required for sampling. As stated, this depends polylogarithmically on \(\frac{1}{\gamma}\), for a final sample complexity that scales polylogarithmically in \(\frac{1}{\gamma}\). Prior work (Block et al., 2020) needs \(\text{poly}(\frac{1}{\gamma})\) training samples even to learn the score at the final smoothing level, as described earlier. Thus our bound gives much higher Wasserstein accuracy for a fixed number of samples.
+
+**Remark 1.4** (Scaling of \(m_{2}\)).: _The above theorems assume \(m_{2}^{2}\) is between \(\frac{1}{\text{poly}(d)}\) and \(\text{poly}(d)\) because the bound is simpler to state with this assumption, and because this is the "right" scaling. The forward diffusion process transforms any arbitrary distribution into a standard normal distribution of second moment \(d\). If the initial moment \(m_{2}^{2}\) is extremely large or extremely small relative to \(d\), the convergence time will have an additional (logarithmic) factor depending on \(m_{2}\). This dependence is analyzed explicitly in Theorem B.6 and Corollary C.1. However, a better way to handle these situations is to rescale the distribution to have second moment polynomial in \(d\), so that Theorem 1.2 and Corollary 1.3 hold for the rescaled distributions._
+
+Application to Neural Networks.To demonstrate that the restriction of Theorem 1.1 to finite hypothesis classes is relatively mild, we show that it implies results for general neural networks with ReLU activation. If the score function is well-approximated by a depth-\(D\), \(P\)-parameter neural network, then roughly \(dPD\) samples suffice to learn it well enough for accurate sampling.
+
+**Theorem 1.5** (Score Training for Neural Networks).: _For any distribution \(q_{0}\) with second moment \(m_{2}^{2}\), and any time \(t>0\), let \(q_{t}\) be the \(\sigma_{t}\)-smoothed version with associated score \(s_{t}\). Let \(\phi_{\theta}(\cdot)\) be the fully connected neural network with ReLU activations parameterized by \(\theta\), with \(P\) total parameters and depth \(D\). If there exists some weight vector \(\theta^{*}\) with \(\|\theta^{*}\|_{F}\leq\Theta\) such that_
+
+\[\mathop{\mathbb{E}}_{x\sim q_{t}}\left[\|\phi_{\theta^{*}}(x)-s_{t}(x)\|^{2} \right]\leq\frac{\delta_{\text{score}}\cdot\delta_{\text{train}}\cdot\varepsilon ^{2}}{1000\cdot\sigma_{t}^{2}}\]
+
+_then using \(m>\tilde{O}\left(\frac{(d+\log\frac{1}{q_{\text{train}}})\cdot PD}{\varepsilon^ {2}\delta_{\text{base}}}\cdot\log\left(\frac{(m_{2}+\sigma)\Theta}{\delta_{ \text{train}}}\right)\right)\) samples, the empirical minimizer \(\phi_{\tilde{\theta}}\) of the score matching objective used to estimate \(s_{t}\) (over \(\phi_{\theta}\) with \(\|\theta\|_{F}\leq\Theta\)) satisfies_
+
+\[D_{q_{t}}^{\delta_{\text{test}}}(\phi_{\tilde{\theta}},s_{t})\leq\varepsilon/\sigma.\]
+
+_with probability \(1-\delta_{\text{train}}\)._
+
+## 2 Related Work
+
+Score-based diffusion models were first introduced in (Sohl-Dickstein et al., 2015) as a way to tractably sample from complex distributions using deep learning. Since then, many empirically validated techniques have been developed to improve the sample quality and performance of diffusion models (Ho et al., 2020; Nichol and Dhariwal, 2021; Song and Ermon, 2020; Song et al., 2021b;a). More recently, diffusion models have found several exciting applications, including medical imaging and compressed sensing (Jalal et al., 2021; Song et al., 2022), and text-to-image models like DALL-E 2 (Ramesh et al., 2022) and Stable Diffusion (Rombach et al., 2022).
+
+Recently, a number of works have begun to develop a theoretical understanding of diffusion. Different aspects have been studied - the sample complexity of training with the score-matching objective (Block et al., 2020), the number of steps needed to sample given accurate scores (Chen et al., 2022a,b; 2023; Benton et al., 2023; Bortoli et al., 2021; Lee et al., 2023), and the relationship to more traditional methods such as maximum likelihood (Pabbaraju et al., 2023; Koehler et al., 2023).
+
+On the _training_ side, Block et al. (2020) showed that for distributions bounded by \(R\), the score-matching objective learns the score of \(q_{\gamma}\) in \(L^{2}\) using a number of samples that scales polynomially in \(\frac{1}{\gamma}\). On the other hand, for _sampling_ using the reverse SDE in equation 2, (Chen et al., 2022a; Benton et al., 2023) showed that the number of steps to sample from \(q_{\gamma}\) scales polylogarithmically in \(\frac{1}{\gamma}\) given \(L^{2}\) approximations to the scores.
+
+Our main contribution is to show that while learning the score in \(L^{2}\)_requires_ a number of samples that scales polynomially in \(\frac{1}{\gamma}\), the score-matching objective _does learn_ the score in a weaker sense with sample complexity depending only _polylogarithmically_ in \(\frac{1}{\gamma}\). Moreover, this weaker guarantee is sufficient to maintain the polylogarithmic dependence on \(\frac{1}{\gamma}\) on the number of steps to sample with \(\gamma\cdot m_{2}\) 2-Wasserstein error.
+
+## 3 Proof Overview
+
+### Training
+
+We show that the score-matching objective (equation 4) concentrates well enough that the ERM is close to the true minimizer.
+
+Background: the true expectation gives the true score.For a fixed \(t\), let \(\sigma=\sigma_{t}\) and \(p\) be the distribution of \(e^{-t}x\) for \(x\sim q_{0}\). We can think of a joint distribution of \((y,x,z)\) where \(y\sim p\) and \(z\sim N(0,\sigma^{2}I_{d})\) are independent, and \(x=y+z\) is drawn according to \(q_{t}\). The score matching objective is then
+
+\[\mathop{\mathbb{E}}_{x,z}\left[\left\|s(x)-\frac{z}{\sigma^{2}}\right\|_{2}^{ 2}\right]\]
+
+Because \(x=y+z\) for Gaussian \(z\), Tweedie's formula states that the true score \(s^{*}\) is given by
+
+\[s^{*}(x)=\mathop{\mathbb{E}}_{z|x}[\frac{-z}{\sigma^{2}}].\]Define \(\Delta=s^{*}(x)-\frac{-z}{\sigma^{2}}\), so \(\mathbb{E}[\Delta\mid x]=0\). Therefore for any \(x\),
+
+\[l(s,x,z):=\left\|s(x)-\frac{-z}{\sigma^{2}}\right\|_{2}^{2} =\left\|s(x)-s^{*}(x)+\Delta\right\|^{2}\] \[=\left\|s(x)-s^{*}(x)\right\|^{2}+2\langle s(x)-s^{*}(x),\Delta \rangle+\left\|\Delta\right\|^{2}. \tag{10}\]
+
+For every \(x\), the second term is zero on average over \((z\mid x)\), so the expected loss is
+
+\[\mathop{\mathbb{E}}_{x,z}[l(s,x,z)] =\mathop{\mathbb{E}}_{x,z}[\left\|s(x)-s^{*}(x)\right\|^{2}+2 \langle s(x)-s^{*}(x),\Delta\rangle+\left\|\Delta\right\|^{2}]\] \[=\mathop{\mathbb{E}}_{x}[\left\|s(x)-s^{*}(x)\right\|^{2}]+ \mathop{\mathbb{E}}_{x,z}[\left\|\Delta\right\|^{2}]\]
+
+The \(\left\|\Delta\right\|^{2}\) term is independent of \(s\), so indeed the score matching objective is minimized by the true score. Moreover, an \(\varepsilon\)-approximate optimizer of \(l(s)\) will be close in \(L^{2}\), as needed by prior samplers.
+
+Understanding the ERM.The algorithm chooses the score function \(s\) minimizing the empirical loss,
+
+\[\mathop{\hat{\mathbb{E}}}_{x,z}[l(s,x,z)]:=\frac{1}{m}\sum_{i=1}^{m}l(s,x_{i}, z_{i})=\mathop{\hat{\mathbb{E}}}_{x,z}[\left\|s(x)-s^{*}(x)\right\|^{2}+2\langle s (x)-s^{*}(x),\Delta\rangle+\left\|\Delta\right\|^{2}].\]
+
+Again the \(\mathop{\hat{\mathbb{E}}}[\left\|\Delta\right\|^{2}]\) term is independent of \(s\), so it has no effect on the minimizer and we can drop it from the loss function. Let
+
+\[l^{\prime}(s,x,z):=\left\|s(x)-s^{*}(x)\right\|^{2}+2\langle s(x)-s^{*}(x),\Delta\rangle \tag{11}\]
+
+so \(l^{\prime}(s^{*},x,z)=0\) always, \(\mathbb{E}[l^{\prime}(s,x,z)]=\mathbb{E}[\left\|s(x)-s^{*}(x)\right\|^{2}]\), and we want to show that
+
+\[\mathop{\hat{\mathbb{E}}}_{x,z}[l^{\prime}(s,x,z)]>0 \tag{12}\]
+
+for all candidate score functions \(s\) that are "far" from \(s^{*}\). We will show equation 12 is true with high probability for each individual \(s\), then take a union bound (possibly over a net).
+
+Boundedness of \(\Delta\).Now, \(z\sim N(0,\sigma^{2}I_{d})\) is technically unbounded, but is exponentially close to being bounded: \(\left\|z\right\|\lesssim\sigma\sqrt{d}\) with overwhelming probability. You are certainly unlikely to sample any \(z_{i}\) much larger than this. So for the purpose of this proof overview, imagine that \(z\) were drawn from a distribution of bounded norm, i.e., \(\left\|z\right\|\leq B\sigma\) always; the full proof needs some exponentially small error terms to handle the tiny mass the Gaussian places outside this ball. Then since \(\Delta=\frac{z}{\sigma^{2}}-\mathbb{E}_{z\left\|x\right\|}\frac{\left\|\sigma \right\|}{\sigma^{2}}\), \(\left\|\Delta\right\|\leq 2B/\sigma\) as well.
+
+Warmup: \(\text{poly}(R/\sigma)\).As a warmup, consider the setting of prior work Block et al. (2020): (1) \(\left\|x\right\|\leq R\) always, so \(\left\|s^{*}(x)\right\|\lesssim\frac{R}{\sigma^{2}}\); and (2) we only optimize over candidate score functions \(s\) with \(\left\|x\right\|\lesssim\frac{R}{\sigma^{2}}\), so \(\left\|s(x)-s^{*}(x)\right\|\lesssim\frac{R}{\sigma^{2}}\). With both these restrictions, then, \(\left\|l^{\prime}(s,x,z)\right\|\leq\frac{R^{2}}{\sigma^{2}}+\frac{RB}{\sigma ^{2}}\). We can then apply a Chernoff bound to show concentration of \(l^{\prime}\): for \(\text{poly}(\varepsilon,\frac{B}{\sigma},B,\log\frac{1}{\delta_{\text{min}}})\) samples, with \(1-\delta_{\text{train}}\) probability we have
+
+\[\mathop{\hat{\mathbb{E}}}_{x,z}[l^{\prime}(s,x,z)]\geq\mathop{\mathbb{E}}_{x,z }[l^{\prime}(s,x,z)]-\frac{\varepsilon}{\sigma^{2}}=\mathbb{E}[\left\|s(x)-s^{ *}(x)\right\|^{2}]-\frac{\varepsilon^{2}}{\sigma^{2}}\]
+
+which is greater than zero if \(\mathbb{E}[\left\|s(x)-s^{*}(x)\right\|^{2}]>\frac{\varepsilon^{2}}{\sigma^{2}}\). Thus the ERM would reject each score function that is far in \(L^{2}\). However, as we show in Section 4, both these restrictions are necessary: the score matching ERM needs a polynomial dependence on both the distribution norm and the candidate score function values to learn in \(L^{2}\). To avoid these, we settle for rejecting score functions \(s\) that are far in our stronger distance measure \(D_{p}^{\delta_{\text{true}}}\), i.e., for which
+
+\[\Pr[\left\|s(x)-s^{*}(x)\right\|>\varepsilon/\sigma]\geq\delta_{\text{score}}. \tag{13}\]An intermediate notion.In order to show equation 12, we take two steps. First, we separate out the choice of \(x\), and that of \((z\mid x)\); we consider an intermediate measure that is the _empirical_ average over \(x\), and the _true_ average over \((z\mid x)\). Since \(\mathbb{E}_{z\mid x}[\Delta]=0\), this is just the empirical \(L^{2}\) error. Second, in order to limit the contribution of outliers we cannot reliably sample, we cap the contribution to \(\frac{10B^{2}}{\sigma^{2}}\). That is, we define
+
+\[A_{x}:=\hat{\mathbb{E}}[\min(\mathbb{E}\,[l^{\prime}(s,x,z)],\frac{10B^{2}}{ \sigma^{2}})]=\hat{\mathbb{E}}[\min(\left\|s(x)-s^{*}(x)\right\|^{2},\frac{10 B^{2}}{\sigma^{2}})]. \tag{14}\]
+
+Under equation 13, for \(m>O(\frac{\log\frac{1}{\sigma^{2}}}{d_{\text{true}}})\), we will with \(1-\delta_{\text{train}}\) probability have
+
+\[A\gtrsim\frac{\varepsilon^{2}\delta_{\text{score}}}{\sigma^{2}}. \tag{15}\]
+
+Concentration about the intermediate notion.Finally, we show that for every set of samples \(x_{i}\) satisfying equation 15, the empirical average over \(z\) is with high probability at least half the true average over \(z\), i.e., \(A/2\). For each sample \(x\), we split our analysis of \(\hat{E}_{z\mid x}[l(s,x,z)]\) into two cases:
+
+If \(\left\|s(x)-s^{*}(x)\right\|>O(\frac{B}{\sigma})\), then by Cauchy-Schwarz and the assumption that \(\left\|\Delta\right\|\leq 2B/\sigma\),
+
+\[l^{\prime}(s,x,z)\geq\left\|s(x)-s^{*}(x)\right\|^{2}-O(\frac{B}{\sigma}) \left\|s(x)-s^{*}(x)\right\|\geq\frac{10B^{2}}{\sigma^{2}}\]
+
+so these \(x\) will contribute the maximum possible value to \(A_{x}\), regardless of \(z\) (in its bounded range). On the other hand, if \(\left\|s(x)-s^{*}(x)\right\|<O(\frac{B}{\sigma})\), then \(\left\|l^{\prime}(s,x,z)\right\|\lesssim B^{2}/\sigma^{2}\) and
+
+\[\operatorname{Var}_{z\mid x}(l^{\prime}(s,x,z))=4\,\mathbb{E}[\left\langle s( x)-s^{*}(x),\Delta\right\rangle^{2}]\lesssim\frac{B^{2}}{\sigma^{2}}\left\|s(x)-s ^{*}(x)\right\|^{2}\]
+
+so for these \(x\), as a distribution over \(z\), \(l^{\prime}\) is bounded with bounded variance.
+
+In either case, the contribution to \(A_{x}\) is bounded with bounded variance; this lets us apply Bernstein's inequality to show, if \(m>O(\frac{B^{2}\log\frac{1}{\sigma^{2}}}{\sigma^{2}A^{2}})\), for every \(x\) we will have
+
+\[\hat{\mathbb{E}}[l^{\prime}(s,x,z)]\geq\frac{A}{2}>0\]
+
+with \(1-\delta_{\text{train}}\) probability.
+
+Conclusion.Suppose \(m>O(\frac{B^{2}\log\frac{1}{\sigma^{2}}}{\varepsilon^{2}\delta_{\text{score} }})\). Then with \(1-\delta_{\text{train}}\) probability we will have equation 15; and conditioned on this, with \(1-\delta_{\text{train}}\) probability we will have \(\hat{\mathbb{E}}_{x,z}>0\). Hence this \(m\) suffices to distinguish any candidate score \(s\) that is far from \(s^{*}\).
+
+Then for finite hypothesis classes we can take the union bound, incurring a \(\log\left|\mathcal{H}\right|\) loss. This gives Theorem 1.1.
+
+### Sampling
+
+Recall that the reverse SDE in equation 2 is discretized using score estimates \(\widehat{s}_{T-t_{k}}\) for some \(0<t_{k}<T\) as follows:
+
+\[\operatorname{d}\!x_{T-t}=(x_{T-t}+2\widehat{s}_{T-t_{k}}(x_{T-t_{k}})) \operatorname{d}\!t+\sqrt{2}\operatorname{d}\!B_{t}.\]
+
+Let \(\widehat{Q}\) be the law of the above approximate process, and let \(Q\) be the law of the true reverse SDE in equation 2. Our goal is to bound \(\operatorname{TV}(\widehat{Q},Q)\), the error incurred from following the above approximate SDE rather than the true one.
+
+There are three sources of error: (a) Score estimation error, from making use of our estimated scores \(\widehat{s}_{k_{k}}\) rather than the true scores \(s_{t_{k}}\). (b) Discretization error. (c) Initialization error, since \(x_{T}\sim\mathcal{N}(0,I_{d})\) rather than \(q_{T}\). To bound (b) and (c), we make use of prior results (Benton et al., 2023). So, our main technical result is to bound the contribution of the score estimation error in our new \(D^{\delta}_{q}\) sense to the final sampling error. Formally, we show the following.
+
+**Lemma 3.1** (Main Sampling Lemma).: _Consider an arbitrary sequence of discretization times \(0=t_{0}<t_{1}<\cdots<t_{N}=T-\gamma\). Assume that for each \(k\in\{0,\ldots,N-1\}\), the following holds:_
+
+\[D^{\delta/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon}{\sigma_{T-t_{k}}}\cdot\frac{1}{\sqrt{T+\log\frac{1}{\gamma}}}\]
+
+_Then, the output distribution \(\widehat{q}_{T-t_{N}}\) satisfies_
+
+\[\mathsf{TV}(\widehat{q}_{T-t_{N}},q_{T-t_{N}})\lesssim\delta+\varepsilon+ \mathsf{TV}(Q,Q_{\text{dis}})+\mathsf{TV}(q_{T},\mathcal{N}(0,I_{d}))\]
+
+In the above lemma, \(Q_{\text{dis}}\) is a discretized version of the true reverse SDE in equation 2, using the true scores. Note that assumption in the above lemma is satisfied for score estimates using the score-matching ERM using a number of samples scaling polynomially in \(N\), via theorem 1.1. Per (Benton et al., 2023), \(N\) scales polylogarithmically in \(\frac{1}{\gamma}\). Also, as stated above, we can bound \(\mathsf{TV}(Q,Q_{\text{dis}})\) and \(\mathsf{TV}(q_{T},\mathcal{N}(0,I_{d}))\) using previous results from (Benton et al., 2023). So, we will focus sketching the proof of the above - for the full proof of Theorem 1.2, see Appendix B.
+
+To show the above, first, note that the error incurred from beginning at \(\mathcal{N}(0,I_{d})\) instead of \(q_{T}\) is exactly \(\mathsf{TV}(q_{T},\mathcal{N}(0,I_{d}))\). For the remaining sketch, we will ignore this term, by assuming that all the processes start at \(q_{T}\).
+
+Observe that by the definition of \(D^{\delta}_{p}\) from equation 8, a simple union bound yields that with probability \(1-\delta\) under \(Q\), the score estimates satisfy
+
+\[\sum_{k=0}^{N-1}\|\widehat{s}_{T-t_{k}}(x_{T-t_{k}})-s_{T-t_{k}}(x_{T-t_{k}})\| ^{2}\left(t_{k+1}-t_{k}\right)\leq\varepsilon^{2}. \tag{16}\]
+
+Now, for each \(k\in\{0,\ldots,N-1\}\), we will let \(E_{k}\) be the event that the accumulated score estimation error up to time \(T-t_{k}\) is at most \(\varepsilon^{2}\). That is
+
+\[E_{k}=\mathbf{1}\left\{\sum_{i=0}^{k}\|\widehat{s}_{T-t_{i}}(x_{T-t_{i}})-s_{T -t_{i}}(x_{T-t_{i}})\|^{2}(t_{i+1}-t_{i})\leq\varepsilon^{2}\right\}.\]
+
+Define the process \(\widetilde{Q}\) initialized at \(x_{T}\sim q_{T}\) that makes use of the _true_ (discretized) score \(s_{T-t_{k}}\) while the accumulated score error is at most \(\varepsilon^{2}\), and then switches over to the score estimate \(\widehat{s}_{T-t_{k}}\). That is, \(x_{T}\sim q_{T}\), and for \(t\in[t_{k},t_{k+1}]\),
+
+\[\mathrm{d}x_{T-t}=-(x_{T-t}+2\widetilde{s}_{T-t_{k}}(x_{T-t_{k}}))\,\mathrm{d} t+\sqrt{2}\,\mathrm{d}B_{t}\]
+
+where
+
+\[\widetilde{s}_{T-t_{k}}(x_{T-t_{k}}):=\left\{\begin{array}{ll}s_{T-t_{k}}(x _{T-t_{k}})&E_{k}\text{ holds},\\ \widehat{s}_{T-t_{k}}(x_{T-t_{k}})&E_{k}\text{ doesn't hold}.\end{array}\right.\]
+
+Now, by the triangle inequality, \(\mathsf{TV}(Q,\widetilde{Q})\lesssim\mathsf{TV}(Q,\widetilde{Q})+\mathsf{ TV}(\widetilde{Q},\widetilde{Q})\). We will bound each term separately.
+
+Bounding \(\mathsf{TV}(Q,\widetilde{Q})\).With probability \(1-\delta\) over \(Q\), all \(E_{k}\) hold, since the total score estimation error is at most \(\varepsilon^{2}\), per equation 16. So, with probability \(1-\delta-\mathsf{TV}(Q,Q_{\text{dis}})\) over \(Q_{\text{dis}}\), all \(E_{k}\) hold, where \(Q_{\text{dis}}\) is the discretized process using the _true_ scores. But, under this condition, \(Q_{\text{dis}}\) and \(\widetilde{Q}\) are the same process. So, \(\mathsf{TV}(Q,\widetilde{Q})\leq\delta+\mathsf{TV}(Q,Q_{\text{dis}})\).
+
+Bounding \(\mathsf{TV}(\widetilde{Q},\widetilde{Q})\).Here, we can apply Girsanov's theorem, which shows
+
+\[D_{\text{KL}}(\widetilde{Q}\|\widetilde{Q})\lesssim\frac{\mathbb{E}}{ \widetilde{Q}}\left[\sum_{k=0}^{N-1}\|\widetilde{s}_{T-t_{k}}(x_{T-t_{k}})- \widehat{s}_{T-t_{k}}(x_{T-t_{k}})\|^{2}(t_{k+1}-t_{k})\right]\lesssim \varepsilon^{2}.\]
+
+So, \(\mathsf{TV}(\widetilde{Q},\widetilde{Q})\lesssim\varepsilon\).
+
+## 4 Hardness of Learning in \(L^{2}\)
+
+In this section, we give concrete examples where it is information-theoretically hard to learn the score in \(L^{2}\), and demonstrate that our proposed error measure can be much smaller than the \(L^{2}\) error. In particular, as in equation (7), previous works require the \(L^{2}\) error of the score estimate to be bounded. We show that this guarantee is prohibitively expensive to achieve - if \(q_{0}\) has second moment \(1\), achieving the bound in (7) requires a number of samples polynomial in \(\frac{1}{\sigma_{t}}\) to learn an estimate of \(s_{t}\). So, to sample from a distribution \(\gamma\)-close in 2-Wasserstein to \(q_{0}\), we would need polynomially many samples in \(\frac{1}{\gamma}\).
+
+For our first example, consider the two distributions \((1-\eta)\mathcal{N}(0,1)+\eta\mathcal{N}(\pm R,1)\), where \(R\) is polynomially large. Even though these distributions are polynomially bounded, it is _information-theoretically impossible_ to distinguish these in \(L^{2}\) given significantly fewer than \(\frac{1}{\eta}\) samples. However, the \(L^{2}\) error in score incurred from picking the score of the wrong distribution is large - polynomial in \(R\). In Figure 1, the rightmost plot shows a simulation of this example, and demonstrates that the \(L^{2}\) error remains large even after many samples are taken. Formally, we have:
+
+**Lemma 4.1**.: _Let \(R\) be sufficiently large. Let \(p_{1}\) be the distribution \((1-\eta)\mathcal{N}(0,1)+\eta\mathcal{N}(-R,1)\) with corresponding score function \(s_{1}\), and let \(p_{2}\) be \((1-\eta)\mathcal{N}(0,1)+\eta\mathcal{N}(R,1)\) with score \(s_{2}\). Then, given \(m\) samples from either distribution, it is impossible to distinguish between \(p_{1}\) and \(p_{2}\) for \(\eta<\frac{1}{m^{1.1}}\) with probability larger than \(1/2+o_{m}(1)\). But,_
+
+\[\mathop{\mathbb{E}}_{x\sim p_{1}}\big{[}\|s_{1}(x)-s_{2}(x)\|^{2}\big{]} \gtrsim\eta R^{2}\quad\text{and}\quad\mathop{\mathbb{E}}_{x\sim p_{2}}\big{[} \|s_{1}(x)-s_{2}(x)\|^{2}\big{]}\gtrsim\eta R^{2}.\]
+
+In the above example, the true distribution that our samples are drawn from is somewhat complex - a mixture of Gaussians. In the following example, we show that even if our true distribution is very simple-just a standard normal distribution, the score can still not be learned in \(L^{2}\) definitively if the hypothesis class is large enough, for instance, in the case of neural networks.
+
+In particular, let \(\widehat{s}\) be the score of the mixture distribution \(\eta\mathcal{N}(0,1)+(1-\eta)\mathcal{N}(S,1)\), as in Figure 2. This score will have practically the same score matching objective as the true score for the given samples with high probability, as shown in Figure 2, since all \(m\) samples will occur in the region where the two scores are nearly identical. However, the squared \(L^{2}\) error incurred from picking the wrong score function \(\widehat{s}\) is large - \(\Omega\left(\frac{S^{2}}{m}\right)\). We formally state this result in the following lemma:
+
+**Lemma 4.2**.: _Let \(S\) be sufficiently large. Consider the distribution \(\widehat{p}=\eta\mathcal{N}(0,1)+(1-\eta)\mathcal{N}(S,1)\) for \(\eta=\frac{Se^{-\frac{S^{2}}{2}+10\sqrt{\log m}\cdot S}}{10\sqrt{\log m}}\), and let \(\widehat{s}\) be its score function. Given \(m\) samples from the standard Gaussian \(p^{*}=\mathcal{N}(0,1)\) with score function \(s^{*}\), with probability at least \(1-\frac{1}{\rho\rho\widehat{\log}(m)}\),_
+
+\[\widehat{\mathbb{E}}\left[\|\widehat{s}(x)-s^{*}(x)\|^{2}\right] \leq e^{-O(S\sqrt{\log m})}\quad\text{but}\quad\mathop{\mathbb{E}}_{x\sim p^ {*}}\big{[}\|\widehat{s}(x)-s^{*}(x)\|^{2}\big{]}\gtrsim\frac{S^{2}}{m}.\]
+
+Together, these examples show that the score _cannot_ be learned in \(L^{2}\) with fewer than \(\text{poly}(R/\gamma)\) samples, motivating our \(1-\delta\) quantile error measure.
+
+Figure 2: For \(m\) samples from \(\mathcal{N}(0,1)\), consider the score \(\widehat{s}\) of the mixture \(\eta\mathcal{N}(0,1)+(1-\eta)\mathcal{N}(R,1)\) above with \(\eta\) is chosen so that \(\widehat{s}(10\sqrt{\log m})=0\). For this \(\widehat{s}\), the score-matching objective is close to 0, while the squared \(L^{2}\) error is \(\Omega\left(\frac{R^{2}}{m}\right)\).
+
+## References
+
+* Anderson (1982) Brian DO Anderson. Reverse-time diffusion equation models. _Stochastic Processes and their Applications_, 12(3):313-326, 1982.
+* Benton et al. (2023) Joe Benton, Valentin De Bortoli, Arnaud Doucet, and George Deligiannidis. Linear convergence bounds for diffusion models via stochastic localization, 2023.
+* Block et al. (2020) Adam Block, Youssef Mroueh, and Alexander Rakhlin. Generative modeling with denoising auto-encoders and langevin sampling. _arXiv preprint arXiv:2002.00107_, 2020.
+* De Bortoli et al. (2021) Valentin De Bortoli, James Thornton, Jeremy Heng, and Arnaud Doucet. Diffusion schrodinger bridge with applications to score-based generative modeling. In A. Beygelzimer, Y. Dauphin, P. Liang, and J. Wortman Vaughan (eds.), _Advances in Neural Information Processing Systems_, 2021. URL [https://openreview.net/forum?id=9BnCWiXB0ty](https://openreview.net/forum?id=9BnCWiXB0ty).
+* Chen et al. (2022a) Hongrui Chen, Holden Lee, and Jianfeng Lu. Improved analysis of score-based generative modeling: User-friendly bounds under minimal smoothness assumptions. In _International Conference on Machine Learning_, 2022a. URL [https://api.semanticscholar.org/CorpusID:253264876](https://api.semanticscholar.org/CorpusID:253264876).
+* Chen et al. (2020) Sitan Chen, Sinho Chewi, Jerry Li, Yuanzhi Li, Adil Salim, and Anru R. Zhang. Sampling is as easy as learning the score: theory for diffusion models with minimal data assumptions. _International Conference on Learning Representations_. URL [https://par.nsf.gov/biblio/10407029](https://par.nsf.gov/biblio/10407029).
+* Chen et al. (2023) Sitan Chen, Sinho Chewi, Holden Lee, Yuanzhi Li, Jianfeng Lu, and Adil Salim. The probability flow ODE is provably fast. _arXiv preprint 2305.11798_, 2023.
+* Chen et al. (2022b) Yongxin Chen, Sinho Chewi, Adil Salim, and Andre Wibisono. Improved analysis for a proximal algorithm for sampling. In _Conference on Learning Theory_, pp. 2984-3014. PMLR, 2022b.
+* Dhariwal and Nichol (2021) Prafulla Dhariwal and Alexander Nichol. Diffusion models beat gans on image synthesis. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman Vaughan (eds.), _Advances in Neural Information Processing Systems_, volume 34, pp. 8780-8794. Curran Associates, Inc., 2021. URL [https://proceedings.neurips.cc/paper_files/paper/2021/file/49ad23d1ec9fa4bd8d77d02681df5cfa-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2021/file/49ad23d1ec9fa4bd8d77d02681df5cfa-Paper.pdf).
+* Gupta et al. (2023) Shivam Gupta, Jasper C.H. Lee, and Eric Price. High-dimensional location estimation via norm concentration for subgamma vectors. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett (eds.), _Proceedings of the 40th International Conference on Machine Learning_, volume 202 of _Proceedings of Machine Learning Research_, pp. 12132-12164. PMLR, 23-29 Jul 2023. URL [https://proceedings.mlr.press/v202/gupta23a.html](https://proceedings.mlr.press/v202/gupta23a.html).
+* Ho et al. (2020) Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. In H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin (eds.), _Advances in Neural Information Processing Systems_, volume 33, pp. 6840-6851. Curran Associates, Inc., 2020. URL [https://proceedings.neurips.cc/paper_files/paper/2020/file/4c5bcfec8584af0d967flab10179ca4b-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2020/file/4c5bcfec8584af0d967flab10179ca4b-Paper.pdf).
+* Hsu et al. (2012) Daniel Hsu, Sham Kakade, and Tong Zhang. A tail inequality for quadratic forms of subgaussian random vectors. _Electronic Communications in Probability_, 17:1-6, 2012.
+* Hyvarinen (2005) Aapo Hyvarinen. Estimation of non-normalized statistical models by score matching. _Journal of Machine Learning Research_, 6(24):695-709, 2005. URL [http://jmlr.org/papers/v6/hyvarinen05a.html](http://jmlr.org/papers/v6/hyvarinen05a.html).
+* Jalal et al. (2021) Ajil Jalal, Marius Arvinte, Giannis Daras, Eric Price, Alexandros G Dimakis, and Jon Tamir. Robust compressed sensing mri with deep generative priors. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman Vaughan (eds.), _Advances in Neural Information Processing Systems_, volume 34, pp. 14938-14954. Curran Associates, Inc., 2021. URL [https://proceedings.neurips.cc/paper_files/paper/2021/file/7d6044e95a16761171b130dcb476a43e-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2021/file/7d6044e95a16761171b130dcb476a43e-Paper.pdf).
+
+* Koehler et al. (2023) Frederic Koehler, Alexander Heckett, and Andrej Risteski. Statistical efficiency of score matching: The view from isoperimetry. In _The Eleventh International Conference on Learning Representations, ICLR 2023, Kigali, Rwanda, May 1-5, 2023_. OpenReview.net, 2023. URL [https://openreview.net/pdf?id=TD7AnQjN2R6](https://openreview.net/pdf?id=TD7AnQjN2R6).
+* Lee et al. (2023) Holden Lee, Jianfeng Lu, and Yixin Tan. Convergence of score-based generative modeling for general data distributions. In _International Conference on Algorithmic Learning Theory_, pp. 946-985. PMLR, 2023.
+* Nichol & Dhariwal (2021) Alex Nichol and Prafulla Dhariwal. Improved denoising diffusion probabilistic models. _CoRR_, abs/2102.09672, 2021. URL [https://arxiv.org/abs/2102.09672](https://arxiv.org/abs/2102.09672).
+* Pabbaraju et al. (2023) Chirag Pabbaraju, Dhruv Rohatgi, Anish Prasad Sevekari, Holden Lee, Ankur Moitra, and Andrej Risteski. Provable benefits of score matching. _CoRR_, abs/2306.01993, 2023. doi: 10.48550/arXiv. 2306.01993. URL [https://doi.org/10.48550/arXiv.2306.01993](https://doi.org/10.48550/arXiv.2306.01993).
+* Ramesh et al. (2022) Aditya Ramesh, Prafulla Dhariwal, Alex Nichol, Casey Chu, and Mark Chen. Hierarchical text-conditional image generation with clip latents, 2022.
+* Rombach et al. (2022) Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bjorn Ommer. High-resolution image synthesis with latent diffusion models. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)_, pp. 10684-10695, June 2022.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In Francis Bach and David Blei (eds.), _Proceedings of the 32nd International Conference on Machine Learning_, volume 37 of _Proceedings of Machine Learning Research_, pp. 2256-2265, Lille, France, 07-09 Jul 2015. PMLR. URL [https://proceedings.mlr.press/v37/sohl-dickstein15.html](https://proceedings.mlr.press/v37/sohl-dickstein15.html).
+* Song & Ermon (2020) Yang Song and Stefano Ermon. Improved techniques for training score-based generative models. In H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin (eds.), _Advances in Neural Information Processing Systems_, volume 33, pp. 12438-12448. Curran Associates, Inc., 2020. URL [https://proceedings.neurips.cc/paper_files/paper/2020/file/92c3b916311a5517d9290576e3ea37ad-Paper.pdf](https://proceedings.neurips.cc/paper_files/paper/2020/file/92c3b916311a5517d9290576e3ea37ad-Paper.pdf).
+* Song et al. (2021a) Yang Song, Conor Durkan, Iain Murray, and Stefano Ermon. Maximum likelihood training of score-based diffusion models. In A. Beygelzimer, Y. Dauphin, P. Liang, and J. Wortman Vaughan (eds.), _Advances in Neural Information Processing Systems_, 2021a. URL [https://openreview.net/forum?id=AkltWrnxS9](https://openreview.net/forum?id=AkltWrnxS9).
+* Song et al. (2021b) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. In _International Conference on Learning Representations_, 2021b. URL [https://openreview.net/forum?id=PxTIGl2RRHS](https://openreview.net/forum?id=PxTIGl2RRHS).
+* Song et al. (2022) Yang Song, Liyue Shen, Lei Xing, and Stefano Ermon. Solving inverse problems in medical imaging with score-based generative models. In _International Conference on Learning Representations_, 2022. URL [https://openreview.net/forum?id=vaRCHVj0uGI](https://openreview.net/forum?id=vaRCHVj0uGI).
+
+## Appendix A Score estimation
+
+This section analyzes the score-matching objective for arbitrary distributions and bounded size function classes. Our main result (Theorem 1.1) shows that if there is a function in the function class \(\mathcal{H}\) that approximates the score well in our \(D^{\delta}_{p}\) sense (see equation 8), then the score-matching objective can learn this function using a number of samples that is independent of the domain size or the maximum value of the score.
+
+We also show how to obtain a similar bound for the case when the function class \(\mathcal{H}\) is the class of neural networks with bounded weight (Theorem 1.5).
+
+### Score Estimation for Fixed Time
+
+Notation.Fix a time \(t\). For the purposes of this section, let \(q:=q_{t}\) be the distribution at time \(t\), let \(\sigma:=\sigma_{t}\) be the smoothing level for time \(t\), and let \(s:=s_{t}\) be the score function for time \(t\). For \(m\) samples \(y_{i}\sim q_{0}\) and \(z_{i}\sim\mathcal{N}(0,\sigma^{2})\), let \(x_{i}=e^{-t}y_{i}-z_{i}\sim q_{t}\).
+
+We now state the score matching algorithm.
+
+```
+0: Distribution \(q_{0}\), \(y_{1},\ldots,y_{m}\sim q_{0}\), set of hypothesis score function \(\mathcal{H}=\{\tilde{s}_{i}\}\), smoothing level \(\sigma\).
+1. Take \(m\) independent samples \(z_{i}\sim N(0,\sigma^{2}I_{d})\), and let \(x_{i}=e^{-t}y_{i}-z_{i}\).
+2. For each \(\tilde{s}\in\mathcal{H}\), let \[l(\tilde{s})=\frac{1}{m}\sum_{i=1}^{m}\left\|\tilde{s}(x_{i})-\frac{-z_{i}}{ \sigma^{2}}\right\|_{2}^{2}\]
+3. Let \(\hat{s}=\arg\min_{\hat{s}\in\mathcal{H}}l(\tilde{s})\)
+4. Return \(\hat{s}\)
+```
+
+**Algorithm 1** Empirical score estimation for \(s\)
+
+**Theorem 1.1** (Score Estimation for Finite Function Class).: _For any distribution \(q_{0}\) and time \(t>0\), consider the \(\sigma_{t}\)-smoothed version \(q_{t}\) with associated score \(s_{t}\). For any finite set \(\mathcal{H}\) of candidate score functions. If there exists some \(s^{*}\in\mathcal{H}\) such that_
+
+\[\mathop{\mathbb{E}}_{x\sim q_{t}}\left[\left\|s^{*}(x)-s_{t}(x)\right\|_{2}^{2} \right]\leq\frac{\delta_{\text{score}}\cdot\delta_{\text{main}}\cdot\varepsilon ^{2}}{100\cdot\sigma_{t}^{2}}, \tag{9}\]
+
+_for a sufficiently large constant \(C\), then using \(m>\widetilde{O}\left(\frac{1}{\varepsilon^{2}\delta_{\text{linear}}}(d+\log \frac{1}{\delta_{\text{linear}}})\log\frac{|\mathcal{H}|}{\delta_{\text{linear}}}\right)\) samples, the empirical minimizer \(\hat{s}\) of the score matching objective as described in equation 4 used to estimate \(s_{t}\) satisfies_
+
+\[D_{q_{t}}^{\delta_{\text{norm}}}(\hat{s},s_{t})\leq\varepsilon/\sigma_{t}\]
+
+_with probability \(1-\delta_{\text{train}}\)._
+
+Proof.: Per the notation discussion above, we set \(s=s_{t}\) and \(\sigma=\sigma_{t}\).
+
+Denote
+
+\[l(s,x,z):=\left\|s(x)-\frac{z}{\sigma^{2}}\right\|_{2}^{2}\]
+
+We will show that for all \(\tilde{s}\) such that \(D_{q}^{\delta_{\text{norm}}}(\tilde{s},s)>\varepsilon/\sigma\), with probability \(1-\delta_{\text{train}}\),
+
+\[\hat{\mathbb{E}}\left[l(\tilde{s},x,z)-l(s^{*},x,z)\right]>0,\]
+
+so that the empirical minimizer \(\hat{s}\) is guaranteed to have
+
+\[D_{q}^{\delta_{\text{norm}}}(\hat{s},s)\leq\varepsilon/\sigma.\]
+
+We have
+
+\[l(\tilde{s},x,z)-l(s^{*},x,z) =\left\|\tilde{s}(x)-\frac{z}{\sigma^{2}}\right\|^{2}-\left\|s^{ *}(x)-\frac{z}{\sigma^{2}}\right\|^{2} \tag{17}\]
+
+Note that by Markov's inequality, with probability \(1-\delta_{\text{train}}/3\),
+
+\[\hat{\mathbb{E}}_{x}\left[\|s^{*}(x)-s(x)\|^{2}\right]\leq\frac{\delta_{\text{ score}}\cdot\varepsilon^{2}}{30\cdot\sigma^{2}}.\]Moreover, \(s(x)=\mathbb{E}_{z|x}\left[\frac{z}{\sigma^{2}}\right]\) so that
+
+\[\mathbb{E}\left[\langle s^{*}(x)-s(x),s(x)-\frac{z}{\sigma^{2}} \rangle\right]=0\]
+
+and
+
+\[\mathbb{E}\left[\langle s^{*}(x)-s(x),s(x)-\frac{z}{\sigma^{2}} \rangle^{2}\right] \leq\mathbb{E}_{x}\left[\|s^{*}(x)-s(x)\|^{2}\right]\mathbb{E}_{x,z}\left[\|s(x)-\frac{z}{\sigma^{2}}\|^{2}\right]\] \[\leq\frac{\delta_{\text{score}}\cdot\delta_{\text{train}}\cdot \varepsilon^{2}}{25\sigma^{2}}\cdot\frac{d}{\sigma^{2}}\]
+
+So, by Chebyshev's inequality, with probability \(1-\delta_{\text{train}}/3\),
+
+\[\widehat{\mathbb{E}}\left[\langle s^{*}(x)-s(x),s(x),\frac{z}{ \sigma^{2}}\rangle\right]\lesssim\frac{1}{\sigma^{2}}\sqrt{\frac{\delta_{ \text{score}}\cdot\varepsilon^{2}\cdot d}{25m}}\leq\frac{\delta_{\text{score} }\cdot\varepsilon^{2}}{100\sigma^{2}}\]
+
+for our choice of \(m\).
+
+Also, by Corollary A.2, with probability \(1-\delta_{\text{train}}/3\), for all \(\tilde{s}\in\mathcal{H}\) that satisfy \(D_{q}^{\delta_{\text{score}}}(\tilde{s},s)>\varepsilon/\sigma\) simultaneously,
+
+\[\widehat{\mathbb{E}}\left[\left\|\tilde{s}(x)-\frac{z}{\sigma^{2}} \right\|^{2}-\left\|s(x)-\frac{z}{\sigma^{2}}\right\|^{2}\right]\geq\frac{ \delta_{\text{score}}\varepsilon^{2}}{16\sigma^{2}}.\]
+
+Plugging in everything into equation 17, we have, with probability \(1-\delta_{\text{train}}\), for all \(\tilde{s}\in\mathcal{H}\) with \(D_{q}^{\delta_{\text{score}}}(\tilde{s},s)>\varepsilon/\sigma\) simultaneously,
+
+\[\widehat{\mathbb{E}}\left[l(\tilde{s},x,z)-l(s^{*},x,z)\right] \geq\frac{\delta_{\text{score}}\varepsilon^{2}}{16\sigma^{2}}-\frac{\delta_{ \text{score}}\varepsilon^{2}}{100\sigma^{2}}-\frac{\delta_{\text{score}} \varepsilon^{2}}{100\sigma^{2}}>0\]
+
+as required. 
+
+**Lemma A.1**.: _Consider any set \(\mathcal{F}\) of functions \(f:\mathbb{R}^{d}\to\mathbb{R}^{d}\) such that for all \(f\in\mathcal{F}\),_
+
+\[\Pr_{x\sim p}\left[\|f(x)\|>\varepsilon/\sigma\right]>\delta_{\text{score}}.\]
+
+_Then, with \(m>\widetilde{O}\left(\frac{1}{\varepsilon^{2}\delta_{\text{score}}}(d+\log \frac{1}{\delta_{\text{score}}})\log\frac{|\mathcal{F}|}{\delta_{\text{score}}}\right)\) samples drawn in Algorithm 1, we have with probability \(1-\delta_{\text{train}}\),_
+
+\[\frac{1}{m}\sum_{i=1}^{m}-2\left(\frac{z_{i}}{\sigma^{2}}-\mathbb{E}\left[ \frac{z}{\sigma^{2}}|x_{i}\right]\right)^{T}f(x_{i})+\frac{1}{2}\|f(x_{i})\|^ {2}\geq\frac{\delta_{\text{score}}\cdot\varepsilon^{2}}{16\sigma^{2}}\]
+
+_holds for all \(f\in\mathcal{F}\)._
+
+Proof.: Define
+
+\[h_{f}(x,z):=-2\left(\frac{z}{\sigma^{2}}-\mathbb{E}\left[\frac{z}{\sigma^{2}} |x\right]\right)^{T}f(x)+\frac{1}{2}\|f(x)\|^{2}\]
+
+We want to show that \(h_{f}\) has
+
+\[\widehat{\mathbb{E}}\left[h_{f}(x,z)\right]:=\frac{1}{m}\sum_{i=1}^{m}h_{f}(x_ {i},z_{i})\geq\frac{\delta_{\text{score}}\varepsilon^{2}}{16\sigma^{2}} \tag{18}\]
+
+for all \(f\in\mathcal{F}\) with probability \(1-\delta_{\text{train}}\).
+
+Let \(B=O\left(\frac{\sqrt{d+\log\frac{m}{\delta_{\text{train}}\delta_{\text{train}} }}}{\sigma}\right)\). For \(f\in\mathcal{F}\), let
+
+\[g_{f}(x,z)=\begin{cases}B^{2}&\text{if }\|f(x)\|\geq 10B\\ h_{f}(x,z)&\text{otherwise}\end{cases}\]
+
+be a clipped version of \(h_{f}(x,z)\). We will show that for our chosen number of samples \(m\), the following hold with probability \(1-\delta_{\text{train}}\) simultaneously:1. For all \(i\), \(\left\|\frac{z_{i}}{\sigma^{2}}\right\|\leq B\).
+2. For all \(i\), \(\left\|\mathbb{E}[\frac{z}{\sigma^{2}}|x_{i}]\right\|\leq B\)
+3. \(\hat{\mathbb{E}}[g_{f}(x,z)]\geq\frac{\delta_{\text{max}}\varepsilon^{2}}{16}\) for all \(f\in\mathcal{F}\)
+
+To show that these together imply equation 18, note that whenever \(g_{f}(x_{i},z_{i})\neq h_{f}(x_{i},z_{i})\), \(\|f(x_{i})\|\geq 10B\). So, since \(\left\|\frac{z_{i}}{\sigma^{2}}\right\|\leq B\) and \(\left\|\mathbb{E}[\frac{z}{\sigma^{2}}|x_{i}]\right\|\leq B\),
+
+\[h_{f}(x_{i},z_{i})=-2\left(\frac{z_{i}}{\sigma^{2}}-\mathbb{E}\left[\frac{z}{ \sigma^{2}}|x_{i}]\right)^{T}f(x_{i})+\frac{1}{2}\|f(x_{i})\|^{2}\geq-4B\|f(x_ {i})\|+\frac{1}{2}\|f(x_{i})\|^{2}\geq B^{2}\geq g_{f}(x_{i},z_{i}).\]
+
+So under conditions \(1,2,3\), for all \(f\in\mathcal{F}\),
+
+\[\hat{\mathbb{E}}[h_{f}(x,z)]\geq\hat{\mathbb{E}}[g_{f}(x,z)]\geq\frac{\delta_{ \text{max}}\varepsilon^{2}}{16\sigma^{2}}\]
+
+So it just remains to show that conditions \(1,2,3\) hold with probability \(1-\delta_{\text{train}}\) simultaneously.
+
+1. **For all i, \(\left\|\frac{z_{i}}{\sigma^{2}}\right\|\leq B\).** Holds with probability \(1-\delta_{\text{train}}/3\) by Lemma E.5 and the union bound.
+2. **For all i, \(\left\|\mathbb{E}\left[\frac{z}{\sigma^{2}}\mid x_{i}\right]\right\|\leq B\).** Holds with probability \(1-\delta_{\text{train}}/3\) by Lemma E.6 and the union bound.
+3. \(\hat{\mathbb{E}}[g_{f}(x,z)]\geq\frac{\delta_{\text{max}}\varepsilon^{2}}{16 \sigma^{2}}\) for all \(f\in\mathcal{F}\). Let \(E\) be the event that \(1.\) and \(2.\) hold. Let \(a_{i}=\min(\|f(x_{i})\|,10B)\). We proceed in multiple steps. * Conditioned on \(E\), \(|g_{f}(x_{i},z_{i})|\lesssim B^{2}\). If \(\|f(x_{i})\|\geq 10B\), \(|g_{f}(x_{i},z_{i})|=B^{2}\) by definition. On the other hand, when \(\|f(x_{i})\|<10B\), since we condition on \(E\), \[|g_{f}(x_{i},z_{i})|=|h_{f}(x_{i},z_{i})|=\left|-2\left(\frac{z_{i}}{\sigma^{ 2}}-\mathbb{E}\left[\frac{z}{\sigma^{2}}|x_{i}\right]\right)^{T}f(x_{i})+\frac {1}{2}\|f(x_{i})\|^{2}\right|\lesssim B^{2}\]
+* \(\mathbb{E}\left[g_{f}(x_{i},z_{i})|E,a_{i}\right]\gtrsim a_{i}^{2}-O(\delta_{ \text{train}}B^{2})\). First, note that by definition of \(g_{f}(x,z)\), for \(a_{i}=10B\), \[\mathbb{E}\left[g_{f}(x_{i},z_{i})|a_{i}=10B\right]=B^{2}\] Now, for \(a_{i}<10B\), \[\mathbb{E}\left[g_{f}(x_{i},z_{i})|a_{i}\right] =\mathbb{E}\left[h_{f}(x_{i},z_{i})|a_{i}\right]\] \[=\mathop{\mathbb{E}}_{x_{i}\|f(x_{i})\|=a_{i}}\left[\mathop{ \mathbb{E}}_{z\mid x_{i}}\left[h_{f}(x_{i},z)\right]\right]\] Now, note that \[\mathop{\mathbb{E}}_{z\mid x}\left[h_{f}(x,z)\right]=\frac{1}{2}\|f(x)\|^{2}\] So, for \(a<10B\) \[\mathbb{E}\left[g_{f}(x_{i},z_{i})|a_{i}\right]=\frac{1}{2}a_{i}^{2}\] Now let \(g_{f}^{\text{clip}}(x_{i},z_{i})\) be a clipped version of \(g_{f}(x_{i},z_{i})\), clipped to \(\pm CB^{2}\) for sufficiently large constant \(C\). We have, by above, \[\mathbb{E}[g_{f}(x_{i},z_{i})|a_{i},E]=\mathbb{E}[g_{f}^{\text{clip}}(x_{i},z_{ i})|a_{i},E]\] But, \[\mathbb{E}[g_{f}^{\text{clip}}(x_{i},z_{i})|a_{i},E] \geq\mathbb{E}[g_{f}^{\text{clip}}(x_{i},z_{i})|a_{i}]-O(\delta_{ \text{train}}B^{2})\] \[\gtrsim a_{i}^{2}-O(\delta_{\text{train}}B^{2})\]* \(\mathrm{Var}(g_{f}(x_{i},z_{i})|a_{i},E)\lesssim a_{i}^{2}B^{2}\). For \(a_{i}=10B\), we have, by definition of \(g_{f}(x,z)\), \[\mathrm{Var}(g_{f}(x_{i},z_{i})|a_{i},E)\lesssim B^{4}\lesssim a_{i}^{2}B^{2}\] On the other hand, for \(a_{i}<10B\), \[\mathrm{Var}(g_{f}(x_{i},z_{i})|a_{i},E) \leq\mathbb{E}\left[g_{f}(x_{i},z_{i})^{2}|a_{i},E\right]\] \[=\mathbb{E}\left[\left(-2\left(\frac{z_{i}}{\sigma^{2}}-\mathbb{E }\left[\frac{z}{\sigma^{2}}|x_{i}|\right]\right)^{T}f(x_{i})+\frac{1}{2}\|f(x _{i})\|^{2}\right)^{2}\right]\] \[\lesssim a_{i}^{2}B^{2}\] by Cauchy-Schwarz.
+* With probability \(1-\delta_{\text{train}}/3\), for all \(f\in\mathcal{F}\), \(\widehat{\mathbb{E}}[g_{f}(x_{i},z_{i})]\gtrsim\Omega\left(\frac{z^{2}\delta_{ \text{test}}}{\sigma^{2}}\right)\) Using the above, by Bernstein's inequality, with probability \(1-\delta_{\text{train}}/6\), \[\widehat{\mathbb{E}}\left[g_{f}(x_{i},z_{i})|a_{i},E\right]\gtrsim\frac{1}{n} \sum_{i=1}^{n}a_{i}^{2}-O(\delta_{\text{train}}B^{2})-\frac{1}{n}B\sqrt{\sum_{ i=1}^{n}a_{i}^{2}\log\frac{1}{\delta_{\text{train}}}}-\frac{1}{n}B^{2}\log \frac{1}{\delta_{\text{train}}}\] Now, note that since \(\Pr_{x\sim p_{\tau}}\left[\|f(x)\|>\varepsilon/\sigma\right]\geq\delta_{\text {score}}\), we have with probability \(1-\delta_{\text{train}}/6\), for \(n>O\left(\frac{\log\frac{1}{\delta_{\text{train}}}}{\delta_{\text{test}}}\right)\) \[\frac{1}{n}\sum_{i=1}^{n}a_{i}^{2}\geq\Omega\left(\frac{\varepsilon^{2}\delta_{ \text{score}}}{\sigma^{2}}\right)\] So, for \(n>O\left(\frac{B^{2}\cdot\sigma^{2}\log\frac{1}{\delta_{\text{train}}}}{ \varepsilon^{2}\delta_{\text{test}}}\right)\), we have, with probability \(1-\delta_{\text{train}}/3\), \[\widehat{\mathbb{E}}\left[g_{f}(x_{i},z_{i})|E\right]\gtrsim\Omega\left( \frac{\varepsilon^{2}\delta_{\text{score}}}{\sigma^{2}}\right)-O(\delta_{\text {train}}B^{2})\] Rescaling so that \(\delta_{\text{train}}\leq O\left(\frac{\varepsilon^{2}\delta_{\text{score}}}{ \sigma^{2}\cdot B^{2}}\right)\), for \(n>O\left(\frac{B^{2}\cdot\sigma^{2}\log\frac{B^{2}\cdot\sigma^{2}}{\sigma^{2} \cdot\delta_{\text{score}}}}{\varepsilon^{2}\cdot\delta_{\text{score}}}\right)\), we have, with probability \(1-\delta_{\text{train}}/3\), \[\widehat{\mathbb{E}}\left[g_{f}(x_{i},z_{i})|E\right]\gtrsim\Omega\left( \frac{\varepsilon^{2}\delta_{\text{score}}}{\sigma^{2}}\right)\] Combining with 1. and 2. gives the claim for a single \(f\in\mathcal{F}\). Union bounding over the size of \(\mathcal{F}\) gives the claim.
+
+**Corollary A.2**.: _Let \(\mathcal{H}_{bad}\) be a set of score functions such that for all \(\tilde{s}\in\mathcal{H}_{bad}\)._
+
+\[D_{q}^{\delta_{\text{score}}}(\tilde{s},s)>\varepsilon/\sigma.\]
+
+_Then, for \(m>\widetilde{O}\left(\frac{1}{\varepsilon^{2}\delta_{\text{score}}}(d+\log \frac{1}{\delta_{\text{train}}})\log\frac{|\mathcal{H}_{\text{bad}}|}{\delta_{ \text{train}}}\right)\) samples drawn by Algorithm 1, we have with probability \(1-\delta_{\text{train}}\),_
+
+\[\widehat{\mathbb{E}}\left[\|\tilde{s}(x)-\frac{z}{\sigma^{2}}\|^{2}-\|s(x)- \frac{z}{\sigma^{2}}\|^{2}\right]\geq\frac{\delta_{\text{score}}\varepsilon^{2} }{16\sigma^{2}}\]
+
+_for all \(\tilde{s}\in\mathcal{H}_{bad}\)._Proof.: We have, for \(f(x):=\tilde{s}(x)-s(x)\),
+
+\[\|\tilde{s}(x)-\frac{z}{\sigma^{2}}\|^{2}-\|s(x)-\frac{z}{\sigma^{2} }\|^{2} =\|f(x)+(s(x)-\frac{z}{\sigma^{2}})\|^{2}-\|s(x)-\frac{z}{\sigma^{2} }\|^{2}\] \[=\|f(x)\|^{2}+2(s(x)-\frac{z}{\sigma^{2}})^{T}f(x)\] \[=\|f(x)\|^{2}-2(\frac{z}{\sigma^{2}}-\mathbb{E}[\frac{z}{\sigma^{ 2}}|x])^{T}f(x)\]
+
+since \(s(x)=\mathbb{E}\left[\frac{z}{\sigma^{2}}|x]\right]\) by Lemma E.1. Then, by definition, for \(s\in\mathcal{H}_{\text{bud}}\), for the associated \(f\), \(\Pr[\|f(x)\|>\varepsilon/\sigma|>\delta_{\text{score}}]\). So, by Lemma A.1, the claim follows. 
+
+### Score Estimation for Diffusion Process
+
+**Theorem A.3**.: _Let \(q_{0}\) be a distribution over \(\mathbb{R}^{d}\). For discretization times \(0=t_{0}<t_{1}<\cdots<t_{N}\), let \(s_{T-t_{k}}\) be the true score function of \(q_{T-t_{k}}\). If for each \(t_{k}\), the function class \(\mathcal{H}\) contains some \(\tilde{s}_{T-t_{k}}\in\mathcal{H}\) with_
+
+\[\mathop{\mathbb{E}}_{x\sim q_{T-t_{k}}}\left[\left\|\tilde{s}_{T-t_{k}}(x)-s_{T -t_{k}}(x)\right\|_{2}^{2}\right]\leq\frac{\delta_{\text{score}}\cdot\delta_{ \text{train}}\cdot\varepsilon^{2}}{40\sigma_{T-t_{k}}^{2}\cdot N^{2}} \tag{19}\]
+
+_Then, if we take \(m>\widetilde{O}\left(\frac{N}{\varepsilon^{2}\delta_{\text{score}}}(d+\log\frac {1}{\delta_{\text{min}}})\log\frac{|\mathcal{H}|}{\delta_{\text{min}}}\right)\) samples, then with probability \(1-\delta_{\text{train}}\), each score \(\hat{s}_{T-t_{k}}\) learned by score matching satisfies_
+
+\[D^{\delta_{\text{score}}/N}_{q_{T-t_{k}}}(\hat{s}_{T-t_{k}},s_{T-t_{k}})\leq \varepsilon/\sigma_{T-t_{k}}.\]
+
+Proof.: Note that for each \(t_{k}\), \(q_{T-t_{k}}\) is a \(\sigma_{T-t_{k}}\)-smoothed distribution. Therefore, we can use theorem 1.1 by taking \(\delta_{\text{train}}/N\) into \(\delta_{\text{train}}\) and taking \(\delta_{\text{score}}/N\) into \(\delta_{\text{score}}\). We have that for each \(t_{k}\), with probability \(1-\delta_{\text{train}}/N\) the following holds:
+
+\[\Pr_{x\sim q_{T-t_{k}}}\left[\|\hat{s}_{T-t_{k}}(x)-s_{T-t_{k}}^{*}(x)\|\leq \varepsilon/\sigma_{T-t_{k}}\right]\geq 1-\delta_{\text{score}}/N.\]
+
+By a union bound over all the steps, we conclude the proposed statement. 
+
+### Score Training for Neural Networks
+
+**Theorem 1.5** (Score Training for Neural Networks).: _For any distribution \(q_{0}\) with second moment \(m_{2}^{2}\), and any time \(t>0\), let \(q_{t}\) be the \(\sigma_{t}\)-smoothed version with associated score \(s_{t}\). Let \(\phi_{\theta}(\cdot)\) be the fully connected neural network with ReLU activations parameterized by \(\theta\), with \(P\) total parameters and depth \(D\). If there exists some weight vector \(\theta^{*}\) with \(\|\theta^{*}\|_{F}\leq\Theta\) such that_
+
+\[\mathop{\mathbb{E}}_{x\sim q_{t}}\left[\|\phi_{\theta^{*}}(x)-s_{t}(x)\|^{2} \right]\leq\frac{\delta_{\text{score}}\cdot\delta_{\text{train}}\cdot \varepsilon^{2}}{1000\cdot\sigma_{t}^{2}}\]
+
+_then using \(m>\widetilde{O}\left(\frac{(d+\log\frac{1}{\delta_{\text{train}}})\cdot PD}{ \varepsilon^{2}\delta_{\text{score}}}\cdot\log\left(\frac{(m_{2}+\Theta)\Theta }{\delta_{\text{train}}}\right)\right)\) samples, the empirical minimizer \(\phi_{\widetilde{\theta}}\) of the score matching objective used to estimate \(s_{t}\) (over \(\phi_{\theta}\) with \(\|\theta\|_{F}\leq\Theta\)) satisfies_
+
+\[D^{\delta_{\text{score}}}_{q_{t}}(\phi_{\widetilde{\theta}},s_{t})\leq \varepsilon/\sigma.\]
+
+_with probability \(1-\delta_{\text{train}}\)._
+
+Proof.: Per the notation discussion above, we set \(s=s_{t}\) and \(\sigma=\sigma_{t}\).
+
+For any function \(f\) denote
+
+\[l(f,x):=\left\|f(x)-\frac{z}{\sigma^{2}}\right\|^{2}\]
+
+We will show that for every \(\widetilde{\theta}\) with \(\|\widetilde{\theta}\|_{F}\leq\Theta\) such that \(D^{\delta_{\text{score}}}_{q}(\phi_{\widetilde{\theta}},s)>\varepsilon/\sigma\), with probability \(1-\delta_{\text{train}}\),
+
+\[\widehat{\mathbb{E}}\left[l(\phi_{\widetilde{\theta}},x,z)-l(\phi_{\theta^{* }},x,z)\right]>0\]so that the empirical minimizer \(\phi_{\widetilde{\theta}}\) is guaranteed to have
+
+\[D_{q}^{\delta_{\text{norm}}}(\phi_{\widetilde{\theta}},s)\leq\varepsilon/\sigma\]
+
+First, note that since the ReLU activation is contractive, the total Lipschitzness of \(\phi_{\theta}\) is at most the product of the spectral norm of the weight matrices at each layer. For any \(\theta\), consider \(\widetilde{\theta}\) such that
+
+\[\|\widetilde{\theta}-\theta\|_{F}\leq\frac{\tau}{\sigma D\Theta^{D-1}}\]
+
+Let \(M_{1},\ldots,M_{D}\) be the weight matrices at each layer of the neural net \(\phi_{\theta}\), and let \(\widetilde{M}_{1},\ldots,\widetilde{M}_{D}\) be the corresponding matrices of \(\phi_{\widetilde{\theta}}\).
+
+We now show that \(\left\|\phi_{\widetilde{\theta}}(x)-\phi_{\theta}(x)\right\|\) is small, using a hybrid argument. Define \(y_{i}\) to be the output of a neural network with weight matrices \(M_{1},\ldots,M_{i},\widetilde{M}_{i+1},\ldots,\widetilde{M}_{D}\) on input \(x\), so \(y_{0}=\phi_{\widetilde{\theta}}(x)\) and \(y_{D}=\phi_{\theta}(x)\). Then we have
+
+\[\|y_{i}-y_{i+1}\| \leq\|x\|\cdot\left(\prod_{j\leq i}\|M_{j}\|\right)\cdot\left\|M_ {i+1}-\widetilde{M}_{i+1}\right\|\cdot\left(\prod_{j>i+1}\left\|\widetilde{M}_ {j}\right\|\right)\] \[\leq\|x\|\,\Theta^{D-1}\left\|\widetilde{\theta}-\theta\right\|_ {F}\]
+
+and so
+
+\[\left\|\phi_{\widetilde{\theta}}(x)-\phi_{\theta}(x)\right\|_{2}=\|y_{0}-y_{D }\|\leq\sum_{i=0}^{D-1}\|y_{i}-y_{i+1}\|\leq\|x\|\,D\Theta^{D-1}\left\| \widetilde{\theta}-\theta\right\|_{F}\leq\|x\|\cdot\tau/\sigma.\]
+
+Note that the dimensionality of \(\theta\) is \(P\). So, we can construct a \(\frac{\tau}{\sigma D\Theta^{D-1}}\)-net \(N\) over the set \(\{\theta:\|\theta\|_{F}\leq\Theta\}\) of size \(O\left(\frac{\sigma D\Theta^{D-1}}{\tau}\right)^{P}\), so that for any \(\theta\) with \(\|\theta\|_{F}\leq\Theta\), there exists \(\widetilde{\theta}\in N\) with
+
+\[\|\phi_{\widetilde{\theta}}(x)-\phi_{\theta}(x)\|_{2}\leq(\tau/\sigma)\cdot\|x\|\]
+
+Let \(\mathcal{H}=\{\phi_{\widetilde{\theta}}:\widetilde{\theta}\in N\}\). Then, we have that for every \(\theta\) with \(\|\theta\|_{F}\leq\Theta\), there exists \(h\in\mathcal{H}\) such that
+
+\[\widehat{\mathbb{E}}\left[\|h(x)-\phi_{\theta}(x)\|^{2}\right]\leq(\tau/ \sigma)^{2}\cdot\frac{1}{m}\sum_{i=1}^{m}\|x_{i}\|^{2} \tag{20}\]
+
+Now, choose any \(\widetilde{\theta}\) with \(\|\widetilde{\theta}\|_{F}\leq\Theta\) and \(D_{q}^{\delta_{\text{norm}}}(\phi_{\widetilde{\theta}},s)>\varepsilon/\sigma\), and let \(\widetilde{h}\in\mathcal{H}\) satisfy the above for \(\widetilde{\theta}\).
+
+Our final choice of \(m\) will satisfy \(m>\widetilde{O}\left(\frac{1}{\varepsilon^{2}\delta_{\text{norm}}}\left(d+ \log\frac{1}{\delta_{\text{norm}}}\right)\log\frac{|\mathcal{H}|}{\delta_{ \text{norm}}}\right)\)
+
+We have
+
+\[l(\phi_{\widetilde{\theta}},x,z)-l(\phi_{\theta^{*}},x,z) \tag{21}\] \[=\|\phi_{\widetilde{\theta}}(x)-\frac{z}{\sigma^{2}}\|^{2}-\|\phi _{\theta^{*}}(x)-\frac{z}{\sigma^{2}}\|^{2}\] \[=\|\phi_{\widetilde{\theta}}(x)-\widetilde{h}(x)\|^{2}+2\langle \phi_{\widetilde{\theta}}(x)-\widetilde{h}(x),\widetilde{h}(x)-\frac{z}{ \sigma^{2}}\rangle+\|\widetilde{h}(x)-\frac{z}{\sigma^{2}}\|^{2}\] \[-\|s(x)-\frac{z}{\sigma^{2}}\|^{2}-\|\phi_{\theta^{*}}(x)-s(x)\|^ {2}-2\langle\phi_{\theta^{*}}(x)-s(x),s(x)-\frac{z}{\sigma^{2}}\rangle\]
+
+Now, by Corollary A.2, for our choice of \(m\), with probability \(1-\delta_{\text{train}}/4\) for every \(h\in\mathcal{H}\) with \(D_{q}^{2\delta_{\text{norm}}}(h,s)>\varepsilon/(2\sigma)\) simultaneously,
+
+\[\widehat{\mathbb{E}}\left[\|h(x)-\frac{z}{\sigma^{2}}\|^{2}-\|s(x)-\frac{z}{ \sigma^{2}}\|^{2}\right]\geq\frac{\delta_{\text{norm}}\varepsilon^{2}}{128 \sigma^{2}}\]
+
+By Markov's inequality, with probability \(1-\delta_{\text{train}}/4\),
+
+\[\widehat{\mathbb{E}}\left[\|\phi_{\theta^{*}}(x)-s(x)\|\|^{2}\right]\leq\frac{ \delta_{\text{norm}}\cdot\varepsilon^{2}}{250\sigma^{2}}\]Now, since \(s(x)=\mathbb{E}_{z|x}\left[\frac{z}{\sigma^{2}}\right]\),
+
+\[\mathbb{E}\left[\langle\phi_{\theta^{*}}(x)-s(x),s(x)-\frac{z}{\sigma^{2}} \rangle\right]=0\]
+
+and
+
+\[\mathbb{E}\left[\langle\phi_{\theta^{*}}(x)-s(x),s(x)-\frac{z}{ \sigma^{2}}\rangle^{2}\right] \leq\mathbb{E}_{x}\left[\|\phi_{\theta^{*}}(x)-s(x)\|^{2}\right] \cdot\mathbb{E}_{x,z}\left[\|s(x)-\frac{z}{\sigma^{2}}\|^{2}\right]\] \[\leq\frac{\delta_{\text{\tiny{dense}}}\cdot\delta_{\text{\tiny{ train}}}\cdot\varepsilon^{2}}{250\cdot\sigma^{2}}\cdot\frac{d}{\sigma^{2}}\]
+
+So, by Chebyshev's inequality, with probability \(1-\delta_{\text{\tiny{train}}}/4\)
+
+\[\widehat{\mathbb{E}}\left[\langle\phi_{\theta^{*}}(x)-s(x),s(x)-\frac{z}{ \sigma^{2}}\rangle\right]\leq\frac{1}{\sigma^{2}}\sqrt{\frac{\delta_{\text{ \tiny{dense}}}\cdot\varepsilon^{2}\cdot d}{250m}}\leq\frac{\delta_{\text{ \tiny{dense}}}\cdot\varepsilon^{2}}{1000\cdot\sigma^{2}}\]
+
+for our choice of \(m\). So, by the above and equation 21 we have shown that with probability \(1-3\delta_{\text{\tiny{train}}}/4\), as long as \(\widetilde{h}\) has \(D_{q}^{2\delta_{\text{\tiny{dense}}}}(\widetilde{h},s)>\varepsilon/(2\sigma)\),
+
+\[\widehat{\mathbb{E}}\left[l(\phi_{\widetilde{g}},x,z)-l(\phi_{\theta^{*}},x,z) \right]\geq\frac{\delta_{\text{\tiny{dense}}}\cdot\varepsilon^{2}}{500\cdot \sigma^{2}}+2\langle\phi_{\widetilde{g}}(x)-\widetilde{h}(x),\widetilde{h}(x )-\frac{z}{\sigma^{2}}\rangle \tag{22}\]
+
+Now, we will show that \(D_{q}^{2\delta_{\text{\tiny{dense}}}}(\widetilde{h},s)>\varepsilon/(2\sigma)\), as well as bound the last term above.
+
+By the fact that \(q_{0}\) has second moment \(m_{2}^{2}\), we have that with probability \(1-\delta\) over \(x\),
+
+\[\|x\|\leq\frac{m_{2}}{\sqrt{\delta}}+\sigma\left(\sqrt{d}+\sqrt{\log\frac{1}{ \delta}}\right)\]
+
+Now since \(D_{q}^{\delta_{\text{\tiny{dense}}}}(\phi_{\widetilde{g}},s)>\varepsilon/\sigma\), and \(\|\widetilde{h}(x)-\phi_{\widetilde{g}}(x)\|\leq(\tau/\sigma)\cdot\|x\|\), we have, with probability at least \(1-2\delta_{\text{\tiny{dense}}}\),
+
+\[\|\widetilde{h}(x)-s(x)\| \geq\|\phi_{\widetilde{g}}(x)-s(x)\|-\|\widetilde{h}(x)-\phi_{ \widetilde{g}}(x)\|\] \[\geq\varepsilon/\sigma-(\tau/\sigma)\cdot\left(\frac{m_{2}}{ \sqrt{\delta_{\text{\tiny{dense}}}}}+\sigma\left(\sqrt{d}+\sqrt{\log\frac{1}{ \delta_{\text{\tiny{dense}}}}}\right)\right)\] \[\geq\varepsilon/(2\sigma)\]
+
+for \(\tau<C\varepsilon\delta_{\text{\tiny{dense}}}\delta_{\text{\tiny{train}}} \frac{1}{\Theta^{D}\left(m\cdot m_{2}^{2}+\sigma^{2}(d+\log\frac{m}{\delta_{ \text{\tiny{train}}}})\right)}\) for some small enough constant \(C\). So, we have shown that \(D_{q}^{2\delta_{\text{\tiny{dense}}}}(\widetilde{h},s)>\varepsilon/(2\sigma)\).
+
+Finally, we bound the last term in equation 22 above. We have by equation 20 and a union bound, with probability \(1-\delta_{\text{\tiny{train}}}/8\),
+
+\[\widehat{\mathbb{E}}\left[\|\widetilde{h}(x)-\phi_{\widetilde{g}}(x)\|^{2} \right]\lesssim(\tau/\sigma)^{2}\cdot\left(\frac{m\cdot m_{2}^{2}}{\delta_{ \text{\tiny{train}}}}+\sigma^{2}\left(d+\log\frac{m}{\delta_{\text{\tiny{ train}}}}\right)\right)\]
+
+for \(\tau<C\varepsilon\delta_{\text{\tiny{dense}}}\delta_{\text{\tiny{train}}} \frac{1}{\Theta^{D}\left(m\cdot m_{2}^{2}+\sigma^{2}(d+\log\frac{m}{\delta_{ \text{\tiny{train}}}})\right)}\) for some small enough constant \(C\). Similarly, with probability \(1-\delta_{\text{\tiny{train}}}/8\),
+
+\[\widehat{\mathbb{E}}\left[|\widetilde{h}(x)-\frac{z}{\sigma^{2}}\|^{2}\right] \lesssim\Theta^{D}\cdot\left(\frac{m\cdot m_{2}^{2}}{\delta_{\text{\tiny{ train}}}}+\sigma^{2}\left(d+\log\frac{m}{\delta_{\text{\tiny{train}}}}\right) \right)+\frac{1}{\sigma^{2}}\left(d+\log\frac{m}{\delta_{\text{\tiny{train}}}}\right)\]
+
+So, with probability \(1-\delta_{\text{\tiny{train}}}/4\), for \(\tau<C\varepsilon\delta_{\text{\tiny{dense}}}\delta_{\text{\tiny{train}}} \frac{1}{\Theta^{D}\left(m\cdot m_{2}^{2}+\sigma^{2}(d+\log\frac{m}{\delta_{ \text{\tiny{train}}}})\right)}\) for some small enough constant \(C\),
+
+\[\widehat{\mathbb{E}}\left[\langle\phi_{\widetilde{g}}(x)-\widetilde{h}(x), \widetilde{h}(x)-\frac{z}{\sigma^{2}}\rangle\right]\geq-\widehat{\mathbb{E}} \left[\|\widetilde{h}(x)-\phi_{\widetilde{g}}(x)\|^{2}\right]\cdot\mathbb{E} \left[\|\widetilde{h}(x)-\frac{z}{\sigma^{2}}\|^{2}\right]\]\[\geq-\frac{\delta_{\text{score}}\varepsilon^{2}}{2000\cdot\sigma^{2}}\]
+
+So finally, combining with equation 22, we have with probability \(1-\delta_{\text{brain}}\)
+
+\[\widehat{\mathbb{E}}\left[l(\phi_{\vec{\theta}},x,z)-l(\phi_{\theta^{*}},x,z) \right]\geq\frac{\delta_{\text{score}}\cdot\varepsilon^{2}}{1000\cdot\sigma^{2 }}>0\]
+
+as required.
+
+## Appendix B Sampling with our score estimation guarantee
+
+In this section, we show that diffusion models can converge to the true distribution without necessarily adhering to an \(L^{2}\) bound on the score estimation error. A high probability accuracy of the score is sufficient.
+
+In order to simulate the reverse process of equation 1 in an actual algorithm, the time was discretized into \(N\) steps. The \(k\)-th step ends at time \(t_{k}\), satisfying \(0\leq t_{0}<t_{1}<\cdots<t_{N}=T-\gamma\). The algorithm stops at \(t_{N}\) and outputs the final state \(x_{T-t_{N}}\).
+
+To analyze the reverse process run under different levels of idealness, we consider these four specific path measures over the path space \(\mathcal{C}([0,T-\gamma];\mathbb{R}^{d})\):
+
+* Let \(Q\) be the measure for the process that \[\mathrm{d}x_{T-t}=\left(x_{T-t}+2s_{T-t}(x_{T-t})\right)\mathrm{d}t+\sqrt{2} \,\mathrm{d}B_{t},\quad x_{T}\sim q_{T}.\]
+* Let \(Q_{\text{dis}}\) be the measure for the process that for \(t\in[t_{k},t_{k+1}]\), \[\mathrm{d}x_{T-t}=\left(x_{T-t}+2s_{T-t_{k}}(x_{T-t_{k}})\right)\mathrm{d}t+ \sqrt{2}\,\mathrm{d}B_{t},\quad x_{T}\sim q_{T}.\]
+* Let \(\overline{Q}\) be the measure for the process that for \(t\in[t_{k},t_{k+1}]\), \[\mathrm{d}x_{T-t}=\left(x_{T-t}+2\widehat{s}_{T-t_{k}}(x_{T-t_{k}})\right) \mathrm{d}t+\sqrt{2}\,\mathrm{d}B_{t},\quad x_{T}\sim q_{T}.\]
+* Let \(\widehat{Q}\) be the measure for the process that for \(t\in[t_{k},t_{k+1}]\), \[\mathrm{d}x_{T-t}=\left(x_{T-t}+2\widehat{s}_{T-t_{k}}(x_{T-t_{k}})\right) \mathrm{d}t+\sqrt{2}\,\mathrm{d}B_{t},\quad x_{T}\sim\mathcal{N}(0,I_{d}).\]
+
+To summarize, \(Q\) represents the perfect reverse process of equation 1, \(Q_{\text{dis}}\) is the discretized version of \(Q\), \(\overline{Q}\) runs \(Q_{\text{dis}}\) with an estimated score, and \(\widehat{Q}\) starts \(\overline{Q}\) at \(\mathcal{N}(0,I_{d})\) -- effectively the actual implementable reverse process.
+
+Recent works have shown that under the assumption that the estimated score function is close to the real score function in \(L^{2}\), then the output of \(\widehat{Q}\) will approximate the true distribution closely. Our next theorem shows that this assumption is in fact not required, and it shows that our score assumption can be easily integrated in a black-box way to achieve similar results.
+
+**Lemma B.1** (Score Estimation guarantee).: _Consider an arbitrary sequence of discretization times \(0=t_{0}<t_{1}<\cdots<t_{N}=T-\gamma\), and let \(\sigma_{t}:=\sqrt{1-e^{-2t}}\). Assume that for each \(k\in\{0,\ldots,N-1\}\), the following holds:_
+
+\[D^{\delta/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon}{\sigma_{T-t_{k}}}.\]
+
+_Then, we have_
+
+\[\Pr_{Q}\left[\sum_{k=0}^{N-1}\left\|\widehat{s}_{T-t_{k}}(x_{T-t_{k}})-s_{T-t_ {k}}(x_{T-t_{k}})\right\|_{2}^{2}(t_{k+1}-t_{k})\leq\varepsilon^{2}\left(T+ \log\frac{1}{\gamma}\right)\right]\geq 1-\delta.\]Proof.: Since random variable \(x_{T-t_{k}}\) follows distribution \(q_{T-t_{k}}\) under \(Q\), for each \(k\in\{0,\ldots,N-1\}\), we have
+
+\[\Pr_{Q}\left[\|\widehat{s}_{T-t_{k}}(x_{T-t_{k}})-s_{T-t_{k}}(x_{T-t_{k}})\| \leq\frac{\varepsilon}{\sqrt{1-e^{-2(T-t_{k})}}}\right]\geq 1-\frac{\delta}{N}.\]
+
+Using a union bound over all \(N\) different \(\sigma\) values, it follows that with probability at least \(1-\delta\) over \(Q\), the inequality
+
+\[\|\widehat{s}_{T-t_{k}}(x_{T-t_{k}})-s_{T-t_{k}}(x_{T-t_{k}})\|_{2}^{2}\leq \frac{\varepsilon^{2}}{1-e^{-2(T-t_{k})}}.\]
+
+is satisfied for every \(k\in\{0,\ldots,N-1\}\). Under this condition, we have
+
+\[\sum_{k=0}^{N-1}\|\widehat{s}_{T-t_{k}}(x_{T-t_{k}})-s_{T-t_{k}}( x_{T-t_{k}})\|_{2}^{2}(t_{k+1}-t_{k})\] \[\leq \sum_{k=0}^{N-1}\frac{\varepsilon^{2}}{1-e^{-2(T-t_{k})}}(t_{k+1 }-t_{k})\] \[\leq \sum_{k=0}^{N-1}\int_{t_{k}}^{t_{k+1}}\frac{\varepsilon^{2}}{1-e^ {-2(T-t_{k})}}\,\mathrm{d}t\] \[\leq \int_{0}^{T-\gamma}\frac{\varepsilon^{2}}{1-e^{-2(T-t_{k})}}\, \mathrm{d}t\] \[\leq \varepsilon^{2}\left(T+\log\frac{1}{\gamma}\right).\]
+
+Hence, we find that
+
+\[\Pr_{Q}\left[\sum_{k=0}^{N-1}\|\widehat{s}_{T-t_{k}}(x_{T-t_{k}})-s_{T-t_{k}}( x_{T-t_{k}})\|_{2}^{2}(t_{k+1}-t_{k})\leq\varepsilon^{2}\left(T+\log\frac{1}{ \gamma}\right)\right]\geq 1-\delta.\]
+
+**Lemma B.2** (Score estimation error to TV).: _Let \(q\) be an arbitrary distribution. If the score estimation satisfies that_
+
+\[\Pr_{Q}\left[\sum_{k=0}^{N-1}\|\widehat{s}_{T-t_{k}}(x_{T-t_{k}})-s_{T-t_{k}} (x_{T-t_{k}})\|_{2}^{2}(t_{k+1}-t_{k})\leq\varepsilon^{2}\right]\geq 1-\delta, \tag{23}\]
+
+_then the output distribution \(p_{T-t_{N}}\) of \(\widehat{Q}\) satisfies_
+
+\[\mathsf{TV}(q_{\gamma},p_{T-t_{N}})\lesssim\delta+\varepsilon+\mathsf{TV}(Q,Q_ {\text{dis}})+\mathsf{TV}(q_{T},\mathcal{N}(0,I_{d})).\]
+
+Proof.: We will start by bounding the \(\mathsf{TV}\) distance between \(Q_{\text{dis}}\) and \(\overline{Q}\). We will proceed by defining \(\widetilde{Q}\) and arguing that both \(\mathsf{TV}(Q_{\text{dis}},\widetilde{Q})\) and \(\mathsf{TV}(\widetilde{Q},\overline{Q})\) are small. By the triangle inequality, this will imply that \(Q\) and \(\overline{Q}\) are close in \(\mathsf{TV}\) distance.
+
+Defining \(\widetilde{Q}\).: For \(k\in\{0,\ldots,N-1\}\), consider event
+
+\[E_{k}:=\left(\sum_{i=0}^{k}\|\widehat{s}_{T-t_{i}}(x_{T-t_{i}})-s_{T-t_{i}}(x _{T-t_{i}})\|_{2}^{2}(t_{i+1}-t_{i})\leq\varepsilon^{2}\right),\]
+
+which represents that the accumulated score estimation error along the path is at most \(\varepsilon^{2}\) for a discretized diffusion process.
+
+Given \(E_{k}\), we define a version of \(Q_{\text{dis}}\) that is forced to have a bounded score estimation error. Let \(\widetilde{Q}\) over \(\mathcal{C}((0,T],\mathbb{R}^{d})\) be the law of a modified reverse process initialized at \(x_{T}\sim q_{T}\), and for each \(t\in[t_{k},t_{k+1})\),
+
+\[\mathrm{d}x_{T-t}=-\left(x_{T-t}+2\widetilde{s}_{T-t_{k}}(x_{T-t_{k}})\right) \mathrm{d}t+\sqrt{2}\,\mathrm{d}B_{t}, \tag{24}\]where
+
+\[\widetilde{s}_{T-t_{k}}(x_{T-t_{k}}):=\left\{\begin{array}{ll}s_{T-t_{k}}(x_{T-t_ {k}})&E_{k}\text{ holds,}\\ \widetilde{s}_{T-t_{k}}(x_{T-t_{k}})&E_{k}\text{ doesn't hold.}\end{array}\right.\]
+
+This SDE guarantees that once the accumulated score error exceeds \(\varepsilon_{score}^{2}\) (\(E_{k}\) fails to hold), we switch from the true score to the estimated score. Therefore, we have that the following inequality always holds:
+
+\[\sum_{k=0}^{N-1}\|\widetilde{s}_{T-t_{k}}(x_{T-t_{k}})-\widehat{s}_{T-t_{k}}(x _{T-t_{k}})\|_{2}^{2}(t_{k+1}-t_{k})\leq\varepsilon^{2}. \tag{25}\]
+
+\(Q_{\text{dis}}\) and \(\widetilde{Q}\) are close.By (23), we have
+
+\[\Pr_{Q_{\text{dis}}}\left[E_{0}\wedge\cdots\wedge E_{N-1}\right]=\Pr_{Q_{ \text{dis}}}\left[E_{N-1}\right]\geq\Pr_{Q}\left[E_{N-1}\right]-\mathsf{TV}(Q, Q_{\text{dis}})\geq 1-\delta-\mathsf{TV}(Q,Q_{\text{dis}}),\]
+
+Note that when a path \((x_{T-t})_{t\in[0,t_{N}]}\) satisfies \(E_{0}\wedge\cdots\wedge E_{N-1}\), its probability under \(\widetilde{Q}\) is at least its probability under \(Q_{\text{dis}}\). Therefore, we have
+
+\[\mathsf{TV}(Q_{\text{dis}},\widetilde{Q})\lesssim\delta+\mathsf{TV}(Q,Q_{ \text{dis}}).\]
+
+\(\widetilde{Q}\) and \(\overline{Q}\) are close.Inspired by Chen et al., we utilize Girsanov's theorem (see theorem E.7) to help bound this distance. Define
+
+\[b_{r}:=\sqrt{2}(\widetilde{s}_{T-t_{k}}(x_{T-t_{k}})-\widehat{s}_{T-t_{k}}(x_ {T-t_{k}})),\]
+
+where \(k\) is index such that \(r\in[t_{k},t_{k+1})\). We apply the Girsanov's theorem to \((\widetilde{Q},(b_{r}))\). By eq. (25), we have
+
+\[\int_{0}^{t_{N}}\|b_{r}\|_{2}^{2}\,\mathrm{d}r\leq\sum_{k=0}^{N-1}\|\sqrt{2}( \widetilde{s}_{T-t_{k}}(x_{T-t_{k}})-\widehat{s}_{T-t_{k}}(x_{T-t_{k}}))\|_{2 }^{2}(t_{k+1}-t_{k})\leq 2\varepsilon^{2}<\infty.\]
+
+This satisfies Novikov's condition and tells us that for
+
+\[\mathcal{E}(\mathcal{L})_{t}=\exp\left(\int_{0}^{t}b_{r}\,\mathrm{d}B_{r}- \frac{1}{2}\int_{0}^{t}\|b_{r}\|_{2}^{2}\,\mathrm{d}r\right),\]
+
+under measure \(\widetilde{Q}^{\prime}:=\mathcal{E}(\mathcal{L})_{t_{N}}\widetilde{Q}\), there exists a Brownian motion \((\widetilde{B}_{t})_{t\in[0,t_{N}]}\) such that
+
+\[\widetilde{B}_{t}=B_{t}-\int_{0}^{t}b_{r}\,\mathrm{d}r,\]
+
+and thus for \(t\in[t_{k},t_{k+1})\),
+
+\[\mathrm{d}\widetilde{B}_{t}=\mathrm{d}B_{t}+\sqrt{2}(\widetilde{s}_{T-t_{k}}( x_{T-t_{k}})-\widehat{s}_{T-t_{k}}(x_{T-t_{k}}))\,\mathrm{d}t.\]
+
+Plug this into \((\ref{eq:d1})\) and we have that for \(t\in[t_{k},t_{k+1})\)
+
+\[\mathrm{d}x_{T-t}=-\left(x_{T-t}+2\widehat{s}_{T-t_{k}}(x_{T-t_{k}})\right) \mathrm{d}t+\sqrt{2}\,\mathrm{d}\widetilde{B}_{t},\quad x_{T}\sim q_{T}.\]
+
+This equation depicts the distribution of \(x\), and this exactly matches the definition of \(\overline{Q}\). Therefore, \(\overline{Q}=\widetilde{Q}^{\prime}=\mathcal{E}(\mathcal{L})_{t_{N}}\widetilde {Q}\), and we have
+
+\[D_{\mathrm{KL}}\left(\widetilde{Q}\middle\|\overline{Q}\right)=\operatorname{ \mathbb{E}}_{\widetilde{Q}}\left[\ln\frac{\mathrm{d}\widetilde{Q}}{\mathrm{ d}\overline{Q}}\right]=\operatorname{\mathbb{E}}_{\widetilde{Q}}\left[\ln \mathcal{E}(\mathcal{L})_{t_{N}}\right].\]
+
+Then by using (25), we have
+
+\[\operatorname{\mathbb{E}}_{\widetilde{Q}}\left[\ln\mathcal{E}(\mathcal{L})_{t_ {N}}\right]\lesssim\operatorname{\mathbb{E}}_{\widetilde{Q}}\left[\sum_{k=0}^ {N-1}\|\widetilde{s}_{T-t_{k}}(x_{T-t_{k}})-\widehat{s}_{T-t_{k}}(x_{T-t_{k}}) \|_{2}^{2}(t_{k+1}-t_{k})\right]\lesssim\varepsilon^{2}.\]
+
+Therefore, we can apply Pinsker's inequality and get
+
+\[\mathsf{TV}(\widetilde{Q},\overline{Q})\leq\sqrt{D_{\mathrm{KL}}\left( \widetilde{Q}\middle\|\overline{Q}\right)}\lesssim\varepsilon.\]Putting things together.Using the data processing inequality, we have
+
+\[\mathsf{TV}(\widetilde{Q},\widetilde{Q})\leq\mathsf{TV}(q_{T},\mathcal{N}(0,I_{d})).\]
+
+Combining these results, we have
+
+\[\mathsf{TV}(Q,\widehat{Q}) \leq\mathsf{TV}(Q,Q_{\text{dis}})+\mathsf{TV}(Q_{\text{dis}}, \widetilde{Q})+\mathsf{TV}(\widetilde{Q},\overline{Q})+\mathsf{TV}(\overline{ Q},\widehat{Q})\] \[\lesssim\delta+\varepsilon+\mathsf{TV}(Q,Q_{\text{dis}})+\mathsf{ TV}(q_{T},\mathcal{N}(0,I_{d})).\]
+
+Since \(q_{\gamma}\) is the distribution for \(x_{T-t_{N}}\) under \(Q\) and \(p_{T-t_{N}}\) is the distribution for \(x_{T-t_{N}}\) under \(\widehat{Q}\), we have
+
+\[\mathsf{TV}(q_{\gamma},p_{T-t_{N}})\leq\mathsf{TV}(Q,\widehat{Q})\lesssim \delta+\varepsilon+\mathsf{TV}(Q,Q_{\text{dis}})+\mathsf{TV}(q_{T},\mathcal{N} (0,I_{d})).\]
+
+**Lemma 3.1** (Main Sampling Lemma).: _Consider an arbitrary sequence of discretization times \(0=t_{0}<t_{1}<\dots<t_{N}=T-\gamma\). Assume that for each \(k\in\{0,\dots,N-1\}\), the following holds:_
+
+\[D^{\delta/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon}{\sigma_{T-t_{k}}}\cdot\frac{1}{\sqrt{T+\log\frac{1}{\gamma}}}\]
+
+_Then, the output distribution \(\widehat{q}_{T-t_{N}}\) satisfies_
+
+\[\mathsf{TV}(\widehat{q}_{T-t_{N}},q_{T-t_{N}})\lesssim\delta+\varepsilon+ \mathsf{TV}(Q,Q_{\text{dis}})+\mathsf{TV}(q_{T},\mathcal{N}(0,I_{d}))\]
+
+Proof.: Follows by Lemma B.1 and Lemma B.2. 
+
+The next two lemmas from existing works show that the discretization error, \(\mathsf{TV}(Q,Q_{\text{dis}})\), is relatively small. Furthermore, as \(T\) increases, \(q_{T}\) converges exponentially towards \(\mathcal{N}(0,I_{d})\).
+
+**Lemma B.3** (Discretization Error, Corollary 1 and eq. (17) in Benton et al. (2023)).: _For any \(T\geq 1\), \(\gamma<1\) and \(N\geq\log(1/\gamma)\), there exists a sequence of \(N\) discretization times such that_
+
+\[\mathsf{TV}(Q,Q_{\text{dis}})\lesssim\sqrt{\frac{d}{N}}\left(T+\log\frac{1}{ \gamma}\right).\]
+
+**Lemma B.4** (TV between true Gaussian and \(q_{T}\) for large \(T\), Proposition 4 in Benton et al. (2023)).: _Let \(q\) be a distribution with a finite second moment of \(m_{2}^{2}\). Then, for \(T\geq 1\) we have_
+
+\[\mathsf{TV}(q_{T},\mathcal{N}(0,I_{d}))\lesssim(\sqrt{d}+m_{2})e^{-T}.\]
+
+Combining lemma B.3 and lemma B.4 with lemma 3.1, we have the following result:
+
+**Corollary B.5**.: _Let \(q\) be a distribution with finite second moment \(m_{2}^{2}\). For any \(T\geq 1\), \(\gamma<1\) and \(N\geq\log(1/\gamma)\), there exists a sequence of discretization times \(0=t_{0}<t_{1}<\dots<t_{N}=T-\gamma\) such that if the following holds for each \(k\in\{0,\dots,N-1\}\):_
+
+\[D^{\delta/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon}{\sigma_{T-t_{k}}},\]
+
+_then there exists a sequence of \(N\) discretization times such that_
+
+\[\mathsf{TV}(q_{\gamma},p_{T-t_{N}})\lesssim\delta+\varepsilon\sqrt{T+\log \frac{1}{\gamma}}+\sqrt{\frac{d}{N}}\left(T+\log\frac{1}{\gamma}\right)+( \sqrt{d}+m_{2})e^{-T}.\]
+
+This implies our main theorem of this section as a corollary.
+
+**Theorem B.6**.: _Let \(q\) be a distribution with finite second moment \(m_{2}^{2}\). For any \(\gamma>0\), there exist \(N=\widetilde{O}(\frac{d}{\varepsilon^{2}+d}\log^{2}\frac{d+m_{2}}{\gamma})\) discretization times \(0=t_{0}<t_{1}<\dots<t_{N}<T\) such that if the following holds for every \(k\in\{0,\dots,N-1\}\),_
+
+\[D^{\delta/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon}{\sigma_{T-t_{k}}}\]
+
+_then the SDE process in equation 5 can produce a sample from a distribution that is within \(\widetilde{O}(\delta+\varepsilon\sqrt{\log\left((d+m_{2})/\gamma\right)})\) in \(\mathsf{TV}\) distance of \(q_{\gamma}\) in \(N\) steps._Proof.: By setting \(T=\log(\frac{\sqrt{d}+m_{2}}{c+\delta})\) and \(N=\frac{d(T+\log(1/\gamma))^{2}}{e^{2}+\delta^{2}}\) in corollary B.5, we have
+
+\[\mathsf{TV}(q_{\gamma},p_{T-t_{N}})=\widetilde{O}\left(\delta+ \varepsilon\sqrt{\log\frac{d+m_{2}}{\gamma}}\right).\]
+
+Furthermore, we present our theorem under the case when \(m_{2}\) lies between \(1/\text{poly}(d)\) and \(poly(d)\) to provide a clearer illustration.
+
+**Theorem 1.2**.: _Let \(q\) be a distribution over \(\mathbb{R}^{d}\) with second moment \(m_{2}^{2}\) between \(1/\text{poly}(d)\) and \(\text{poly}(d)\). For any \(\gamma>0\), there exist \(N=\widetilde{O}(\frac{d}{\varepsilon^{2}+\delta^{2}}\log^{2}\frac{1}{\gamma})\) discretization times \(0=t_{0}<t_{1}<\cdots<t_{N}<T\) such that if the following holds for every \(k\in\{0,\ldots,N-1\}\):_
+
+\[D^{\delta/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon}{\sigma_{T-t_{k}}}\]
+
+_then the SDE process in equation 5 can produce a sample from a distribution that is within \(\widetilde{O}(\delta+\varepsilon\sqrt{\log\left(d/\gamma\right)})\) in \(\mathsf{TV}\) distance to \(q_{\gamma}\) in \(N\) steps._
+
+## Appendix C End-to-end Guarantee
+
+In this section, we state our end-to-end guarantee that combines our score estimation result in the new equation 8 sense with prior sampling results (from Benton et al. (2023)) to show that the score can be learned using a number of samples scaling polylogarithmically in \(\frac{1}{\gamma}\), where \(\gamma\) is the desired sampling accuracy.
+
+**Corollary C.1**.: _Let \(q\) be a distribution of \(\mathbb{R}^{d}\) with second moment \(m_{2}^{2}\). For any \(\gamma>0\), there exist \(N=\widetilde{O}(\frac{d}{\varepsilon^{2}+\delta^{2}}\log^{2}\frac{m_{2}+1/m_{ 2}}{\gamma})\) discretization times \(0=t_{0}<\cdots<t_{N}<T\) such that if \(\mathcal{H}\) contain approximations \(h_{T-t_{k}}\) that satisfy_
+
+\[\mathbb{E}_{x\sim q_{t}}\left[\|h_{T-t_{k}}(x)-s_{T-t_{k}}(x)\|^{2} \right]\leq\frac{\delta\cdot\varepsilon^{3}}{CN^{2}\sigma_{T-t_{k}}^{2}}\cdot \frac{1}{\log\frac{d+m_{2}+1/m_{2}}{\gamma}}\]
+
+_for sufficiently large constant \(C\), then given \(m=\widetilde{O}\left(\frac{N}{\varepsilon^{3}}(d+\log\frac{1}{\delta})\log \frac{|\mathcal{H}|}{\delta}\log\frac{m_{2}+1/m_{2}}{\gamma}\right)\) samples, with \(1-\delta\) probability the SDE process in equation 5 can sample from a distribution \(\varepsilon\)-close in \(\mathsf{TV}\) to a distribution \(\gamma m_{2}\)-close in 2-Wasserstein to \(q\) in \(N\) steps._
+
+Proof.: Note that for an arbitrary \(t>0\), the 2-Wasserstein distance between \(q\) and \(q_{t}\) is bounded by \(O(tm_{2}+\sqrt{td})\). Therefore, by choosing \(t_{N}=T-\min(\gamma,\gamma^{2}m_{2}^{2}/d)\), Theorem B.6 shows that by choosing \(N=\widetilde{O}(\frac{d}{\varepsilon^{\prime 2}+\delta^{2}}\log^{2}\frac{d+m_{2}} {\min(\gamma,\gamma^{2}m_{2}^{2}/d)})\), we only need
+
+\[D^{\varepsilon/N}_{q_{T-t_{k}}}(\widehat{s}_{T-t_{k}},s_{T-t_{k}})\leq\frac{ \varepsilon^{\prime}}{\sigma_{T-t_{k}}\sqrt{\log\frac{d+m_{2}}{\min(\gamma, \gamma^{2}m^{2}/d)}}}\]
+
+then DDPM can produce a sample from a distribution within \(\widetilde{O}(\varepsilon^{\prime})\) in \(\mathsf{TV}\) distance to a distribution \(\gamma m_{2}\)-close in 2-Wasserstein to \(q\) in \(N\) steps. Note that
+
+\[\log\frac{d+m_{2}}{\min(\gamma,\gamma^{2}m_{2}^{2}/d)}\lesssim\log\frac{d+m_{2 }+1/m_{2}}{\gamma}.\]
+
+Therefore, we only need to take \(\widetilde{O}(\frac{d}{\varepsilon^{\prime 2}+\delta^{2}}\log^{2}\frac{m^{2}+1/m_{ 2}}{\gamma})\) steps. Therefore, to achieve this, we set \(\delta_{\text{train}}=\delta\), \(\delta_{\text{score}}=\varepsilon^{\prime}\), and \(\varepsilon=\varepsilon^{\prime}/\sqrt{\log\frac{d+m_{2}+1/m_{2}}{\gamma}} \lesssim\varepsilon^{\prime}/\sqrt{\log\frac{d+m_{2}}{\min(\gamma,\gamma^{2}m_ {2}^{2}/d)}}\) in theorem A.3. This gives us the result that with
+
+\[m=\widetilde{O}\left(\frac{N}{\varepsilon^{\prime 3}}(d+\log\frac{1}{\delta})\log \frac{|\mathcal{H}|}{\delta}\log\frac{m_{2}+1/m_{2}}{\gamma}\right)\]
+
+samples, we can satisfy the score requirement given the assumption in the statement.
+
+Again, we present this corollary under the case when \(m_{2}\) lies between \(1/\text{poly}(d)\).
+
+**Corollary 1.3** (End-to-end Guarantee).: _Let \(q\) be a distribution over \(\mathbb{R}^{d}\) with second moment \(m_{2}^{2}\) between \(1/\text{poly}(d)\) and \(\text{poly}(d)\). For any \(\gamma>0\), there exist \(N=\widetilde{O}(\frac{d}{\varepsilon^{4}+\delta^{2}}\log^{2}\frac{1}{\gamma})\) discretization times \(0=t_{0}<\cdots<t_{N}<T\) such that if \(\mathcal{H}\) contain approximations \(h_{T-t_{k}}\) that satisfy_
+
+\[\operatorname*{\mathbb{E}}_{x\sim q_{t}}\big{[}\|h_{T-t_{k}}(x)-s_{T-t_{k}}(x) \|^{2}\big{]}\leq\frac{\delta\cdot\varepsilon^{3}}{CN^{2}\sigma_{T-t_{k}}^{2} }\cdot\frac{1}{\log\frac{d}{\gamma}}\]
+
+_for sufficiently large constant \(C\), then given \(m=\widetilde{O}\left(\frac{N}{\varepsilon^{3}}(d+\log\frac{1}{\delta})\log \frac{|\mathcal{H}|}{\delta}\log\frac{1}{\gamma}\right)\) samples, with \(1-\delta\) probability the SDE process in equation 5 can sample from a distribution \(\varepsilon\)-close in \(\mathsf{TV}\) to a distribution \(\gamma m_{2}\)-close in 2-Wasserstein to \(q\) in \(N\) steps._
+
+## Appendix D Hardness of Learning in \(L^{2}\)
+
+In this section, we give proofs of the hardness of the examples we mention in Section 4.
+
+**Lemma 4.1**.: _Let \(R\) be sufficiently large. Let \(p_{1}\) be the distribution \((1-\eta)\mathcal{N}(0,1)+\eta\mathcal{N}(-R,1)\) with corresponding score function \(s_{1}\), and let \(p_{2}\) be \((1-\eta)\mathcal{N}(0,1)+\eta\mathcal{N}(R,1)\) with score \(s_{2}\). Then, given \(m\) samples from either distribution, it is impossible to distinguish between \(p_{1}\) and \(p_{2}\) for \(\eta<\frac{1}{m^{1+}}\) with probability larger than \(1/2+o_{m}(1)\). But,_
+
+\[\operatorname*{\mathbb{E}}_{x\sim p_{1}}\big{[}\|s_{1}(x)-s_{2}(x)\|^{2}\big{]} \gtrsim\eta R^{2}\quad\text{and}\quad\operatorname*{\mathbb{E}}_{x\sim p_{2}} \big{[}\|s_{1}(x)-s_{2}(x)\|^{2}\big{]}\gtrsim\eta R^{2}.\]
+
+Proof.: \[\mathsf{TV}(p_{1},p_{2})\gtrsim\eta\]
+
+So, it is impossible to distinguish between \(p_{1}\) and \(p_{2}\) with fewer than \(O\left(\frac{1}{\eta}\right)\) samples with probability \(1/2+o_{m}(1)\).
+
+The score \(L^{2}\) bound follows from calculation. 
+
+**Lemma 4.2**.: _Let \(S\) be sufficiently large. Consider the distribution \(\widehat{p}=\eta\mathcal{N}(0,1)+(1-\eta)\mathcal{N}(S,1)\) for \(\eta=\frac{S\varepsilon^{-\frac{\delta^{2}}{2}+10\sqrt{\log m}-S}}{10\sqrt{ \log m}}\), and let \(\widehat{s}\) be its score function. Given \(m\) samples from the standard Gaussian \(p^{*}=\mathcal{N}(0,1)\) with score function \(s^{*}\), with probability at least \(1-\frac{1}{\text{poly}(m)}\),_
+
+\[\widehat{\operatorname*{\mathbb{E}}}\big{[}\|\widehat{s}(x)-s^{*}(x)\|^{2} \big{]}\leq e^{-O(S\sqrt{\log m})}\quad\text{but}\quad\operatorname*{\mathbb{ E}}_{x\sim p^{*}}\big{[}\|\widehat{s}(x)-s^{*}(x)\|^{2}\big{]}\gtrsim\frac{S^{2}}{m}.\]
+
+Proof.: Let \(X_{1},\ldots,X_{m}\sim p^{*}\) be the \(m\) samples from \(\mathcal{N}(0,1)\). With probability at least \(1-\frac{1}{\text{poly}(m)}\), every \(X_{i}\leq 2\sqrt{\log m}\). Now, the score function of the mixture \(\widehat{p}\) is given by
+
+\[\widehat{s}(x)=\frac{-x-(x-S)\left(\frac{1-\eta}{\eta}\right)e^{-\frac{S^{2}} {2}+Sx}}{1+\left(\frac{1-\eta}{\eta}\right)e^{-\frac{S^{2}}{2}+Sx}}\]
+
+For \(x\leq 2\sqrt{\log m}\),
+
+\[\widehat{s}(x)=-x\left(1+\frac{e^{-O(S\sqrt{\log m})}}{S}\right)+e^{-O(S\sqrt {\log m})}\]
+
+So,
+
+\[\widehat{\operatorname*{\mathbb{E}}}\left[\|\widehat{s}(x)-s^{*}(x)\|^{2} \right]\leq e^{-O(S\sqrt{\log m})}\]
+
+On the other hand,
+
+\[\operatorname*{\mathbb{E}}_{x\sim p^{*}}\big{[}\|\widehat{s}(x)-s^{*}(x)\|^{2} \big{]}\gtrsim\frac{S^{2}}{m}\]
+
+## Appendix E Utility Results
+
+**Lemma E.1** (From Gupta et al. (2023)).: _Let \(f\) be an arbitrary distribution on \(\mathbb{R}^{d}\), and let \(f_{\Sigma}\) be the \(\Sigma\)-smoothed version of \(f\). That is, \(f_{\Sigma}(x)=\mathbb{E}_{y\sim f}\left[(2\pi)^{-d/2}\det(\Sigma)^{-1/2}\exp \left(-\frac{1}{2}(x-Y)^{T}\Sigma^{-1}(x-Y)\right)\right]\). Let \(s_{\Sigma}\) be the score function of \(f_{\Sigma}\). Let \((X,Y,Z_{\Sigma})\) be the joint distribution such that \(Y\sim f\), \(Z_{\Sigma}\sim\mathcal{N}(0,\Sigma)\) are independent, and \(X=Y+Z_{\Sigma}\sim f_{\Sigma}\). We have for \(\varepsilon\in\mathbb{R}^{d}\),_
+
+\[\frac{f_{\Sigma}(x+\varepsilon)}{f_{\Sigma}(x)}=\mathop{\mathbb{E}}_{Z_{ \Sigma}|x}\left[e^{-\varepsilon^{T}\Sigma^{-1}Z_{\Sigma}-\frac{1}{2} \varepsilon^{T}\Sigma^{-1}\varepsilon}\right]\]
+
+_so that_
+
+\[s_{\Sigma}(x)=\mathop{\mathbb{E}}_{Z_{\Sigma}|x}\left[-\Sigma^{-1}Z_{\Sigma}\right]\]
+
+**Lemma E.2** (From Hsu et al. (2012), restated).: _Let \(x\) be a mean-zero random vector in \(\mathbb{R}^{d}\) that is \(\Sigma\)-subgaussian. That is, for every vector \(v\),_
+
+\[\mathbb{E}\left[e^{\lambda(x,v)}\right]\leq e^{\lambda^{2}v^{T}\Sigma v/2}\]
+
+_Then, with probability \(1-\delta\),_
+
+\[\|x\|\lesssim\sqrt{\operatorname{Tr}(\Sigma)}+\sqrt{2\|\Sigma\|\log\frac{1}{ \delta}}\]
+
+**Lemma E.3**.: _For \(s_{\Sigma}\) the score function of an \(\Sigma\)-smoothed distribution where \(\Sigma=\sigma^{2}I\), we have that \(v^{T}s_{\Sigma}(x)\) is \(O(1/\sigma^{2})\)-subgaussian, when \(x\sim f_{\Sigma}\) and \(\|v\|=1\)._
+
+Proof.: We have by Lemma E.1 that
+
+\[s_{\Sigma}(x)=\mathop{\mathbb{E}}_{Z_{\Sigma}|x}\left[\Sigma^{-1}Z_{\Sigma}\right]\]
+
+So,
+
+\[\mathop{\mathbb{E}}_{x\sim f_{\Sigma}}\left[(v^{T}s_{\Sigma}(x))^ {k}\right] =\mathop{\mathbb{E}}_{x\sim f_{\Sigma}}\left[\mathop{\mathbb{E}} _{Z|x}\left[v^{T}\Sigma^{-1}Z_{\Sigma}\right]^{k}\right]\] \[\leq\mathop{\mathbb{E}}_{Z_{\Sigma}}\left[(v^{T}\Sigma^{-1}Z_{ \Sigma})^{k}\right]\] \[\leq\frac{k^{k/2}}{\sigma^{k}}\quad\text{since }v^{T}Z_{\Sigma} \sim\mathcal{N}(0,\sigma^{2})\]
+
+The claim follows. 
+
+**Lemma E.4**.: _Let \(\Sigma=\sigma^{2}I\), and let \(x\sim f_{\Sigma}\). We have that with probability \(1-\delta\),_
+
+\[\|s_{\Sigma}(x)\|^{2}\lesssim\frac{d+\log\frac{1}{\delta}}{\sigma^{2}}\]
+
+Proof.: Follows from Lemmas E.3 and E.2. 
+
+**Lemma E.5**.: _For \(z\sim\mathcal{N}(0,\sigma^{2}I_{d})\), with probability \(1-\delta\),_
+
+\[\left\|\frac{z}{\sigma^{2}}\right\|\lesssim\frac{\sqrt{d+\log\frac{1}{\delta} }}{\sigma}\]
+
+Proof.: Note that \(\|z\|^{2}\) is chi-square, so that we have for any \(0\leq\lambda<\sigma^{2}/2\),
+
+\[\mathop{\mathbb{E}}_{z}\left[e^{\lambda\left\|\frac{1+\eta}{\sigma^{2}}\right\| ^{2}}\right]\leq\frac{1}{(1-2(\lambda/\sigma^{2}))^{d/2}}\]
+
+The claim then follows by the Chernoff bound.
+
+**Lemma E.6**.: _For \(x\sim f_{\Sigma}\), with probability \(1-\delta\),_
+
+\[\mathop{\mathbb{E}}_{Z_{\Sigma}|x}\left[\frac{\|Z_{\Sigma}\|}{\sigma^{2}}\right] \lesssim\frac{\sqrt{d+\log\frac{1}{\delta}}}{\sigma}\]
+
+Proof.: Since \(Z_{\Sigma}\sim\mathcal{N}(0,\sigma^{2}I_{d})\) so that \(\|Z_{\Sigma}\|^{2}\) is chi-square, we have that for any \(0\leq\lambda<\sigma^{2}/2\), by Jensen's inequality,
+
+\[\mathop{\mathbb{E}}_{x\sim f_{\Sigma}}\left[e^{\lambda\mathop{\mathbb{E}}_{Z_{ \Sigma}|x}\left[\frac{\|Z_{\Sigma}\|}{\sigma^{2}}\right]^{2}}\right]\leq \mathop{\mathbb{E}}_{Z_{\Sigma}}\left[e^{\lambda\frac{\|Z_{\Sigma}\|^{2}}{ \sigma^{4}}}\right]\leq\frac{1}{(1-2(\lambda/\sigma^{2}))^{d/2}}\]
+
+The claim then follows by the Chernoff bound. That is, setting \(\lambda=\sigma^{2}/4\), for any \(t>0\),
+
+\[\Pr_{x\sim f_{\Sigma}}\left[\mathop{\mathbb{E}}_{Z_{\Sigma}|x}\left[\frac{\|Z_ {\Sigma}\|}{\sigma^{2}}\right]^{2}\geq t\right]\leq\frac{\mathop{\mathbb{E}}_{ x\sim f_{\Sigma}}\left[e^{\lambda\mathop{\mathbb{E}}_{Z_{\Sigma}|x}\left[\frac{ \|Z_{\Sigma}\|}{\sigma^{2}}\right]^{2}}\right]}{e^{\lambda t}}\leq 2^{d/2}e^{-t \sigma^{2}/4}=2^{\frac{d\ln 2}{2}-\frac{t\sigma^{2}}{4}}\]
+
+For \(t=O\left(\frac{d+\log\frac{1}{\delta}}{\sigma^{2}}\right)\), this is less than \(\delta\). 
+
+**Theorem E.7** (Girsanov's theorem).: _For \(t\in[0,T]\), let \(\mathcal{L}_{t}=\int_{0}^{t}b_{s}\,\mathrm{d}B_{s}\) where \(B\) is a \(Q\)-Brownian motion. Assume Novikov's condition is satisfied:_
+
+\[\mathop{\mathbb{E}}_{Q}\left[\exp\left(\frac{1}{2}\int_{0}^{T}\|b_{s}\|_{2}^{ 2}\,\mathrm{d}s\right)\right]<\infty.\]
+
+_Then_
+
+\[\mathcal{E}(\mathcal{L})_{t}:=\exp\left(\int_{0}^{t}b_{s}\,\mathrm{d}B_{s}- \frac{1}{2}\int_{0}^{t}\|b_{s}\|_{2}^{2}\,\mathrm{d}s\right)\]
+
+_is a \(Q\)-martingale and_
+
+\[\widetilde{B}_{t}:=B_{t}-\int_{0}^{t}b_{s}\,\mathrm{d}s\]
+
+_is a Brownian motion under \(P\) where \(P:=\mathcal{E}(\mathcal{L})_{T}Q\), the probability distribution with density \(\mathcal{E}(\mathcal{L})_{T}\) w.r.t. \(Q\)._

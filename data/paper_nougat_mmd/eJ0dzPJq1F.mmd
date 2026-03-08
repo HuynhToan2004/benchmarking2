@@ -1,0 +1,484 @@
+# Blending Imitation and Reinforcement Learning for Robust Policy Improvement
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+While reinforcement learning (RL) has shown promising performance, its sample complexity continues to be a substantial hurdle, restricting its broader application across a variety of domains. Imitation learning (IL) utilizes oracles to improve sample efficiency, yet it is often constrained by the quality of the oracles deployed. To address the demand for robust policy improvement in real-world scenarios, we introduce a novel algorithm, Robust Policy Improvement (RPI), which actively interleaves between IL and RL based on an online estimate of their performance. RPI draws on the strengths of IL, using oracle queries to facilitate exploration--an aspect that is notably challenging in sparse-reward RL--particularly during the early stages of learning. As learning unfolds, RPI gradually transitions to RL, effectively treating the learned policy as an improved oracle. This algorithm is capable of learning from and improving upon a diverse set of black-box oracles. Integral to RPI are Robust Active Policy Selection (RAPS) and Robust Policy Gradient (RPG), both of which reason over whether to perform state-wise imitation from the oracles or learn from its own value function when the learner's performance surpasses that of the oracles in a specific state. Empirical evaluations and theoretical analysis validate that RPI excels in comparison to existing state-of-the-art methodologies, demonstrating superior performance across various benchmark domains.
+
+## 1 Introduction
+
+Reinforcement learning (RL) has shown significant advancements, surpassing human capabilities in diverse domains such as Go (Silver et al., 2017), video games (Berner et al., 2019; Mnih et al., 2013), and Poker (Zhao et al., 2022). Despite such achievements, the application of RL is largely constrained by its substantial computational and data requirements and high sample complexity, particularly in fields like robotics (Singh et al., 2022) and healthcare (Han et al., 2023), where the extensive online interaction for trial and error is often impractical.
+
+Imitation learning (IL) (Osa et al., 2018) improves sample efficiency by allowing the agent to replace some or all environment interactions with demonstrations provided by an oracle policy. However, the efficacy of IL heavily relies on access to near-optimal oracles for approaches like behavior cloning (Pomerleau, 1988; Zhang et al., 2018) or inverse reinforcement learning (Abbeel and Ng, 2004; Finn et al., 2016; Ho and Ermon, 2016; Ziebart et al., 2008). Interactive IL techniques, such as DAgger (Ross et al., 2011) and AggreVate(D) (Ross and Bagnell, 2014; Sun et al., 2017), similarly assume that the policy we train (i.e., _learner_ policy) can obtain demonstrations from a near-optimal oracle. When we have access to rewards, the learner has the potential to improve and outperform the oracle. THOR (Sun et al., 2018) exemplifies this capability by utilizing a near-optimal oracle for cost shaping, optimizing the \(k\)-step advantage relative to the oracle's value function (referred to as "cost-to-go oracle").
+
+However, in realistic settings, obtaining optimal or near-optimal oracles is often infeasible. Typically, learners have access to _suboptimal_ and _black-box_ oracles that may not offer optimal trajectories or quantitative performance measures in varying states, requiring substantial environment interactions to identify state-wise optimality. Recent approaches, including LOKI (Cheng et al., 2018) and TGRL (Shenfeld et al., 2023) aim to tackle this issue by combining IL and RL. They focus on a single-oracle setting, whereas MAMBA (Cheng et al., 2020) and MAPS (Liu et al., 2023) learn from multiple oracles. These approaches demonstrate some success, but often operate under theassumption that at least one oracle provides optimal actions in any given state, which does not always hold in practice. In situations where no oracle offers beneficial advice for a specific state, it is more effective to learn based on direct reward feedback. Our work intend to bridge this gap by adaptively blending IL and RL in a unified framework.
+
+Our contributions.In this paper, we present max\({}^{+}\), a learning framework devised to enable robust learning in unknown Markov decision processes (MDP) by interleaving RL and IL, leveraging multiple suboptimal, black-box oracles. Within this framework, we introduce _Robust Policy Improvement_ (RPI), a novel policy gradient algorithm designed to facilitate learning from a set of black-box oracles. RPI comprises two innovative components:
+
+1. _Robust Active Policy Selection_ (RAPS), improving value function estimators of black-box oracles efficiently, and
+2. _Robust Policy Gradient_ (RPG), executing policy gradient updates within an actor-critic framework based on a newly devised advantage function.
+
+Our algorithm strikes a balance between learning from these suboptimal oracles and self improvement through active exploration in states where the learner has surpassed the oracle's performance. We provide a theoretical analysis of our proposed method, proving that it ensures a performance lower bound no worse than that of the competing baseline (Cheng et al., 2020). Through extensive empirical evaluations on eight different tasks from DeepMind Control Suite (Tassa et al., 2018) and Meta-World (Yu et al., 2020), we empirically demonstrate that RPI outperforms contemporary methods and then ablate its core components.
+
+## 2 Related Work
+
+Online selection of suboptimal experts.CAMS (Liu et al., 2022; 2020) learns from multiple suboptimal black-box experts to perform model selection based on a given context, but is only applicable in stateless online learning settings. Meanwhile, SAC-X (Riedmiller et al., 2018) learns the intention policies (oracles), each of which optimizes their own auxiliary reward function, and then reasons over which of these oracles to execute as a form of curriculum learning for the task policy. LGP (Ablett et al., 2023) combines adversarial IL with SAC-X to improve exploration. Defining auxiliary rewards requires the task be decomposed into smaller subtasks, which may not be trivial. Further, they query the intention policies several times within a single episode. Unlike CAMS and SAC-X, which rely on selecting expert policies to perform sub-tasks, our approach trains an independent learner policy. It acquires expertise from sub-optimal experts using only a single oracle query per episode, thus having the potential to surpass these oracles through global exploration.
+
+Policy improvement with multiple experts.Recent works attempt to learn from suboptimal black-box oracles while also utilizing rewards observed under the learner's policy. Active offline policy selection (A-OPS) (Konyushova et al., 2021) utilizes policy similarities to enhance value predictions. However, A-OPS lacks a learner policy to acquire expertise from these offline policies. ILEED (Beliaev et al., 2022) distinguishes between oracles based on their expertise at each state but is constrained to pure offline IL settings. InfoGAIL (Li et al., 2017) conditions the learned policy on latent factors that motivate demonstrations of different oracles. OIL (Li et al., 2018) tries to identify and follow the best oracle in a given situation. Nevertheless, both overlook two essential inquiries: what constitutes a reasonable benchmark for policy improvement in multiple oracles setting, and what is the systematic approach for amalgamating sub-optimal oracles into a more stronger baseline. SFQL (Barreto et al., 2017) proposes _generalized policy improvement_ with successor features. MAMBA (Cheng et al., 2020) utilizes an advantage function with geometric weighted generalization and achieves a larger policy improvement over SFQL, while addressing the above two important questions with theoretical support. MAPS (Liu et al., 2023) improves on the sample efficiency and performance of MAMBA by proposing active policy selection and state exploration. However, even when the quality of the oracle set is poor, these algorithms will still resort to imitation learning with the inferior oracles. In contrast, our algorithm performs self-improvement, employing imitation learning only on states for which an oracle outperforms the learner.
+
+## 3 Preliminaries
+
+We consider a finite-horizon Markov decision process (MDP) \(\mathcal{M}_{0}=\langle\mathcal{S},\mathcal{A},\mathcal{P},r,H\rangle\) with state space \(\mathcal{S}\), action space \(\mathcal{A}\), unknown stochastic transition dynamics \(\mathcal{P}:\mathcal{S}\times\mathcal{A}\rightarrow\Delta(\mathcal{S})\), unknown reward function \(r:\mathcal{S}\times\mathcal{A}\rightarrow[0,1]\), and episode horizon \(H\). We define total number of training steps (rounds) as \(N\) and assume access to a (possibly empty) set of \(K\) oracles, defined as \(\Pi=\{\pi^{k}\}_{k=1}^{K}\), where \(\pi_{k}:\mathcal{S}\rightarrow\Delta(\mathcal{A})\). The _generalized Q-function_ with respect to a general function \(f:\mathcal{S}\rightarrow\mathbb{R}\) is defined as:
+
+\[Q^{f}\left(s,a\right):=r\left(s,a\right)+\mathbb{E}_{s^{\prime}\sim\mathcal{P} \mid s,a}[f\left(s^{\prime}\right)]\,.\]
+
+When \(f(s)\) is the value function of a particular policy \(\pi\), the generalized Q-function can be used to recover the policy's Q-function \(Q^{\pi}(s,a)\). We denote the _generalized advantage function_ with respect to \(f\) as
+
+\[\boldsymbol{A}^{f}\left(s,a\right)=Q^{f}\left(s,a\right)-f\left(s\right)=r \left(s,a\right)+\mathbb{E}_{s^{\prime}\sim\mathcal{P}\mid s,a}[f\left(s^{ \prime}\right)]-f\left(s\right).\]
+
+Given an initial state distribution \(d_{0}\in\Delta(\mathcal{S})\), let \(d_{t}^{\pi}\) denote the distribution over states at time \(t\) under policy \(\pi\). The state visitation distribution under \(\pi\) can be expressed as \(d^{\pi}:=\frac{1}{H}\sum_{t=0}^{H-1}d_{t}^{\pi}\). The value function of the policy \(\pi\) under \(d_{0}\) is denoted as:
+
+\[V^{\pi}\left(d_{0}\right)=\mathbb{E}_{s_{0}\sim d_{0}}[V^{\pi}\left(s\right)]= \mathbb{E}_{s_{0}\sim d_{0}}\Bigg{[}\mathbb{E}_{\tau_{0}\sim\rho^{\pi}\mid_{0} }\Bigg{[}\sum_{t=0}^{H-1}r\left(s_{t},a_{t}\right)\Bigg{]}\Bigg{]}\]
+
+where \(\rho^{\pi}(\tau_{t}\mid s_{t})\) is the distribution over trajectories \(\tau_{t}=\{s_{t},a_{t},\ldots,s_{H-1},a_{H-1}\}\) under policy \(\pi\). The goal is to find a policy \(\pi=\arg\max_{\pi}J\left(\pi\right)\) maximizing the expected return
+
+\[J\left(\pi\right)=\mathbb{E}_{s\sim d_{0}}\left[V^{\pi}\left(s\right)\right]. \tag{1}\]
+
+## 4 Policy Improvement with Perfect Knowledge of Oracle Set
+
+We now present a reinforcement learning framework in the presence of an imitation learning oracle set, which is inspired from Cheng et al. (2020); Liu et al. (2023). In this section, we assume that we have perfect knowledge of the underlying MDP and each oracle's value function. We will relax these assumptions in the next section.
+
+Max-following.Given a collection of \(k\) imitation learning _oracles_\(\Pi^{\mathsf{o}}=\{\pi^{k}\}_{k\in[K]}\), the _max-following_ policy is a greedy policy that selects the oracle with the highest expertise in any given state. The max-following policy is sensitive to the quality of the oracles. Specifically, if all oracles perform worse than the learner policy at a given state, the max-following policy will still naively imitate the best (but poor) oracle. Instead, it would be more prudent to follow the learner's guidance in these cases.
+
+**Definition 4.1**.: **(Extended Oracle Set)**. Let \(\Pi^{\mathsf{o}}=\{\pi^{k}\}_{k\in[K]}\) be the given black-box oracle set, \(\Pi^{\mathcal{L}}=\{\pi_{n}\}_{n\in[N]}\) be the learner's policy class, where \(\pi_{n}\) denotes that the policy has been updated for \(n\) rounds. We define the _extended oracle set_ at the \(n\)-th round as
+
+\[\Pi^{\mathcal{E}}=\Pi^{\mathsf{o}}\cup\{\pi_{n}\}=\left\{\pi^{1},\ldots,\pi^{ K},\pi_{n}\right\}. \tag{2}\]
+
+**Remark 4.2**.: The learner policy in the extended oracle set is updated at each round.
+
+### Max\({}^{+}\) Aggregation
+
+Based on the extended oracle set, we first introduce the advantage function \(\boldsymbol{A}^{+}\) and the baseline value function \(f^{+}\) as follows:
+
+**Definition 4.3**.: **(\(\boldsymbol{A^{+}}\) Advantage Function)**. Given \(k\) oracles \(\pi^{1},\ldots,\pi^{k}\) and the learner policy \(\pi_{n}\), we define \(\boldsymbol{A}^{+}\) advantage function as :
+
+\[\boldsymbol{A}^{+}\left(s,a\right):=r\left(s,a\right)+\mathbb{E}_{s^{\prime} \sim\mathcal{P}\mid\pi,s}[f^{+}\left(s^{\prime}\right)]-f^{+}\left(s\right), \tag{3}\]
+
+where \(f^{+}\left(s\right)\) is the baseline value function, defined as:
+
+\[f^{+}\left(s\right)=\max_{k\in[|\Pi^{\mathcal{E}}|]}V^{k}\left(s\right),\text{ where }\left[V^{k}\right]_{k\in[|\Pi^{\mathcal{E}}|]}:=\left[V^{\pi^{1}},\ldots,V^{\pi^{K}},V^{\pi_{n}}\right]. \tag{4}\]\(f^{+}\left(s\right)\) focuses exclusively on optimizing oracle selection for a single state, assuming that the selected policy will be followed for the remainder of the trajectory. To optimize the oracle selection for every encountered state, we introduce the \(\max^{*}\)-following policy, which acts as a greedy policy, adhering to the optimal policy within the _extended_ oracle set for any given state.
+
+**Definition 4.4**.: **(Max\({}^{\star}\)-Following Policy)**. Given extended oracle set \(\Pi^{\mathcal{E}}\), the _max\({}^{+}\)-following_ policy
+
+\[\pi^{\circ}\left(a\mid s\right):=\pi^{k^{*}}\left(a\mid s\right),\text{ where }k^{*}:=\operatorname*{arg\,max}_{k\in\left\|\Pi^{\mathcal{E}}\right\|}V^{k} \left(s\right),\left|\Pi^{\mathcal{E}}\right|=K+1,V^{K+1}=V^{\pi_{n}}. \tag{5}\]
+
+**Proposition 4.5**.: _Following \(\pi^{\circ}\) is as good or better than imitating the single-best policy in \(\Pi^{\mathcal{E}}\)._
+
+With a slight abuse of notation, we use \(\boldsymbol{A}^{+}\left(s,\pi^{\circ}\right)\) to denote the generalized advantage function of the policy \(\pi^{\circ}\) at \(s\). As proved in the Appendix, the function \(\boldsymbol{A}^{+}\left(s,\pi^{\circ}\right)\geq 0\) (Appendix C.1) and that the value function for the \(\max^{+}\)-following policy satisfies \(V^{\pi^{*}}(s)\geq f^{+}\left(s\right)=\max_{k\in\left[\Pi^{\mathcal{E}}\right] }V^{k}(s)\) (Appendix C.1). This indicates that following \(\pi^{\circ}\) is at least as good as or better than imitating a single best policy in \(\Pi^{\mathcal{E}}\). Thus, \(\pi^{\circ}\) is a valid approach to robust policy learning in the multiple oracle setting. The \(\max^{+}\)-following policy \(\pi^{\circ}\) is better than the max-following policy when the learner's policy is better than any oracle for a given state. On the other hand, when the value of a specific oracle \(V^{k}\) is always better than all other policies for all states, \(\pi^{\circ}\) simply reduces to the corresponding oracle \(\pi^{k}\). This is not ideal because the value \(V^{k}(s)\) assumes to keep rolling out the same oracle \(\pi^{k}\) from state \(s\) until termination, without making improvement by looking one step ahead and searching for a better action. To address this, we propose the _max\({}^{+}\)-aggregation_ policy as follows.
+
+**Definition 4.6**.: **(Max\({}^{\star}\)-Aggregation Policy1)**. For state \(s\), the max\({}^{\star}\)-aggregation policy \(\pi^{\oplus}\) performs one-step improvement and takes the action with largest advantage over \(f^{+}\),
+
+Footnote 1: When we exclude the learner’s policy from the extended oracle set, this reduces to the max-aggregation policy, which was used in MAMBA (Cheng et al., 2020).
+
+\[\pi^{\oplus}\left(a\mid s\right)=\delta_{a=a^{\star}},\text{where }a^{\star}= \operatorname*{arg\,max}_{a\in\boldsymbol{A}}\boldsymbol{A}^{+}\left(s,a \right)\text{ and }\delta\text{ is the Dirac delta distribution}. \tag{6}\]
+
+Although the \(\max^{+}\)-following policy \(\pi^{\circ}\) improves upon the max-following policy, it does not perform self-improvement. In contrast, the \(\max^{+}\)-aggregation policy \(\pi^{\oplus}\) looks one step ahead and makes the largest one-step advantage improvement with respect to \(f^{+}\). Thus, in the degenerate case where \(\pi^{\circ}\) is equivalent to the single best policy, \(\pi^{\oplus}\) outperforms the best single policy in \(\Pi^{\mathcal{E}}\) for all states. Since \(\boldsymbol{A}^{+}\left(s,\pi^{\oplus}\right)\geq\boldsymbol{A}^{+}\left(s,\pi ^{\circ}\right)\geq 0\) for any state \(s\) by Corollary C.2 and Proposition 4.5, we conclude that the \(\max^{+}\)-aggregation policy \(\pi^{\oplus}\) is a suitable policy benchmark for the robust policy learning setting as well. We note that the baseline \(f^{+}(s)\) corresponds to the value of choosing the single-best policy in \(\Pi^{\mathcal{E}}\) at state \(s\) and rolling it out throughout the rest of the episode. In contrast, \(\pi^{\circ}\) and \(\pi^{\oplus}\) optimize the oracle selection at every remaining step in the trajectory. This work is therefore built on \(\pi^{\oplus}\).
+
+**Remark 4.7**.: **(Empty Oracle Set)** Up to this point, we have primarily assumed a non-empty oracle set \(\Pi^{\circ}\) and an extended oracle set of size \(\left|\Pi^{\mathcal{E}}\right|\geq 2\). Given an empty oracle set \(\Pi^{\circ}\), \(\Pi^{\mathcal{E}}\) will only contain the learner policy. In this case, \(f^{+}\equiv V^{\pi^{\circ}}\) and \(\pi^{\circ}\) will not improve, while \(\pi^{\oplus}\) reduces to pure reinforcement learning, performing self-improvement by using the advantage function \(\boldsymbol{A}^{+}\).
+
+## 5 Robust Policy Improvement with Black-Box Oracle Set
+
+Improving a policy from the \(\max^{+}\) baseline \(f^{+}\) (Eqn. 4) is the key to learning robustly via IL and RL. Nominally, this requires knowledge of the MDP and the oracles' value functions, however, the oracles are presented to the learner as black-box policies with unknown value functions.
+
+A critical challenge to use \(f^{+}\) as a baseline is that \(f^{+}\left(s\right)=\max_{k\in\left\|\Pi^{\mathcal{E}}\right\|}V^{k}\left(s\right)\) is dynamic in the training process and is improving as the learner improves, which departs from the setting of MAMBA where the baseline function is static. In the following analysis we resort to a slightly weaker baseline, \(f^{+}_{m}:=\max_{k\in\left\|\Pi^{\mathcal{E}}\cup\{\pi_{m}\}\right\|}V^{k} \left(s\right)\), where \(m\ll N\) is an intermediate step in the learning process, and \(N\) is the total number of rounds. Similarly, we define \(\boldsymbol{A}^{+}_{m}\left(s,a\right):=r\left(s,a\right)+\mathbb{E}_{s^{ \prime}\sim\mathcal{P}\left[\pi,s\right]}[f^{+}_{m}\left(s^{\prime}\right)]- f^{+}_{m}\left(s\right),\) as the corresponding advantage function, and \(\pi^{\oplus}_{m}\) as the corresponding max\({}^{+}\)-aggregation policy by plugging \(\boldsymbol{A}^{+}=\boldsymbol{A}^{+}_{m}\) in Definition 4.6. In the following, we use the baseline value \(f^{+}_{m}\), and reformulate the problem in an online learning setting (Ross et al., 2014; Ross and Bagnell, 2014; Sun et al., 2017; Cheng et al., 2020; Liu et al., 2023) for black-box oracles. Following the analysis framework from MAMBA (Cheng et al., 2020), we first assume that the oracle value functions are known, but the MDP is unknown, and then consider the case that the value functions are unknown.
+
+Unknown MDP with known value functions.If the MDP is unknown, we can regard \(d^{\pi_{n}}\) as an adversary in online learning and establish the online loss for round \(n\) as
+
+\[\ell_{n}\left(\pi\right):=-H\mathbb{E}_{s\sim d^{\pi_{n}}}\mathbb{E}_{a\sim\pi \mid s}\left[\mathbb{A}^{*}\left(s,a\right)\right]. \tag{7}\]
+
+Lemma C.1 and Proposition 4.5 suggest that making \(\ell_{n}\left(\pi\right)\) small ensures that \(V^{\pi_{n}}\left(d_{0}\right)\) achieves better performance than \(f_{m}^{*}\left(d_{0}\right)\) for \(m<n\). Averaging over \(N\) rounds of online learning, we obtain
+
+\[\frac{1}{N}\sum_{n\in\left[N\right]}V^{\pi_{n}}\left(d_{0}\right)=f_{m}^{*} \left(d_{0}\right)+\Delta_{N}-\epsilon_{N}\left(\Pi^{\mathcal{L}}\right)- \text{Regret}_{N}^{\mathcal{L}}, \tag{8}\]
+
+where \(\text{Regret}_{N}^{\mathcal{L}}:=\frac{1}{N}(\sum_{n=1}^{N}\ell_{n}\left(\pi_{ n}\right)-\min_{\pi\in\Pi^{\mathcal{L}}}\sum_{n=1}^{N}\ell_{n}\left(\pi \right))\) depends the learning speed of an online algorithm, \(\Delta_{N}:=-\frac{1}{N}\sum_{n=1}^{N}\ell_{n}(\pi_{m}^{\otimes})\) is the loss of the baseline max\({}^{+}\)-aggregation policy \(\pi_{m}^{\otimes}\), and \(\epsilon_{N}(\Pi^{\mathcal{L}}):=\min_{\pi\in\Pi^{\mathcal{L}}}\frac{1}{N}( \sum_{n=1}^{N}\ell_{n}(\pi)-\sum_{n=1}^{N}\ell_{n}(\pi_{m}^{\otimes}))\) expresses the quality of oracle class, where \(\Pi^{\mathcal{L}}\) is specified in Definition 4.1. If \(\pi_{m}^{\otimes}\in\Pi^{\mathcal{L}}\), we have \(\epsilon_{N}(\Pi^{\mathcal{L}})=0\). Otherwise, \(\epsilon_{N}(\Pi^{\mathcal{L}})>0\). By Proposition 4.5, \(\mathbb{A}^{*}(s,\pi_{m}^{\otimes})\geq 0\) and, in turn, \(\Delta_{N}\geq 0\). If \(\pi^{\otimes}\in\Pi^{\mathcal{L}}\), using a no-regret algorithm to address this online learning problem will produce a policy that achieves performance of at least \(\mathbb{E}_{s\sim d_{0}}[f_{m}^{*}\left(s\right)]+\Delta_{N}+O(1)\) after \(N\) iterations.
+
+Unknown MDP with unknown value function.In practice, the value functions of the oracle set are unavailable. \(f^{+}\) and \(\mathbb{A}^{*}\) need to be approximated by \(\hat{f}^{+}\) and \(\hat{\mathbb{A}}^{*}\). We compute the sample estimate of the gradient as follows:
+
+\[\nabla\hat{\ell}_{n}\left(\pi_{n}\right)=-H\mathbb{E}_{s\sim d^{\pi_{n}}} \mathbb{E}_{a\sim\pi_{n}\mid s}\Big{[}\nabla\log\pi_{n}\left(a\mid s\right) \hat{\mathbb{A}}^{*}\left(s,a\right).\Big{]} \tag{9}\]
+
+The approximation of the value function and gradient introduces bias and variance terms in the online learning regret bound \(\text{Regret}_{N}^{\mathcal{L}}\). We propose a general theorem to lower bound the performance:
+
+**Proposition 5.1** (Adapted from Cheng et al. (2020)).: _Define \(\Delta_{N}\), \(\epsilon_{N}\left(\Pi^{\mathcal{L}}\right)\), \(f_{m}^{*}\), and \(\text{Regret}_{N}^{\mathcal{L}}\) as above, where \(f_{m}^{*}:=\max_{k\in\left[\Pi^{\mathcal{L}}\cup\{\pi_{n}\}\right]}V^{k}\left(s\right)\) for \(m\leq N\), and \(\text{Regret}_{N}^{\mathcal{L}}\) corresponds to the regret of a first-order online learning algorithm based on Eqn. 9. It holds that_
+
+\[\mathbb{E}\left[\max_{n\in\left[N\right]}V^{\pi_{n}}\left(d_{0}\right)\right] \geq\mathbb{E}_{s\sim d_{0}}[f_{m}^{*}\left(s\right)]+\mathbb{E}\left[\Delta_{ N}-\epsilon_{N}\left(\Pi^{\mathcal{L}}\right)-\text{Regret}_{N}^{\mathcal{L}} \right],\]
+
+_where the expectation is over the randomness in feedback and the online algorithm._
+
+**Remark 5.2**.: W.l.o.g. we assume \(f_{0}^{*}(s):=\arg\max_{k\in\left[K\right]}V^{k}\left(s\right)\), which corresponds to the baseline function considered in MAMBA. Note that \(f_{m}^{*}(s)\) admits a weaker baseline value than \(f_{n}^{*}(s)\) for \(m<n\), but _no weaker than_ the max value of any oracle, \(f_{0}^{*}(s)\). Therefore, as the learner improves \(f_{m}^{*}(s)\), max'-aggregation will have an improved lower bound over Cheng et al. (2020). Consider a scenario where \(m=o(N)\). In round \(m\), we instantiate \(f_{m}^{*}\) and perform 1-step advantage improvement over \(f_{m}^{*}\). Since \(f_{m}^{*}(s)>f_{0}^{*}(s)\) when \(V^{\pi_{m}(s)}>f_{0}^{*}(s)\), \(s\sim d^{\pi_{n}}\), we can view max\({}^{+}\)-aggregation as adding improved learner policies into \(\Pi^{\mathcal{L}}\) at the end of each round and perform 1-step improvement over \(f^{*}\) on the _expending_ oracle set. As \(\mathbb{E}_{s\sim d_{0}}[f_{m}^{*}\left(s\right)]\) improves, it will lead to the improvement over the original bound in Proposition 5.1.
+
+## 6 Robust Policy Improvement via Actively Blending RL and IL
+
+In this section, we present RPI, an algorithm for robust policy improvement that builds upon the max\({}^{+}\)-aggregation policy. RPI consists of two main components: Robust Active Policy Selection (RAPS) and Robust Policy Gradient (RPG) that enable the algorithm to combine the advantages of reinforcement and imitation learning.
+
+### Robust Active Policy Selection
+
+To improve the sample efficiency in learning from multiple oracles and lower the bias in \(\text{Regret}_{N}^{\mathcal{L}}\) in Proposition 5.1 caused by the approximator of the max\({}^{+}\) baseline function \(\hat{f}^{+}\), we propose a _robust active policy selection_ strategy. We employ an ensemble of prediction models to estimate the value function for a policy (Liu et al., 2023), where we estimate both the mean \(\hat{V}_{\mu}^{k}\left(s\right)\) and the uncertainty \(\sigma_{k}\left(s\right)\) for a particular state \(s\). We generate a few independent value prediction networks that are initialized randomly, and then train them using random samples from the trajectory buffer of the corresponding oracle \(\pi^{k}\).
+
+In the single oracle case, the motivation of rolling in a learner policy and rolling out an oracle policy (referred to RIRO) in prior work (e.g., DAgger, AggrevateD) is to address the distribution shift. In our work, in addition to addressing distribution shift, we aim to improve the value function estimator \(\hat{V}\) of the most promising oracle on the switch state \(s\) to reduce the bias term of \(\hat{f}^{+}\). Moreover, we seek to reduce the roll-out cost associated with querying oracles, particularly when the learner exhibits a higher expected value for the switching state. In such cases, we roll-out the learner to collect additional data to enhance its policy. We achieve this goal by comparing the UCB of oracle policies' value function and LCB of learner policy to improve the estimation of \(\hat{f}^{+}\). We design the strategy as follows:
+
+Let \(\widehat{V^{k}}(s)=\hat{V}_{\mu}^{k}(s)+\sigma_{k}(s),\underline{\hat{V}^{k}}( s)=\hat{V}_{\mu}^{k}(s)-\sigma_{k}(s)\) be the UCB and LCB of policy \(k\)'s value function for state \(s\), respectively. We obtain the best oracle \(\pi^{k_{*}}\) for state \(s\) as follows:
+
+\[k_{*}=\operatorname*{arg\,max}_{k\in[|\Pi^{k}|]}\left\{\overline{\hat{V}^{1} }\left(s\right),\overline{\hat{V}^{2}}\left(s\right),...,\overline{\hat{V}^{K }}\left(s\right),\underline{\hat{V}^{K+1}}\left(s\right)\right\}, \tag{10}\]
+
+where \(\underline{\hat{V}^{K+1}}\) is the confidence-aware value function approximator for the learner's policy, while \([\overline{\hat{V}^{k}}]_{k\in[K]}\) represents the value function approximators associated with oracle policies.
+
+**Remark 6.1**.: The insight behind using a confidence-aware policy selection strategy in RAPS is to improve the estimate of the value function of the most promising oracle at a given state. This necessitates accounting for estimation uncertainties, which leads to the adoption of a UCB-based approach to identify the optimal oracle. Using LCB for the learner encourages oracle-guided exploration unless we are certain that the learner surpasses all oracles for the given state. We empirically evaluate this in Section 7.2.
+
+**Remark 6.2**.: MAPS (Liu et al., 2023) introduced an active policy selection strategy by selecting the best oracle to roll out and improve the value function approximation on state \(s_{t_{c}}\) according to \(f_{0}^{\prime}\). In this work, we empirically improve such strategy by utilizing the learner policy in \(\Pi^{\mathcal{E}}\).
+
+### Robust Policy Gradient
+
+We now propose robust policy gradient based on a novel advantage function, denoted by \(\boldsymbol{A}^{\text{GAE+}}\) and a novel max\({}^{+}\) actor-critic framework.
+
+\(\boldsymbol{A}^{\text{GAE+}}\) **advantage function.** The policy gradient methods maximize the expected total reward by repeatedly estimating the gradient \(g:=\triangledown_{\theta}\mathbb{E}[\sum_{t=0}^{H-1}r_{t}]\). The policy gradient has the form \(g=\mathbb{E}_{t}[\triangledown_{\theta}\text{log}\pi_{\theta}\left(a_{t}|s_{t }\right)\hat{\boldsymbol{A}}_{t}]\)(Sutton et al., 1999; Gensmith et al., 2004; Schulman et al., 2015, 2017), where \(\pi_{\theta}\) is a stochastic learner policy and \(\hat{\boldsymbol{A}}_{t}\) is an estimator of the advantage function at timestep \(t\) and \(\mathbb{E}[\cdot]\) indicates the empirical average over a finite batch of samples, for an algorithm that alternates between sampling and optimization. \(\mathbf{A}_{t}\) measures whether the action is better or worse than the current policy. Hence, the gradient term \(\triangledown_{\theta}\text{log}\,\pi_{\theta}\left(a_{t}|s_{t}\right)\hat{\mathbf{A }}_{t}\) points in the direction of increased \(\pi_{\theta}\left(a_{t}|s_{t}\right)\) if and only if \(\hat{\mathbf{A}}_{t}=\hat{\mathbf{A}}\left(s_{t},a_{t}\right)>0\). For \(\hat{\mathbf{A}}\), we propose a novel advantage function \(\mathbf{A}^{\text{GAE+}}\) based on general advantage estimation (Schulman et al., 2015), the max\({}^{+}\) baseline \(f^{+}\) and the \(\mathbf{A}^{+}\) advantage function (3).
+
+\[\hat{\mathbf{A}}_{t}^{\text{GAE}(\gamma,\lambda)^{+}}=\hat{\delta}_{t}+\left(\gamma \lambda\right)\hat{\delta}_{t+1}+...+\left(\lambda\gamma\right)^{T-t+1}\hat{ \delta}_{T-1},\text{ where }\hat{\delta}_{t}=r_{t}+\gamma\hat{f}^{+}\left(s_{t+1} \right)-\hat{f}^{+}\left(s_{t}\right), \tag{11}\]
+
+where \(T\ll H\), and \(\gamma\) and \(\lambda\) are the predefined parameters that control the bias-variance tradeoff. In this work, we use \(\lambda=0.9\) and \(\gamma=1\), and thus simplify \(\hat{\mathbf{A}}_{t}^{\text{GAE}(\gamma,\lambda)^{+}}\) as \(\hat{\mathbf{A}}_{t}^{\text{GAE+}}\).
+
+We propose a variant of the max\({}^{+}\) baseline \(f^{+}\) that includes a confidence threshold \(\Gamma_{s}\) for an oracle's value estimate:
+
+\[\hat{f}^{+}\left(s\right)=\begin{cases}\hat{V}_{\mu}^{\pi_{n}}\left(s\right), &\text{ if }\sigma_{k}\left(s\right)>\Gamma_{s},\text{ where }k=\arg\max_{k\in[ \Pi^{\mathcal{E}}]}\hat{V}_{\mu}^{k}\left(s\right).\\ \max_{k\in[\Pi^{\mathcal{E}}]}\hat{V}_{\mu}^{k}\left(s\right),&\text{ otherwise.}\end{cases} \tag{12}\]
+
+**Remark 6.3**.: We use a threshold to control the reliability of taking the advice of an oracle, where a lower value indicates greater confidence. In our experiments, we use \(\Gamma_{s}=0.5\), which we have found to exhibit robust behavior (Appendix E.5).
+
+Finally, we have the \(n\)-th round online loss as
+
+\[\hat{\ell}_{n}\left(\pi_{n}\right):=-H\mathbb{E}_{s\sim d^{\pi_{n}}}\mathbb{E }_{a\sim\pi|s}\left[\hat{\mathbf{A}}^{\text{GAE+}}\left(s,a\right)\right]|_{\pi= \pi_{n}}, \tag{13}\]
+
+and gradient estimator as
+
+\[\hat{g}_{n}=\nabla\hat{\ell}_{n}\left(\pi_{n}\right)=-H\mathbb{E}_{s\sim d^{ \pi_{n}}}\mathbb{E}_{a\sim\pi|s}\left[\nabla\text{log}\,\pi\left(a\mid s\right) \hat{\mathbf{A}}_{t}^{\text{GAE+}}\left(s,a\right)\right]|_{\pi=\pi_{n}}. \tag{14}\]
+
+Max\({}^{\star}\) actor-critic.We note that the RPG component (Algorithm 1, lines 8-9) can be viewed as a variant of the _actor-critic_ framework, with the actor sampling trajectories that are then evaluated by the max\({}^{+}\) critic based on the \(\mathbf{A}^{\text{GAE+}}\) advantage function (11). The policy gradient in Eqn. 14 enables the learner policy \(\pi_{n}\) to learn from high-performing oracles and to improve its own value function \(\hat{V}^{k}\) for the states in which the oracles perform poorly.
+
+**Remark 6.4**.: When \(\gamma=1\), Eqn. 11 disregards the accuracy of \(\hat{f}^{+}\), but it has high variance due to the sum of the reward terms. When \(\gamma=0\), it introduces bias, but has much lower variance. Moreover, when \(\lambda=0\) and \(\gamma=1\), the loss (13) of RPI reduced to the loss (7) under max\({}^{+}\)-aggregation (6), and the performance bound for the max\({}^{+}\)-aggregation policy and RPI will be equal. Thus, performing no-regret online learning with regards to Eqn. 13 has the guarantee in Proposition 5.1 and Remark 5.2. However, when \(\lambda>0\), RPI will optimize the multi-steps advantage over \(f^{+}\) in Eqn. 13, while the max\({}^{+}\)-aggregation policy \(\pi^{\otimes}\) only optimizes the one-step advantage over \(f^{+}\). Thus, RPI will have a smaller \(\epsilon_{N}\left(\Pi^{\mathcal{E}}\right)\) term than max\({}^{+}\)-aggregation, which improves the performance lower bound in Proposition 5.1.
+
+**Imitation, Blending and Reinforcement.** Instances of \(\hat{f}^{+}\) in Eqn. 11 may involve a combination of oracles' and learner's value functions. In a case that this does not involve the learner's value function--this is likely in the early stage of training since the learner's performance is poor--RPI performs imitation learning on the oracle policies. Once the learner policy improves and \(\hat{f}^{+}\) becomes identical to the learner's value function, RPI becomes equivalent to the vanilla actor-critic that performs self-improvement. When it is a combination of the two, RPI learns from a blending of the learner and oracles.
+
+Figure 1: We consider 8 tasks from DeepMind Control Suite and Meta-World. Extended results on different variants of these tasks are provided in Appendices E.2 & E.3.
+
+[MISSING_PAGE_EMPTY:99901]
+
+### Ablation studies
+
+Learning state-wise oracle expertise.In Fig. 3(a), we examine the ability of RPI to aggregate the expertise of multiple oracles on Cartpole. We created three diversified oracles and find that RPI achieves a return of \(645\) when it is able to query all three oracles, while the best return falls below \(600\) when given access to only a single oracle. This result demonstrates RPI's utilization of the oracles' state-wise expertise, as it achieves better performance when given access to more oracles.
+
+Ablation on robust active policy selection.In order to understand the effectiveness of RPI's robust active policy selection strategy (RAPS), we compare it to active policy selection (APS) (Liu et al., 2023) (without the learner in RIRO (Algorithm 1, line 4)) on Cartpole. Fig. 3(b) shows that RAPS has the advantage of selecting the learner policy to roll out in states for which it outperforms the oracles, resulting in self-improvement. This leads to RAPS outperforming the APS-based approach.
+
+Confidence-awareness in RPI._(1) RPG_: We first perform an ablation on Cartpole to investigate the benefits of using a confidence threshold on an oracle's value estimate for RPG (Eqn. 12). We see in Fig. 3(c) that the confidence threshold enables RPG to benefit from both state-wise imitation learning from oracles with high confidence and the execution of reinforcement learning when oracles exhibit high uncertainty. Without the threshold, RPG is more vulnerable to the quality of oracle set. _(2) RAPS_: We then consider the benefits of reasoning over uncertainty to the policy selection strategy, comparing uncertainty-aware RPI-LCB/UCB (Eqn. 10) to RPI-MEAN, which does not consider uncertainty. Fig. 3(d) demonstrates the benefits of using LCB/UCB for policy selection. Addition results in Appendix E.6 reveal that RPI-LCB/UCB outperforms RPI-MEAN across all benchmarks by an _overall_ margin of 40%, supporting the advantage of incorporating confidence to policy selection.
+
+Visualizing active IL and RL.Figure 4 visualizes the active state-wise imitation and reinforcement process employed by RPI in the gradient estimator on Pendulum. The figure includes three oracle policies (in blue, orange, and green) and the learner's policy (in red). Each oracle exhibits different expertise at different stages. In the beginning, RPI only imitates the oracles, which initially have greater state-wise expertise than the learner. As the learner improves, the frequency with which RPI samples the leaner policy increases, corresponding to self-improvement. As training continues, the expertise of the learner increasingly exceeds that of the oracles, resulting in RPI choosing self-improvement more often than imitating the oracles.
+
+## 8 Conclusion
+
+We present \(\max^{+}\), a robust framework for IL and RL in the presence of a set of black-box oracles. Within this framework, we introduce RPI, a policy gradient algorithm comprised of two innovative components: a robust active policy selection strategy (RAPS) that enhances sample efficiency and a robust policy gradient (RPG) for policy improvement. We provide a rigorous theoretical analysis of RPI, demonstrating its superior performance compared to the current state-of-the-art. Moreover, empirical evaluations on a diverse set of tasks demonstrate that RPI consistently outperforms all IL and RL baselines, even in scenarios with limited oracle information (favoring RL) or sparse rewards (favoring IL). RPI effectively adapts to the nature of the domain and the quality of the oracles by actively interleaving IL and RL. Our work introduces new avenues for robust imitation and reinforcement learning and encourages future research on addressing more challenging tasks in robust settings, such as handling missing state or oracle information.
+
+Figure 4: IL and RL.
+
+Figure 3: Results of ablation studies on the Cartpole environment.
+
+## References
+
+* Abbeel & Ng (2004) Pieter Abbeel and Andrew Y. Ng. Apprenticeship learning via inverse reinforcement learning. In _Proceedings of the International Conference on Machine Learning (ICML)_, 2004.
+* Ablett et al. (2023) Trevor Ablett, Bryan Chan, and Jonathan Kelly. Learning from guided play: Improving exploration for adversarial imitation learning with simple auxiliary tasks. _IEEE Robotics and Automation Letters_, 8(3):1263-1270, 2023.
+* Barreto et al. (2017) Andre Barreto, Will Dabney, Remi Munos, Jonathan J Hunt, Tom Schaul, Hado P van Hasselt, and David Silver. Successor features for transfer in reinforcement learning. In _Advances in Neural Information Processing Systems (NeurIPS)_, 2017.
+* Beliaev et al. (2022) Mark Beliaev, Andy Shih, Stefano Ermon, Dorsa Sadigh, and Ramtin Pedarsani. Imitation learning by estimating expertise of demonstrators. In _Proceedings of the International Conference on Machine Learning (ICML)_, pages 1732-1748, July 2022.
+* Berner et al. (2019) Christopher Berner, Greg Brockman, Brooke Chan, Vicki Cheung, Przemyslaw Debiak, Christy Dennison, David Farhi, Quirin Fischer, Shariq Hashme, Chris Hesse, Rafal Jozefowicz, Scott Gray, Catherine Olsson, Jakub Pachocki, Michael Petrov, Henrique P. d. O. Pinto, Jonathan Raiman, Tim Salimans, Jeremy Schlatter, Jonas Schneider, Szymon Sidor, Ilya Sutskever, Jie Tang, Filip Wolski, and Susan Zhang. Dota 2 with large scale deep reinforcement learning. _arXiv preprint arXiv:1912.06680_, 2019.
+* Brantley et al. (2020) Kiante Brantley, Amr Sharaf, and Hal Daume III. Active imitation learning with noisy guidance. _arXiv preprint arXiv:2005.12801_, 2020.
+* Cheng et al. (2018) Ching-An Cheng, Xinyan Yan, Nolan Wagener, and Byron Boots. Fast policy learning through imitation and reinforcement. _arXiv preprint arXiv:1805.10413_, 2018.
+* Cheng et al. (2020) Ching-An Cheng, Andrey Kolobov, and Alekh Agarwal. Policy improvement via imitation of multiple oracles. In _Advances in Neural Information Processing Systems (NeurIPS)_, pages 5587-5598, 2020.
+* Daume et al. (2009) Hal Daume, John Langford, and Daniel Marcu. Search-based structured prediction. _Machine Learning_, 75(3):297-325, 2009.
+* Finn et al. (2016) Chelsea Finn, Sergey Levine, and Pieter Abbeel. Guided cost learning: Deep inverse optimal control via policy optimization. In _Proceedings of the International Conference on Machine Learning (ICML)_, pages 49-58, 2016.
+* Greensmith et al. (2004) Evan Greensmith, Peter L Bartlett, and Jonathan Baxter. Variance reduction techniques for gradient estimates in reinforcement learning. _Journal of Machine Learning Research_, 5(9), 2004.
+* Haarnoja et al. (2018) Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine. Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor. In _Proceedings of the International Conference on Machine Learning (ICML)_, pages 1861-1870, 2018.
+* Han et al. (2023) Dong Han, Beni Mulyana, Vladimir Stankovic, and Samuel Cheng. A survey on deep reinforcement learning algorithms for robotic manipulation. _Sensors_, 23(7):3762, 2023.
+* Hansen et al. (2022) Nicklas Hansen, Yixin Lin, Hao Su, Xiaolong Wang, Vikash Kumar, and Aravind Rajeswaran. Modern: Accelerating visual model-based reinforcement learning with demonstrations. _arXiv preprint arXiv:2212.05698_, 2022.
+* Hester et al. (2018) Todd Hester, Matej Vecerik, Olivier Pietquin, Marc Lanctot, Tom Schaul, Bilal Piot, Dan Horgan, John Quan, Andrew Sendonaris, Ian Osband, et al. Deep q-learning from demonstrations. In _Proceedings of the AAAI conference on artificial intelligence_, volume 32, 2018.
+* Ho & Ermon (2016) Jonathan Ho and Stefano Ermon. Generative adversarial imitation learning. In _Advances in Neural Information Processing Systems (NeurIPS)_, pages 4565-4573, 2016.
+* Kakade & Langford (2002) Sham Kakade and John Langford. Approximately optimal approximate reinforcement learning. In _Proceedings of the International Conference on Machine Learning (ICML)_, 2002.
+* Krizhevsky et al. (2012)* Konyushova et al. (2021) Ksenia Konyushova, Yutian Chen, Thomas Paine, Caglar Gulcehre, Cosmin Paduraru, Daniel J Mankowitz, Misha Denil, and Nando de Freitas. Active offline policy selection. In _Advances in Neural Information Processing Systems (NeurIPS)_, pages 24631-24644, 2021.
+* Kostrikov et al. (2021) Ilya Kostrikov, Ashvin Nair, and Sergey Levine. Offline reinforcement learning with implicit q-learning. _arXiv preprint arXiv:2110.06169_, 2021.
+* Li et al. (2018) Guohao Li, Matthias Mueller, Vincent Casser, Neil Smith, Dominik L Michels, and Bernard Ghanem. Oil: Observational imitation learning. _arXiv preprint arXiv:1803.01129_, 2018.
+* Li et al. (2017) Yunzhu Li, Jiaming Song, and Stefano Ermon. Infogail: Interpretable imitation learning from visual demonstrations. _Advances in neural information processing systems_, 30, 2017.
+* Liu et al. (2022) Xuefeng Liu, Fangfang Xia, Rick L Stevens, and Yuxin Chen. Cost-effective online contextual model selection. _arXiv preprint arXiv:2207.06030_, 2022a.
+* Liu et al. (2022b) Xuefeng Liu, Fangfang Xia, Rick L Stevens, and Yuxin Chen. Contextual active online model selection with expert advice. In _Proceedings of the ICML Workshop on Adaptive Experimental Design and Active Learning in the Real World_, 2022b.
+* Liu et al. (2023) Xuefeng Liu, Takuma Yoneda, Chaoqi Wang, Matthew R Walter, and Yuxin Chen. Active policy improvement from multiple black-box oracles. In _Proceedings of the International Conference on Machine Learning (ICML)_, pages 22320-22337, 2023.
+* Mnih et al. (2013) Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Alex Graves, Ioannis Antonoglou, Daan Wierstra, and Martin Riedmiller. Playing Atari with deep reinforcement learning. _arXiv preprint arXiv:1312.5602_, 2013.
+* Ng et al. (1999) Andrew Y Ng, Daishi Harada, and Stuart Russell. Policy invariance under reward transformations: Theory and application to reward shaping. In _Proceedings of the International Conference on Machine Learning (ICML)_, pages 278-287, 1999.
+* Osa et al. (2018) Takayuki Osa, Joni Pajarinen, Gerhard Neumann, J Andrew Bagnell, Pieter Abbeel, and Jan Peters. An algorithmic perspective on imitation learning. _Foundations and Trends in Robotics_, 7(1-2):1-179, 2018.
+* Pomerleau (1988) Dean A Pomerleau. Alvinn: An autonomous land vehicle in a neural network. _Advances in neural information processing systems_, 1, 1988.
+* Riedmiller et al. (2018) Martin Riedmiller, Roland Hafner, Thomas Lampe, Michael Neunert, Jonas Degrave, Tom Wiele, Vlad Mnih, Nicolas Heess, and Jost Tobias Springenberg. Learning by playing solving sparse reward tasks from scratch. In _Proceedings of the International Conference on Machine Learning (ICML)_, pages 4344-4353, 2018.
+* Ross & Bagnell (2010) Stephane Ross and Drew Bagnell. Efficient reductions for imitation learning. In _Proceedings of the International Conference on Artificial Intelligence and Statistics (AISTATS)_, pages 661-668, 2010.
+* Ross & Bagnell (2014) Stephane Ross and J Andrew Bagnell. Reinforcement and imitation learning via interactive no-regret learning. _arXiv preprint arXiv:1406.5979_, 2014.
+* Ross et al. (2011) Stephane Ross, Geoffrey Gordon, and Drew Bagnell. A reduction of imitation learning and structured prediction to no-regret online learning. In _Proceedings of the International Conference on Artificial Intelligence and Statistics (AISTATS)_, pages 627-635, 2011.
+* Schulman et al. (2015) John Schulman, Philipp Moritz, Sergey Levine, Michael Jordan, and Pieter Abbeel. High-dimensional continuous control using generalized advantage estimation. _arXiv preprint arXiv:1506.02438_, 2015.
+* Schulman et al. (2017) John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy optimization algorithms. _arXiv preprint arXiv:1707.06347_, 2017.
+* Shenfeld et al. (2023) Idan Shenfeld, Zhang-Wei Hong, Aviv Tamar, and Pulkit Agrawal. TGRL: An algorithm for teacher guided reinforcement learning. In _Proceedings of the International Conference on Machine Learning (ICML)_, 2023.
+
+* Silver et al. (2017) David Silver, Julian Schrittwieser, Karen Simonyan, Ioannis Antonoglou, Aja Huang, Arthur Guez, Thomas Hubert, Lucas Baker, Matthew Lai, Adrian Bolton, Yutian Chen, Timothy Lillicrap, Fan Hui, Laurent Sifre, George van den Driessche, Thore Graepel, and Demis Hassabis. Mastering the game of Go without human knowledge. _Nature_, 550(7676):354-359, 2017.
+* Singh et al. (2022) Bharat Singh, Rajesh Kumar, and Vinay Pratap Singh. Reinforcement learning in robotic applications: a comprehensive survey. _Artificial Intelligence Review_, pages 1-46, 2022.
+* Song et al. (2022) Yuda Song, Yifei Zhou, Ayush Sekhari, J Andrew Bagnell, Akshay Krishnamurthy, and Wen Sun. Hybrid rl: Using both offline and online data can make rl efficient. _arXiv preprint arXiv:2210.06718_, 2022.
+* Sun et al. (2017) Wen Sun, Arun Venkatraman, Geoffrey J Gordon, Byron Boots, and J Andrew Bagnell. Deeply AggreVaTeD: Differentiable imitation learning for sequential prediction. In _Proceedings of the International Conference on Machine Learning (ICML)_, pages 3309-3318, 2017.
+* Sun et al. (2018) Wen Sun, J Andrew Bagnell, and Byron Boots. Truncated horizon policy search: Combining reinforcement learning & imitation learning. _arXiv preprint arXiv:1805.11240_, 2018.
+* Sutton et al. (1999) Richard S Sutton, David McAllester, Satinder Singh, and Yishay Mansour. Policy gradient methods for reinforcement learning with function approximation. In _Advances in Neural Information Processing Systems (NeurIPS)_, 1999.
+* Tassa et al. (2018) Yuval Tassa, Yotam Doron, Alistair Muldal, Tom Erez, Yazhe Li, Diego de Las Casas, David Budden, Abbas Abdolmaleki, Josh Merel, Andrew Lefrancq, Timothy Lillicrap, and Martin Riedmiller. DeepMind control suite. _arXiv preprint arXiv:1801.00690_, 2018.
+* Williams (1992) Ronald J Williams. Simple statistical gradient-following algorithms for connectionist reinforcement learning. _Machine Learning_, 8(3):229-256, 1992.
+* Yu et al. (2020) Tianhe Yu, Deirdre Quillen, Zhampeng He, Ryan Julian, Karol Hausman, Chelsea Finn, and Sergey Levine. Meta-World: A benchmark and evaluation for multi-task and meta reinforcement learning. In _Proceedings of the Conference on Robot Learning (CoRL)_, pages 1094-1100, 2020.
+* Zhang et al. (2023) Haichao Zhang, We Xu, and Haonan Yu. Policy expansion for bridging offline-to-online reinforcement learning. _arXiv preprint arXiv:2302.00935_, 2023.
+* Zhang et al. (2018) Tianhao Zhang, Zoe McCarthy, Owen Jow, Dennis Lee, Xi Chen, Ken Goldberg, and Pieter Abbeel. Deep imitation learning for complex manipulation tasks from virtual reality teleoperation. In _Proceedings of the IEEE International Conference on Robotics and Automation (ICRA)_, pages 5628-5635, 2018.
+* Zhao et al. (2022) Emmin Zhao, Renye Yan, Jinqiu Li, Kai Li, and Junliang Xing. AlphaHoldem: High-performance artificial intelligence for heads-up no-limit poker via end-to-end reinforcement learning. In _Proceedings of the National Conference on Artificial Intelligence (AAAI)_, pages 4689-4697, 2022.
+* Ziebart et al. (2008) Brian D. Ziebart, A. Maas, J. Andrew Bagnell, and Anind. K. Dey. Maximum entropy inverse reinforcement learning. In _Proceedings of the National Conference on Artificial Intelligence (AAAI)_, 2008.
+
+## Appendix A Selective Comparison against Related Works
+
+### Additional Notes on Related work
+
+MAMBA addressed the challenge of learning from multiple sub-optimal oracles and tackled two fundamental questions: what constitutes a reasonable benchmark for policy improvement, and how to systematically combine sub-optimal oracles into a stronger baseline. MAMBA proposed a max-aggregated baseline and suggested policy improvement from it as a natural strategy for combining these oracles to form a better policy. In addition, they introduced a novel Max-aggregation of Multiple Baseline approach and provided a theoretical performance guarantee for it. However, one limitation of MAMBA is its high sample complexity. It requires prolonged rounds to identify the optimal oracle for a given state due to its strategy of uniformly sampling an oracle, resulting in a larger accumulation of regret. MAPS aims to enhance the sample efficiency of MAMBA by introducing Max-aggregation Active Policy Selection with theoretical support, and it empirically outperforms MAMBA. Nevertheless, both MAMBA and MAPS share a common limitation in non-robustness. They are susceptible to the quality of the oracle set, and both algorithms may fail in cases where the oracle set is of poor quality. Our work addresses this robustness challenge by proposing a novel max\({}^{+}\) framework. Inspired by the max-aggregation policy from MAMBA, we introduced a max\({}^{+}\)-aggregation policy based on a novel extended oracle set. This enables the policy to undergo self-improvement even when the oracle set is poor. Additionally, we proposed a novel algorithm,
+
+\begin{table}
+\begin{tabular}{l l c c c c c c c} \hline \hline \multirow{2}{*}{**Algorithm**} & \multirow{2}{*}{**Criterion**} & \multirow{2}{*}{**Oallone**} & \multirow{2}{*}{**Sustabl**} & \multirow{2}{*}{**Active**} & \multirow{2}{*}{**Interactive**} & \multirow{2}{*}{\begin{tabular}{} \end{tabular} } & \multirow{2}{*}{\begin{tabular}{} \end{tabular} } & \multirow{2}{*}{\begin{tabular}{} \end{tabular} } & \multirow{2}{*}{
+\begin{tabular}{} \end{tabular} } \\  & & & & & & & **(in multiple**) \\ \hline Behavioral Cloning (Onsciences, 1988) & IL & & \(\times\) & ✓ & \(\times\) & \(\times\) & \(\times\) & – & \(\times\) \\ REINWORK (Williams, 1992) & IL & & & ✓ & \(\times\) & \(\times\) & \(\times\) & \(\times\) & – \\ Sutton et al., 1999 & & & & & & & & & \\ SMLE & & & & & & & & & \\ Boost and Bengel, 2010 & IL & & \(\times\) & ✓ & \(\times\) & \(\times\) & – & \(\times\) \\ Dagger & & & ✓ & ✓ & \(\times\) & ✓ & \(\times\) & – & \(\times\) \\ Goyal et al., 2011 & IL & & & ✓ & ✓ & \(\times\) & ✓ & \(\times\) & – & \(\times\) \\ PPO with GAE & & & & & & & & & \\ Cichulian et al., 2017 & IL & & ✓ & ✓ & \(\times\) & \(\times\) & \(\times\) & – & \\ Async/DCN & & & & & & & & & \\ Gau et al., 2017 & IL & & ✓ & ✓ & ✓ & \(\times\) & – & \(\times\) \\ DOD & & & & & & & & & \\ (Gheer et al., 2018) & Online \(\rightarrow\) online RL & ✓ & ✓ & – & ✓ & \(\times\) & – & – \\ THOR & & & & & & & & & \\ (Sunt et al., 2019) & IL+RL & ✓ & ✓ & \(\times\) & ✓ & \(\times\) & – & \(\times\) \\ LORI & & & & & & & & & \\ (Cheng et al., 2018) & IL+RL & ✓ & ✓ & \(\times\) & ✓ & \(\times\) & – & \(\times\) \\ SAC & & & & & & & & \\ (Cikshallier et al., 2018) & IL & & ✓ & ✓ & ✓ & ✓ & \(\times\) & \(\times\) \\ LEADM & & & ✓ & ✓ & ✓ & ✓ & \(\times\) & – & \(\times\) \\ MAMBA & & & & & & & & & \\ Cheng et al., 2020 & IL+RL & ✓ & ✓ & \(\times\) & ✓ & ✓ & \(\times\) & \(\times\) \\ A\_OPS & & & & & & & & & \\ (Cosyubova et al., 2021) & Policy Set. & & \(\times\) & ✓ & \(\times\) & ✓ & ✓ & – \\ LEBD & & & & & & & & \\ (Believ et al., 2022) & IL & & & ✓ & \(\times\) & \(\times\) & ✓ & \(\times\) & \(\times\) \\ IQE & & & & & & & & \\ (Auxiliary et al., 2021) & & & & ✓ & \(\times\) & ✓ & ✓ & \(\times\) & – & \(\times\) \\ CAMS & & & & & & & & & \\ (Lia et al., 2022a) & & & & & & & & & \\ (Mollen et al., 2022) & & & & ✓ & \(\times\) & ✓ & ✓ & \(\times\) & – & – \\ Hybrid RL. & & & & & & & & & \\ (Gong et al., 2022) & & & & & & & & & \\ PEX & & & & & & & & & \\ Zhang et al., 2023 & & & & & & & & & \\ TGRL & & & & & & & & & \\ (Sloefeld et al., 2023) & IL+RL & ✓ & ✓ & \(\times\) & ✓ & ✓ & \(\times\) & – & \(\times\) \\ LCP & & & ✓ & ✓ & \(\times\) & ✓ & ✓ & \(\times\) & \(\times\) \\ MAMBA & & & & & & & & & \\ (Lin et al., 2023) & IL+RL & & ✓ & ✓ & ✓ & ✓ & ✓ & ✓ & \(\times\) \\
+**RPI (Ours)** & IL+RL & ✓ & ✓ & ✓ & ✓ & ✓ & ✓ & ✓ \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: A qualitative comparison of related algorithms. The publication years are included in parentheses for reference. Algorithms designed to fit a particular criterion are marked by “\(\diagup\)”; criteria that are not explicitly considered in the algorithm design are marked by “\(\times\)”.
+
+RPI, with Robust Active Policy Selection to improve active policy selection from MAPS. Theoretical analyses were provided for both the max\({}^{+}\) framework and the RPI algorithm.
+
+## Appendix B Additional Background
+
+### Additional algorithms for learning from multiple oracles
+
+In this section, we introduce a few baselines that learn from a set of black-box oracles \(\Pi=\left\{\pi^{k}\right\}_{k\in[K]}\).
+
+**Single-best expert \(\pi^{\star}\):** The first baseline that we consider imitates a single oracle that achieves the best performance in hindsight among the oracle set, i.e., \(\pi^{\star}:=\arg\max_{\pi\in\Pi}\mathbb{E}_{s_{0}\sim d_{0}}\big{[}V^{\pi}(s_ {0})\big{]}\). After figuring out the single-best expert, this strategy simply keeps rolling out the expert. In practice, this is often inadequate as it neglects the potential benefits of suboptimal oracles at the state level.
+
+**Max-following \(\pi^{\star}\):** Given a collection of \(k\) imitation learning _oracles_\(\Pi^{\circ}=\{\pi^{k}\}_{k\in[K]}\), the _max-following_ policy (Cheng et al., 2020; Liu et al., 2023) is a greedy policy that selects the oracle with the highest expertise in any given state:
+
+\[\pi^{\star}\left(a\mid s\right):=\pi^{k^{\star}}\left(a\mid s\right),\;\;k^{ \star}:=\arg\max_{k\in[K]}\;V^{k}\left(s\right)\]
+
+where \(V^{k}(s)=V^{\pi^{k}}(s)\) is the value function for oracle \(k\in[K]\).
+
+**Max-aggregation \(\pi^{\text{max}}\)**: Max-aggregation (Cheng et al., 2020) performs one-step improvement based on the _max-following_ policy \(\pi^{\bullet}\). Denote a natural value baseline \(f^{\text{max}}\left(s_{t}\right)\) for IL with multiple oracles as
+
+\[f^{\text{max}}\left(s_{t}\right):=\max_{k\in[K]}V^{k}\left(s\right). \tag{15}\]
+
+We then denote the _max-aggregation_ policy as
+
+\[\pi^{\text{max}}\left(a\mid s\right):=\delta_{a=a^{\star}},\text{where }a^{ \star}=\arg\max_{a\in\mathcal{A}}\;A^{f^{\text{max}}}\left(s,a\right), \tag{16}\]
+
+The max-aggregation policy is a function of \(f^{\text{max}}\) and, in turn, requires knowledge of the MDP and each oracle's value function (Eqn. 15). However, in the episodic interactive IL setting, oracles are provided as black boxes and their value functions are unknown. MAMBA (Cheng et al., 2020) and MAPS (Liu et al., 2023) deal with this by reducing IL to an online learning problem and adapt the online loss defined at round \(n\) as:
+
+\[\ell_{n}\left(\pi;\lambda\right):= -\left(1-\lambda\right)H\mathbb{E}_{s\sim d^{\pi n}}\left[A_{ \lambda}^{f^{\text{max}},\pi}\left(s,\pi\right)\right]-\lambda\mathbb{E}_{s \sim d_{0}}\Big{[}A_{\lambda}^{f^{\text{max}},\pi}\left(s,\pi\right)\Big{]}\;. \tag{17}\]
+
+Here, \(A_{\lambda}^{f^{\text{max}},\pi}(s,a)\) is a \(\lambda\)-weighted advantage defined as:
+
+\[A_{\lambda}^{f^{\text{max}},\pi}\left(s,a\right):=\left(1-\lambda\right)\sum _{i=0}^{\infty}\lambda^{i}A_{\left(i\right)}^{f^{\text{max}},\pi}\left(s,a \right), \tag{18}\]
+
+which integrates various \(i\)-step advantages:
+
+\[A_{\left(i\right)}^{f^{\text{max}},\pi}\left(s_{t},a_{t}\right):=\mathbb{E}_{ \tau_{t}\sim\rho^{\pi}\left(\cdot\mid s_{t}\right)}\big{[}r\!\left(s_{t},a_{t} \right)+\cdots+r\left(s_{t+i},a_{t+i}\right)+f^{\text{max}}\left(s_{t+i+1} \right)\big{)}\big{]}-f^{\text{max}}\left(s_{t}\right).\]
+
+### Limitations of the prior art
+
+MAPS (Liu et al., 2023) and MAMBA (Cheng et al., 2020) suffer from two limitations related to their non-robustness to the choice of the oracle set. First, their online loss function (17) relies on a predetermined \(\lambda\) value that combines imitation learning and reinforcement learning, making their performance sensitive to the quality of the oracle set. Second, their gradient estimator utilizes the max-aggregation policy \(\pi^{\text{max}}\) and the value baseline function \(f^{\text{max}}\), both of which are dependent on the given black-box oracle set. If the oracle set includes only adversarial oracles, these methods will still try to perform imitation learning, thereby impeding policy enhancement.
+
+### Value function approximator for discrete environment
+
+In the interactive episodic MDP, we roll out a selected oracle \(k\), resulting in \(N_{k}(s_{t})\) trajectories \(\tau_{1,k},\tau_{2,k},\ldots,\tau_{N_{k},k}\) starting from state \(s_{t}\) for round \(N\). We determine an estimate for the return in state \(s_{t}\) by averaging the returns obtained across the trajectories:
+
+\[\hat{V}^{\pi_{k}}\left(s_{t}\right)=\frac{1}{N_{k}\left(s_{t}\right)}\sum_{i=1 }^{N_{k}\left(s_{t}\right)}\sum_{j}^{H}\lambda^{j}r\left(s_{j},a_{j}\right). \tag{19}\]
+
+### Active policy selection
+
+To address the sample efficiency challenge in learning from multiple experts, we reference active policy selection technique in MAPS work to select the best oracle \(k^{\star}\) for state \(s_{t}\) as follows:
+
+\[k_{\star}=\operatorname*{arg\,max}_{k\in[K]}\begin{cases}\hat{V}^{k}(s_{t})+ \sqrt{\frac{2H^{2}\log\frac{2}{2}}{N_{k}\left(s_{t}\right)}}&\mathcal{S}\, \text{discrete}\\ \hat{V}^{k}_{\mu}(s_{t})+\sigma_{k}\left(s_{t}\right)&\mathcal{S}\,\text{ continuous}\end{cases} \tag{20}\]
+
+## Appendix C Proofs
+
+In the following, we provide proofs for the theoretical claims in the main paper.
+
+**Lemma C.1**.: _(_Kakade and Langford_,_ 2002; Ng et al._,_ 1999_)_ _Let \(f:\mathcal{S}\rightarrow\mathbb{R}\) such that \(f\left(s_{H}\right)=0\). For any MDP and policy \(\pi\),_
+
+\[V^{\pi}\left(d_{0}\right)-f\left(d_{0}\right)=H\mathbb{E}_{s\sim d^{\pi}} \left[\textbf{A}^{f}\left(s,\pi\right)\right] \tag{21}\]
+
+From Lemma C.1, we get the following corollary:
+
+**Corollary C.2**.: _(_Cheng et al._,_ 2020_)_ _If \(f\) is improvable with respect to \(\pi\), then \(V^{\pi}\left(s\right)\geq f\left(s\right)\), \(\forall s\in\mathcal{S}\)._
+
+Corollary C.2 indicates that a policy \(\pi\) outperforms all policies in \(\Pi^{\mathcal{E}}\), if, for every state, there is a baseline value function \(f\) superior to that of all policies \(\left(f(s)\geq V^{k}\left(s\right),\forall k\in[|\Pi^{k}|],s\in\mathcal{S}\right)\), while \(f\) can be improved by \(\pi\) (i.e., \(\textbf{A}^{f}\left(s,\pi\right)\geq 0\)).
+
+### Proof of Proposition 4.5
+
+Proof.: Without loss of generality, let us assume the optimal oracle is oracle 1 (the first oracle) in oracle set \(\Pi\),
+
+\[\textbf{A}^{+}\left(s,\pi^{\circ}\right) =r\left(s,\pi^{\circ}\right)+\mathbb{E}_{a\sim\pi^{\circ}|s} \mathbb{E}_{s^{\prime}\sim\mathcal{P}|s,a}\left[f^{\ast}\left(s^{\prime} \right)\right]-f^{\ast}\left(s\right) \tag{22a}\] \[\geq r\left(s,\pi^{\circ}\right)+\mathbb{E}_{a\sim\pi^{\circ}|s} \mathbb{E}_{s^{\prime}\sim\mathcal{P}|s,a}\left[V^{1}\left(s^{\prime}\right) \right]-V^{1}\left(s\right)\] (22b) \[\geq r\left(s,\pi^{\star}\right)+\mathbb{E}_{a\sim\pi^{\circ}|s} \mathbb{E}_{s^{\prime}\sim\mathcal{P}|s,a}\left[V^{1}\left(s^{\prime}\right) \right]-V^{1}\left(s\right)\] (22c) \[=\textbf{A}^{V^{1}}\left(s,\pi^{1}\right)\geq 0, \tag{22d}\]
+
+where the last step follows since \(\pi^{\circ}\left(a|s\right)\geq\pi^{\bullet}\left(a|s\right)=\pi^{1}\left(a|s\right)\). Since we have \(\textbf{A}^{+}\left(s,\pi^{\circ}\right)\geq 0\), together with Lemma C.1, we have
+
+\[V^{\pi^{\circ}}(s)\geq f^{\ast}\left(s\right)=\max_{k\in[|\Pi^{\mathcal{E}}|]} V^{k}(s). \tag{23}\]
+
+\(V^{\pi^{\circ}}(s)\geq f^{\ast}\left(s\right)\) indicates that following \(\pi^{\circ}\) is equally good or superior to imitating a single best policy in \(\Pi^{\mathcal{E}}\)
+
+### Proof of Proposition 5.1
+
+We denote \(f_{0}^{*}(s):=\arg\max_{k\in[K]}\ V^{k}\left(s\right)\). According to Theorem 1 of Cheng et al. (2020), we obtain
+
+\[\mathbb{E}\left[\max_{n\in[N]}V^{\pi_{n}}\left(d_{0}\right)\right]\geq\mathbb{E }_{s\sim d_{0}}[f_{0}^{*}\left(s\right)]+\mathbb{E}\left[\Delta_{N}-\epsilon_{ N}\left(\Pi^{\mathcal{L}}\right)-\mathrm{Regret}_{N}^{\mathcal{L}}\right]. \tag{24}\]
+
+Now let \(\Pi_{m}^{\mathcal{E}}=\Pi^{\mathcal{O}}\cup\pi_{m}\). Following the same reasoning strategy as above, we will have lower bound for RPI as \(\mathbb{E}_{s\sim d_{0}}[f_{m}^{*}\left(s\right)]+\mathbb{E}\left[\Delta_{N}- \epsilon_{N}\left(\Pi^{\mathcal{L}}\right)-\mathrm{Regret}_{N}^{\mathcal{L}}\right]\). Since \(\mathbb{E}_{s\sim d_{0}}[f_{m}^{*}\left(s\right)]\geq\mathbb{E}_{s\sim d_{0}}[ f_{0}^{*}\left(s\right)]\), we have performance lower bound of RPI no worse than MAMBA.
+
+**Remark.** MAPS (Liu et al., 2023) retains MAMBA's lower bound but enhances sample efficiency and reduces the bias in \(\mathrm{Regret}_{N}^{\mathcal{L}}\). The inherent uncertainty of the optimal policy \(\pi^{\star}\in\Pi_{m}^{\mathcal{E}}\) makes an unbiased \(f^{+}\) estimate challenging. The regret term \(\mathrm{Regret}_{N}^{\mathcal{L}}\) is bounded by:
+
+\[\mathbb{E}\left[\mathrm{Regret}_{N}^{\mathcal{L}}\right]\leq O\left(\left( \beta^{+}+\beta^{\star}\right)N+\sqrt{vN}\right),\]
+
+where \(\beta^{+}\) is the estimation bias that results from selecting the non-optimal policy \(\hat{\pi}^{\star}\) in \(\Pi_{m}^{\mathcal{E}}\) for a given state, and \(\beta^{\star}\) is the value estimation error w.r.t. the true value for given state of selected policy \(\hat{\pi}^{\star}\) and \(v\) represents the variance term.
+
+MAPS improves upon MAMBA's sample complexity, reducing bias in its regret bound via an active policy selection mechanism. Our work builds on MAPS, emphasizing empirical enhancements in active policy selection with the integration of the learner policy in \(\Pi_{m}^{\mathcal{E}}\).
+
+## Appendix D Experimental Details
+
+### Baselines
+
+AggreVaTeDAggreVaTeD (Sun et al., 2017) is a differentiable version of AggreVaTe, which focuses on a single oracle scenario. AggreVaTeD allows us to train policies with efficient gradient update procedures. AggreVaTeD models the policy as a deep neural network and trains the policy using differentiable imitation learning. By applying differentiable imitation learning, it minimize the difference between the expert's demonstration and the learner policy behavior. AggreVaTeD learns from the expert's demonstration while interact with the environment to outperform the expert.
+
+Max-AggregationWe have developed a variant of the Max-aggregation policy as outlined in Equation (16) that is specifically designed for pure imitation learning using multiple oracle sets. When utilizing a single oracle, it effectively reduces to AggreVateD. Our approach builds on the existing MAMBA framework by setting the lambda value in the loss function to zero. While max-aggregation may not always yield the optimal policy, it offers the advantage of being able to achieve results with fewer samples, making it a more sample-efficient option.
+
+LOKI-variantLOKI (Cheng et al., 2018) is strategy for policy learning that combines the imitation learning and reinforcement learning objectives in a two-stage manner for the single oracle setting. In the first stage, LOKI performs imitation learning for a small but random number of iterations and then switches to policy gradient reinforcement learning method for the second stage. LOKI is able to outperform a sub-optimal expert and converge faster than running policy gradient from scratch. In this work, we propose a variation of LOKI that adapts to multiple experts. During the first-half of training (i.e., the first stage) we perform Max-aggregation style imitation learning, and then perform pure reinforcement learning as the second stage.
+
+Ppo-GaeSchulman et al. (2015) proposed the generalized advantage estimator (GAE) as a means of solving high-dimensional continuous control problems using reinforcement learning. GAE is used to estimate the advantage function for updating the policy. The advantage function measures how much better a particular action is compared to the average action. Estimating the advantage function with accuracy in high-dimensional continuous control problems is challenging. In this work, we propose PPO-GAE, which combines PPO's policy gradient method with GAE's advantage functionestimate, which is based on a linear combination of value function estimates. By combining the advantage of PPO and GAE, PPO-GAE (Schulman et al., 2017) achieved both sample efficiency and stability in high-dimensional continuous control problems.
+
+MambaMAMBA (Cheng et al., 2020) is the SOTA work of learning from multiple oracles. It utilizes a mixture of imitation learning and reinforcement learning to learn a policy that is able to imitate the behavior of multiple experts. MAMBA is also considered as interactive imitation learning algorithm, it imitates the expert and interact with environment to improve the performance. MAMBA randomly select the state as switch point between learner policy and oracle. Then, it randomly selects the oracle to roll out. It effectively combines the strengths of multiple experts and able to handle the case of conflicting expert demonstrations.
+
+MapsMAPS (Liu et al., 2023) is a policy improvement algorithm that performs imitation learning from multiple suboptimal oracles. It actively chooses the oracle to imitate based on their value function estimates and identifies the states that require exploration. By introducing two variations, Active Policy Selection (APS) and Active State Exploration (ASE), MAPS improves the sample efficiency of MAMBA. The MAPS variant selects the most promising oracle, denoted as \(k_{\star}\), for rollout, utilizing the resulting trajectory to refine the value function estimate \(\hat{V}^{k_{\star}}\) (\(s_{t}\)). This approach aims to minimize the chances of selecting an inferior oracle for a given state \(s_{t}\), thereby reducing both the sample complexity and gradient estimation bias. On the other hand, the ASE variant of MAPS deliberates whether to continue with the current policy or switch to what is believed to be the most promising oracle, similar to APS, by leveraging an uncertainty measure over the current state. In this study, we adopt MAPS variant as our baseline method.
+
+### Gym environments
+
+We evaluate RPI and compare its performance to the aforementioned baselines on the Cheetahrun, CartPole-swingup, Pendulum-swingup, and Walker-walk tasks from the DeepMind Control Suite (Tassa et al., 2018) and Window-close, Faucet-open, Drawer-close and Button-press from Meta-World (Yu et al., 2020). In addition, we conduct experiments on a modified sparse reward Meta-World environment, which is considered to be a more challenge task.
+
+### Setup
+
+**Setup.** In order to ensure a fair evaluation, all baselines are assessed using an equal number of environment interaction steps (training steps). Each training iteration involved a policy rollout for the same number of steps. We note that there is a discrepancy in the amount of data available to the learners of RPI and PPO-GAE. RPI (MAPS, MAMBA, Max-Aggregation) uses some of the interactions to learn the value function for each Oracle, which results in relatively less data for its learner, whereas PPO-GAE utilizes all the environment interactions to update all benefits for its learner policy. Thus, in this work, we balance the transition buffer size for each algorithm to make them have approximately same number of stored transitions for learner policy improvement. We average the result based on 5-10 trials.
+
+### Implementation details of RPI
+
+We provide the details of RPI in Algorithm 1 as Algorithm 2. Algorithm 2 closely follows Algorithm 1 with a few modifications as follows:
+
+* In line 5, we use a buffer with a fixed size (\(|\mathcal{D}_{n}|=19,200\)) for each oracle, and discard the oldest data when it fills up.
+* In line 7, we roll-out the learner policy until the buffer reaches a fixed size (\(|\mathcal{D}^{\prime}_{n}|\) = 2,048), and then empty it once we use the roll outs to update the learner policy. This stabilizes the training compared to storing a fixed number of trajectories in the buffer, as MAMBA does.
+* In line 10, we use PPO with a max\({}^{+}\) actor-critic style policy update.
+* We pretrain the value function \(\hat{V}^{k}\) of oracle \(k\) before the main training loop, with trajectories generated by rolling out \(\pi^{k}\) from the initial states. In the main training loop, we train using the corresponding rolled-out trajectories, bootstrapped only by itself. This is the same strategy as in MAMBA and MAPS. Similarly, we train the learner value function \(\hat{V}_{n}\) using only the trajectories rolled-in with \(\pi_{n}\), bootstrapped only by itself.
+
+### Hyperparameters and architectures
+
+Table 3 provides a list of hyperparameter settings we used for our experiments. We use an ensemble of MLPs to predict an oracle's value. With five identical MLPs that are separately initialized at random, we train each MLP separately for the same dataset. At inference time, we collect predictions from all MLPs for a single input and compute the mean and standard deviation.
+
+\begin{table}
+\begin{tabular}{l c} \hline \hline  & **Parameter** & **Value** \\ \hline Shared & \\ \hline Learning rate & \(3\times 10^{-4}\) \\ \hline Optimizer & Adam \\ \hline Nonlinearity & ReLU \\ \hline \# of functions in a value function ensemble & 5 \\ \hline Oracle & \\ \hline \# of oracles in the oracle set \((K)\) & 3 \\ \hline The buffer size for oracle \(k\) \(\left(\mathcal{D}^{k}\right)\) & 19200 \\ \hline \# of episodes to rollout the oracles for value function pretraining & 8 \\ \hline Learner & \\ \hline Horizon of MetaWorld and DMControl \((H)\) & 300, 1000 \\ \hline Replay buffer size for the learner policy \(\left(\left|\mathcal{D}^{\prime}_{n}\right|\right)\) & 2048 \\ \hline GAE gamma \((\gamma)\) & 0.995 \\ \hline GAE lambda \((\lambda)\) for AggetVaE and Max-Aggregation & 0 \\ \hline for IOXi-variant & 0 or 1 \\ \hline \# of training steps / rounds \((N)\) & 100 \\ \hline \# of episodes to perform RIRO (Alg 1, line 4) per training iteration & 4 \\ \hline mini-batch size & 128 \\ \hline \# of epochs to perform gradient update per training iteration & 4 \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: RPI Hyperparameters.
+
+### Computing infrastructure and wall-time comparison
+
+We conducted our experiments on a cluster that includes CPU nodes (approximately 280 cores) and GPU nodes (approximately 110 Nvidia GPUs, ranging from Titan X to A6000, set up mostly in 4- and 8-GPU configurations). Based on the computing infrastructure, we obtained the wall-time comparison in Table 4 as follows.
+
+## Appendix E Supplemental Experiments
+
+### Comparing RPI against baselines with a data advantage
+
+In the main paper, we followed an experimental setup where we assumed that the learner had access to approximately the same quantity of transitions, while lacking access to the oracle's offline trajectory. However, some of the baseline algorithms, such as MAPS (Liu et al., 2023) were originally evaluated under a different setting in the literature: They assume that the learner can access additional data from the oracles' pre-trained offline dataset. In this section, we run MAPS under such a setting, in order to provide more comprehensive evaluation that is consistent with the literature. Note that under this experimental setup, MAPS has approximately twice the amount of data compared to RPI. We refer to this variant as MAPS-ALL.
+
+In contrast to MAPS in our original configuration, the performance of MAPS-ALL doubles in the Cheetah environment (as shown in Figure 5(a)) and the Pendulum environment (as depicted in Figure 5(c)). Moreover, the performance of MAPS-ALL surges between middle and end of rounds in the Pendulum environment. This behavior mirrors what was reported in the original MAPS paper as well. In the Walker-walk environment (as illustrated in Figure 5(b)), MAPS-ALL demonstrates an approximate 10% improvement. For the Cartpole environment (Figure 5(d)), MAPS-ALL's performance increases by around 20%. MAPS-ALL exhibits overall performance similar to that of its original paper, with any differences caused by the difference in the oracle set. Notably, as a result, MAPS-ALL distinctly outperforms RPI only in the Pendulum environment. RPI's performance remains comparable to MAPS-ALL in the Cheetah environment and significantly surpasses the MAPS-ALL baseline in the Walker-Walker and Cartpole environments, despite utilizing much less data.
+
+### Meta-World experiments (dense reward)
+
+In Fig. 6, we conducted additional experiments comparing RPI and state-of-the-art (SOTA) methods {MAMBA, MAPS}, as well as the best-performing oracle and PPO-GAE, across the
+
+\begin{table}
+\begin{tabular}{l c c c c} \hline \hline
+**Methods** & Cheetah & Cartpole & Walk-Walker & Pendulum \\ \hline
+**MAPS** & 1h 18m & 1h 10m & 1h 41m & 1h 17m \\
+**MAMBA** & 1h 23m & 59m & 2h 14m & 1h 21m \\
+**LOK-variant** & 1h 17m & 1h 36m & 2h 11m & 1h 12m \\
+**PPO-GAE** & 54m & 58m & 1h 10m & 49m \\
+**MAX-aggregation** & 1h 5m & 1h 34m & 2h 25m & 1h 13m \\ \hline
+**RPI** & 57m & 58m & 1h 43m & 1h 18m \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: Wall-time comparison between different methods.
+
+Figure 5: Running MAPS in the original paper’s setting.
+
+Meta-World benchmarks. The tasks are including (1) window-close, (2) faucet-open, (3) drawer-close, and (4) button-press. RPI demonstrates superior performance compared to all baselines in the majority of environments, with the exception of the button-press task.
+
+### Meta-World experiments (sparse reward)
+
+In Fig. 7, to further demonstrate the advantages of imitation learning, we modified the Meta-World environment to create a more challenging sparse reward environment. In this environment, the agent only receives a reward of 1 upon success; otherwise, it receives a reward of 0. We then compared the performance of the RPI and state-of-the-art (SOTA) imitation learning-based methods MAMBA, MAPS, as well as the pure RL method PPO-GAE, and the best-performing oracle across the Meta-World benchmarks. The tasks include (1) window-close, (2) faucet-open, (3) drawer-close, and (4) button-press. In these sparse reward environments, when provided with a good oracle, the imitation learning-based approach demonstrates its advantage over the pure RL approach. RPI, MAPS, and Mamba outperform PPO-GAE by a factor of 3 in the button-press environment. When provided with a bad oracle, RPI can still outperform MAPS and MAMBA in the faucet-open environment. Moreover, even with a poor oracle, RPI outperforms both IL-based approaches (MAMBA, MAPS) and the RL-based approach (PPO-GAE) in the window-close environment, showcasing that RPI enjoys benefits from both RL and IL aspects.
+
+### Single/empty oracle set
+
+In Fig. 2, we mainly discuss experiment on multiple oracle set. In Fig. 8, we demonstrate that RPI is also robust enough to handle single or empty oracle set.
+
+**Single oracle setting.** In Fig. 8(b), we demonstrate that RPI outperforms all other baselines in a single oracle setting as well. This is consistent with the results observed in the multiple-experts setting. Fig. 8(c) demonstrates that providing an oracle with mediocre performance to RPI boosts the performance rather than providing a near-optimal oracle. Since we train oracles' value functions from the oracle rollouts, the value function of the near-optimal oracle may not have seen the "bad" states that the learner policy would encounter in the early stage. This leads to inaccuracy in the predicted values for such states. In comparison, the value function for a mediocre oracle would be able to produce accurate predictions on such states.
+
+**No oracle environment.** When there are no experts available, the performance of imitation learning-based approaches will inevitably degrade. However, as shown in Fig. 8(a), RPI can adapt to such a scenario by regressing to pure reinforcement learning. Since we extend RPI based on PPO-GAE, it achieves a similar level of performance to PPO-GAE when the oracle set is empty.
+
+Figure 6: Experimental results on the Meta-World benchmark with dense reward.
+
+Figure 7: Experimental results on the Meta-World benchmark with sparse reward.
+
+### Ablation on confidence threshold \(\Gamma_{s}\)
+
+In Table 5, we perform an ablation study of threshold \(\Gamma_{s}\) in Eqn. 12 of robust policy gradient component. We treat \(\Gamma_{s}\) as a hyperparameter the choice of which depends on the user's risk aversion. Empirically, we find that a setting of \(\Gamma_{s}=0.5\) robustly works well in nearly every setting in our experiments across Deepmind Control suite, Meta-World (Dense reward), and Meta-world (Sparse reward) environment, the one exception being the Pendulum domain. To better understand how the choice of \(\Gamma_{s}\) effects overall performance, we conducted a set of experiments in which we ran RPI on the Deepmind Control Suite using different values for \(\Gamma_{s}\in[0,0.5,1,3,5]\). As the following table shows, setting \(\Gamma_{s}=0.5\) yields the best performance for all but the Pendulum environment.
+
+In practice, one can first use roll outs of each oracle to estimate the standard deviation and associated confidence intervals of their ensemble values. A conservative user could then start by setting \(\Gamma_{s}\) based on a probabilistic lower-bound of \(\sigma\) and subsequently tune the hyperparameter according to user's risk aversion preference.
+
+### Ablation on UCB/LCB policy selection
+
+We conducted an ablation study that compares RPI-LCB/UCB, which takes uncertainty into account as follows:
+
+\[K=\arg\max\left(\overline{\dot{V}^{1}(s)},\overline{\dot{V}^{2}(s)},\ldots, \underline{\dot{V}^{K+1}(s)}\right)\]
+
+against RPI-MEAN, which does not consider uncertainty as:
+
+\[K=\arg\max\left(\dot{V}^{1}(s),\dot{V}^{2}(s),\ldots,\dot{V}^{K+1}(s)\right).\]
+
+Figure 8: **Ablation study. (a) Comparing RPI and PPO-GAE under no oracle Pendulum environment. (b) Comparing RPI and six baseline under single expert Cheetah environment. (c) ablation study on oracle quality under Cheetah environment.**
+
+\begin{table}
+\begin{tabular}{l c c c c c} \hline \hline
+**Environment** & Round & \(\Gamma_{s}=0\) & \(\Gamma_{s}=0.5\) & \(\Gamma_{s}=1\) & \(\Gamma_{s}=3\) & \(\Gamma_{s}=5\) \\ \hline
+**Cheetah** & 100 & 252.7 ± 23.2 & **291.2 ± 36.3** & 251.4 ± 15.1 & 53.4 ± 20.0 & 81.3 ± 20.8 \\ \hline
+**Walker-walk** & 100 & 328.7 ± 6.5 & **402.2 ± 57.7** & 253.0 ± 43.5 & 31.8 ± 1.4 & 38.2 ± 1.9 \\ \hline
+**Pendulum** & 100 & 34.2 ± 23.5 & 38.0 ± 10.4 & 45.6 ± 2.3 & **54.3 ± 1.5 & 52.1 ± 0.1 \\ \hline
+**Cartpole** & 100 & 445.7 ± 13.5 & **670.4 ± 110.1** & 394.8 ± 50.6 & 301.7 ± 60.0 & 303.2 ± 4.0 \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Tuning the confidence threshold \(\Gamma_{s}\).
+
+Figure 9: Experimental results on ablation study on confidence aware UCB/LCB vs MEAN policy selection.
+
+The experimental results presented in Fig. 9 and Table 6 demonstrate that the RPI-LCB/UCB strategy outperforms RPI-MEAN across all benchmarks by an _overall_ margin of 40%. This highlights the significance of incorporating uncertainty in the policy selection strategy.
+
+\begin{table}
+\begin{tabular}{l c c c} \hline \hline
+**Environment** & Round & RPI-RAPS(LCB/UCB) & RPI-MEAN \\ \hline
+**Cheetah** & 100 & **291.2**\(\pm\) 36.3 & 263.0 \(\pm\) 33.7 \\
+**Walker-walk** & 100 & **402.2**\(\pm\) 57.7 & 342.7 \(\pm\) 18.8 \\
+**Pendulum** & 100 & **54.3**\(\pm\) 1.5 & 53.8 \(\pm\) 0.5 \\
+**Cartpole** & 100 & **670.4**\(\pm\) 110.1 & 354.3 \(\pm\) 65.2 \\ \hline
+**Overall** & 100 & **1418.1** & 1013.8 \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Ablation study on confidence aware UCB/LCB vs MEAN policy selection

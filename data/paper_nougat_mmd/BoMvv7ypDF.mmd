@@ -1,0 +1,1389 @@
+# Recursive Score Estimation Accelerates Diffusion-Based Monte Carlo
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+To sample from a general target distribution \(p_{*}\propto e^{-f_{*}}\) beyond the isoperimetric condition, Huang et al. (2023) proposed to perform sampling through reverse diffusion, giving rise to _Diffusion-based Monte Carlo_ (DMC). Specifically, DMC follows the reverse SDE of a diffusion process that transforms the target distribution to the standard Gaussian, utilizing a non-parametric score estimation. However, the original DMC algorithm encountered high gradient complexity1, resulting in an _exponential dependency_ on the error tolerance \(\epsilon\) of the obtained samples. In this paper, we demonstrate that the high complexity of the original DMC algorithm originates from its redundant design of score estimation, and proposed a more efficient DMC algorithm, called RS-DMC, based on a novel recursive score estimation method. In particular, we first divide the entire diffusion process into multiple segments and then formulate the score estimation step (at any time step) as a series of interconnected mean estimation and sampling subproblems accordingly, which are correlated in a recursive manner. Importantly, we show that with a proper design of the segment decomposition, all sampling subproblems will only need to tackle a strongly log-concave distribution, which can be very efficient to solve using the standard sampler (e.g., Langevin Monte Carlo) with a provably rapid convergence rate. As a result, we prove that the gradient complexity of RS-DMC only has a _quasi-polynomial dependency_ on \(\epsilon\), which significantly improves exponential gradient complexity in Huang et al. (2023). Furthermore, under commonly used dissipative conditions, our algorithm is provably much faster than the popular Langevin-based algorithms. Our algorithm design and theoretical framework illuminate a novel direction for addressing sampling problems, which could be of broader applicability in the community.
+
+Footnote 1: We denote gradient complexity as the required number of gradient calculations to achieve at most \(\epsilon\) sampling error.
+
+## 1 Introduction
+
+Sampling problems, i.e., generating samples from a given target distribution \(p_{*}\propto\exp(-f_{*})\), have received increasing attention in recent years. For resolving this problem, a popular option is to apply gradient-based Markov chain Monte Carlo (MCMC) methods, such as Unadjusted Langevin Algorithms (ULA) (Neal, 1992; Roberts & Tweedie, 1996), Underdamped Langevin Dynamics (ULD) (Cheng et al., 2018; Ma et al., 2021; Mou et al., 2021), Metropolis-Adjusted Langevin Algorithm (MALA) (Roberts & Stramer, 2002; Xifara et al., 2014), and Hamiltonian Monte Carlo (HMC) (Duane et al., 1987; Neal, 2010). In particular, these algorithms can be seen as the discretization of the continuous Langevin dynamics (LD) and its variants (Ma et al., 2015), which will converge to a unique stationary distribution that follows \(p_{*}\propto\exp(-f_{*})\), under regularity conditions on the energy function \(f_{*}(\mathbf{x})\) (Roberts & Tweedie, 1996).
+
+However, the convergence rate of the Langevin-based algorithms heavily depends on the target distribution \(p_{*}\): guaranteeing the convergence in polynomial time requiring \(p_{*}\) to have some nice properties, e.g., being strongly log-concave, satisfying log-Sobolev or Poincare inequality with a large coefficient. However, for more general non-log-concave distributions, the convergence rate may exponentially depend on the problem dimension (Raginsky et al., 2017; Holzmuller & Bach, 2023) (i.e., \(\sim\exp(d)\)), or even the convergence itself (to \(p_{*}\)) cannot be guaranteed (one can only guaranteeto converge to some locally stationary distribution (Balasubramanian et al., 2022)), implying that the Langevin-based algorithms are extremely inefficient for solving such hard sampling problems. To this end, we are interested in addressing the following question:
+
+_Can we develop a new sampling algorithm that enjoys a non-exponential convergence rate for sampling general non-log-concave distributions?_
+
+To address this problem, we are inspired by several recent studies, including Montanari (2023); Huang et al. (2023), that attempt to design samplers based on diffusion models (Sohl-Dickstein et al., 2015; Ho et al., 2020; Vargas et al., 2023), which we refer to as the **diffusion-based Monte Carlo** (DMC). In particular, the algorithm developed in Huang et al. (2023) is based on the reverse process of the Ornstein-Uhlenbeck (OU) process, which starts from the target distribution \(p_{*}\) and converges to a standard Gaussian distribution. The mathematical formula of the OU process and its reverse process are given as follows (Anderson, 1982; Song et al., 2020):
+
+\[\mathrm{d}\mathbf{x}_{t} =-\mathbf{x}_{t}\mathrm{d}t+\sqrt{2}\mathrm{d}B_{t},\quad\mathbf{ x}_{0}\sim p_{0}(\mathbf{x})=p_{*},\] (OU Process) \[\mathrm{d}\mathbf{x}_{t}^{\leftarrow} =\big{[}\mathbf{x}_{t}^{\leftarrow}+2\nabla\log p_{T-t}(\mathbf{ x}_{t}^{\leftarrow})\big{]}\mathrm{d}t+\sqrt{2}\mathrm{d}B_{t},\quad\mathbf{x}_{0}^{ \leftarrow}\sim p_{T}(\mathbf{x})\approx\mathcal{N}(\mathbf{0},\mathbf{I}),\] (Reverse Process)
+
+where \(B_{t}\) denotes the Brownian term, \(p_{t}(\mathbf{x})\) denotes the underlying distribution of the particle at time \(t\) along the OU process, \(T\) denotes the end time of the OU process, and \(\nabla\log p_{t}(\mathbf{x})\) denotes the score function of the distribution \(p_{t}(\mathbf{x})\). In fact, the exponentially slow convergence rate of the Langevin-based algorithms stems from the rather long mixing time of Langevin dynamics to its stationary distribution, while in contrast, the OU process exhibits a much shorter mixing time. Therefore, principally, if the reverse process of the OU process can be perfectly recovered, one can avoid suffering from the issue of slow mixing of Langevin dynamics, and develop more efficient sampling algorithms accordingly.
+
+Then, the key to recovering (Reverse Process) is to obtain a good estimation for the score \(\nabla\log p_{t}(\mathbf{x})\) for all \(t\in[0,T]\). Huang et al. (2023) proposed a score estimation method called reverse diffusion sampling (RDS) based on an inner-loop ULA. However, it still suffers from the exponential dependency with respect to the target sampling error, which requires \(\exp\big{(}\mathcal{O}(1/\epsilon)\big{)}\) gradient complexity to achieve the \(\epsilon\) sampling error in KL divergence. The reason behind this is that RDS involves many _hard_ subproblems that need to sample non-log-concave distributions with bad isoperimetric properties, which incurs huge gradient complexities in the desired Langevin algorithms.
+
+In this work, we argue that the _hard_ subproblems in Huang et al. (2023) are redundant or even unnecessary, and propose a more efficient diffusion-based Monte Carlo method, called recursive score DMC (RS-DMC), that only requires **quasi-polynomial gradient complexity** to sampling general non-log-concave distributions. At the core of RS-DMC is a novel non-parametric method for score estimation, which involves a series of interconnected mean estimation and sampling subproblems that are correlated in a recursive manner. In particular, we first divide the entire forward process into several segments starting from \(0,S,\ldots,(K-1)S\), and estimate the scores \(\{\nabla\log p_{kS}(\mathbf{x})\}_{k=0,\ldots,K-1}\) recursively. Given the segments, the score within each segment \(\nabla\log p_{kS+\tau}(\mathbf{x})\) will be further estimated according to the reference score \(\nabla\log p_{kS}(\mathbf{x})\), where \(\tau\in[0,S]\) can be arbitrarily chosen. Importantly, given proper configuration of the segment length (i.e., \(S\)), we can show that all sampling subproblems in the developed score estimation method are _much easier_, as long as the target distribution \(p_{*}\) is log-smooth and has bounded second moment. Then, all intermediate target distributions are guaranteed to be strongly log-concave, which can be sampled very efficiently via standard ULA. We then summarize the main contributions of this paper as follows:
+
+* We propose a new Diffusion Monte Carlo algorithm, called RS-DMC, for sampling general non-log-concave distributions. At the core is a novel and efficient recursive score estimation algorithm. In particular, based on a properly designed recursive structure, we show that the hard non-log-concave sampling problem can be divided into a series of benign sampling subproblems that can be solved very efficiently via standard ULA.
+* We establish the convergence guarantee of the proposed RS-DMC algorithm under very mild assumptions, which only require the target distribution to be log-smooth and to have a bounded second moment. In contrast, to obtain provable convergence (to the target distribution), the Langevin-based methods typically require additional isoperimetric conditions (e.g., Log-Sobolev inequality, Poincare inequality, etc). This justifies that our algorithm can be applied to a broader class of distributions with rigorous theoretical convergence guarantees.
+
+* We prove that the gradient complexity of our algorithm is \(\exp\left[\mathcal{O}(\log^{3}(d/\epsilon))\right]\) to achieve \(\epsilon\) sampling error in KL divergence, which only has a quasi-polynomial dependency on the target error \(\epsilon\) and dimension \(d\). In contrast, under even stronger conditions in our work, the gradient complexity in prior works either need exponential dependency in \(\epsilon\) (i.e., \(\exp\left(\mathcal{O}(1/\epsilon)\right)\)) (Huang et al., 2023) or exponential dependency in \(d\), (i.e., \(\exp\left(\mathcal{O}(d)\right)\)) (Raginsky et al., 2017; Xu et al., 2018)2 (which requires the additional dissipative condition). This demonstrate the efficiency of our algorithm.
+
+Footnote 2: We omit the \(d\)-dependency in Huang et al. (2023) and \(\epsilon\)-dependency in Raginsky et al. (2017); Xu et al. (2018) for the ease of presentation.
+
+## 2 Preliminaries
+
+In this section, we will first introduce the notations and problem settings that are commonly used in the following sections. We will then present some fundamental properties, such as the closed form of the transition kernel and the expectation form of score functions along the OU process. Finally, we will specify the assumptions that the target distribution is required in our algorithms and analysis.
+
+**Notations.** We use lower case bold symbol \(\mathbf{x}\) to denote the random vector, we use lower case italicized bold symbol \(\mathbf{x}\) to denote a fixed vector. We use \(\|\cdot\|\) to denote the standard Euclidean distance. We say \(a_{n}=\mathrm{poly}(n)\) if \(a_{n}\leq O(n^{c})\) for some constant \(c\).
+
+**The segmented OU process.** We define \(\mathbb{N}_{a,b}=[a,b]\cap\mathbb{N}_{*}\) for brevity. Suppose the length of each segment is \(S\in\mathbb{R}_{+}\), and we divide the entire forward process with length \(T\) into \(K\in\mathbb{N}_{+}\) segments satisfying \(K=T/S\). In this condition, we can reformulate the previous SDE as
+
+\[\begin{split}&\mathbf{x}_{k,0}\sim p_{0,0}=p_{*}\ \mathrm{when}\ k=0,\ \mathrm{else}\ \mathbf{x}_{k,0}=\mathbf{x}_{k-1,S}&\quad k\in\mathbb{N}_{0,K-1}\\ &\quad\mathrm{d}\mathbf{x}_{k,t}=-\mathbf{x}_{k,t}\mathrm{d}t+ \sqrt{2}\mathrm{d}B_{t}&\quad k\in\mathbb{N}_{0,K-1},t\in[0,S], \end{split} \tag{1}\]
+
+where \(\mathbf{x}_{k,t}\) denotes the random variable of the OU process at time \((kS+t)\) with underlying density \(p_{k,t}\). Besides, we define the following conditional density, i.e., \(p_{(k,t)|(k^{\prime},t^{\prime})}(\mathbf{x}|\mathbf{x}^{\prime})\), which presents the probability of obtaining \(\mathbf{x}_{k,t}=\mathbf{x}\) when \(\mathbf{x}_{k^{\prime},t^{\prime}}=\mathbf{x}^{\prime}\). The diagram of SDE (1) is presented in Fig 1.
+
+**The reverse segmented OU process.** According to (Reverse Process), the reverse process of the segmented SDE (1) can be presented as
+
+\[\begin{split}&\mathbf{x}_{k,0}^{\leftarrow}\sim p_{K-1,S}\ \mathrm{when}\ k=K-1,\ \mathrm{else}\ \mathbf{x}_{k,0}^{\leftarrow}=\mathbf{x}_{k+1,S}^{\leftarrow}&\quad k\in\mathbb{N}_{0,K-1}\\ &\quad\mathrm{d}\mathbf{x}_{k,t}^{\leftarrow}=\left[\mathbf{x}_{k,t}^{ \leftarrow}+2\nabla\log p_{k,S-t}(\mathbf{x}_{k,t}^{\leftarrow})\right] \mathrm{d}t+\sqrt{2}\mathrm{d}B_{t}&\quad k\in\mathbb{N}_{0,K-1},t \in[0,S]\end{split}\]
+
+where particles satisfy \(\mathbf{x}_{k,t}^{\leftarrow}=\mathbf{x}_{k,S-t}\) with underlying density \(p_{k,t}^{\leftarrow}=p_{k,S-t}\) for any \(k\in\mathbb{N}_{0,K-1}\) and \(t\in[0,S]\). To approximately solve the SDE with numerical methods, we first split each segment into \(R\) intervals \(\{[(r-1)\eta,r\eta]\}_{]=1,\ldots,R}\), where \(\eta\) is the interval length and \(R=S/\eta\). Then we can replace the score function \(\nabla\log p_{k,S-t}\) as \(\mathbf{v}_{k,t}^{\leftarrow}\), and for \(t\in[r\eta,(r+1)\eta]\), we freeze the value of this coefficient in the SDE at time \((k,r\eta)\). Then starting from the standard Gaussian distribution, we consider the following new SDE:
+
+\[\begin{split}&\mathbf{x}_{k,0}^{\leftarrow}\sim p_{\infty}= \mathcal{N}(\mathbf{0},\mathbf{I})\ \mathrm{when}\ k=K-1,\ \mathrm{else}\ \mathbf{x}_{k,0}^{\leftarrow}=\mathbf{x}_{k+1,S}^{\leftarrow}&\quad k\in\mathbb{N}_{0,K-1}\\ &\quad\mathrm{d}\mathbf{x}_{k,t}^{\leftarrow}=\left[\mathbf{x}_{k,t}^{\leftarrow}+2\mathbf{v}_{k, \lfloor t/\eta\rfloor\eta}^{\leftarrow}\left(\mathbf{x}_{k,\lfloor t/\eta \rfloor\eta}^{\leftarrow}\right)\right]\mathrm{d}t+\sqrt{2}\mathrm{d}B_{t}&\quad k\in\mathbb{N}_{0,K-1},t\in[0,S]\end{split} \tag{2}\]
+
+where \(p_{\infty}\) denotes the stationary distribution of the forward process. Similar to the segmented OU process, we define the following conditional density, i.e., \(p_{(k,t)|(k^{\prime},t^{\prime})}^{(\mathbf{x}|\mathbf{x}^{\prime})}\), which presents the probability of obtaining \(\mathbf{x}_{k,t}^{\leftarrow}=\mathbf{x}\) when \(\mathbf{x}_{k^{\prime},t^{\prime}}^{\leftarrow}=\mathbf{x}^{\prime}\). The diagram of SDE (2) is presented in Fig 1.
+
+**Basic properties of the OU process.** In the previous paragraph, we have demonstrated that SDE (1) is an alternative presentation of the OU process. Therefore, the properties in the OU process can be directly introduced for this segmented version. First, the transition kernel in the \(k\)-th segment satisfies
+
+\[p_{(k,t)|(k,0)}(\mathbf{x}|\mathbf{x}_{0})=\left(2\pi\left(1-e^{-2t}\right)\right)^{-d/2} \cdot\exp\left[\frac{-\left\|\mathbf{x}-e^{-t}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2t}\right)} \right],\quad\forall\ 0<t\leq S.\]
+
+Plugging the transition kernel into Tweedie's formula, the score function can be reformulated as the following lemma whose proof is deferred in Section E.
+
+**Lemma 2.1** (Lemma 1 of Huang et al. (2023)).: _For any \(k\in\mathbb{N}_{0,K-1}\) and \(t\in[0,S]\), the score function can be written as_
+
+\[\nabla\log p_{k,S-t}(\mathbf{x})=\mathbb{E}_{\mathbf{x}_{0}\sim q_{k,S-t}(\cdot|\mathbf{ x})}\left[-\frac{\mathbf{x}-e^{-(S-t)}\mathbf{x}_{0}}{\big{(}1-e^{-2(S-t)}\big{)}}\right]\]
+
+_where the conditional density function \(q_{k,S-t}(\cdot|\mathbf{x})\) is defined as_
+
+\[q_{k,S-t}(\mathbf{x}_{0}|\mathbf{x})\propto\exp\left(\log p_{k,0}(\mathbf{x}_{0})-\frac{ \left\|\mathbf{x}-e^{-(S-t)}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-t)}\right)} \right).\]
+
+Therefore, to approximate the score \(\nabla\log p_{k,S-rq}(\mathbf{x})\) with an estimator \(\mathbf{v}_{k,rq}^{+}(\mathbf{x})\), we can draw samples from \(q_{k,S-rq}(\cdot|\mathbf{x})\) and calculate their empirical mean.
+
+**Assumptions.** To guarantee the convergence in KL divergence, the Langevin-based methods require the target distribution to satisfy certain isoperimetric properties such as Log-Sobolev inequality (LSI) and Poincare inequality (PI) or even strong log-concavity (Vempala and Wibisono, 2019; Cheng and Bartlett, 2018; Dwivedi et al., 2018) (the formal definitions of these conditions are deferred to Section A). Some other works consider milder assumptions such as modified LSI Erdogdu and Hosseinzadeh (2021) and weak Poincare inequality Mousavi-Hosseini et al. (2023), but they are only the analytical continuation of LSI and PI, which still exhibit a huge gap with the general non-log-concave distributions. Huang et al. (2023) requires the target distribution \(p_{*}\) to have a heavier tail than that of the Gaussian distribution.
+
+Remarkably, our algorithm does not require any isoperimetric condition or condition on the tail properties of \(p_{*}\) to establish the convergence guarantee. We only require the following mild conditions on the target distribution.
+
+**[A\({}_{1}\)]** For any \(k\in\mathbb{N}_{0,K-1}\) and \(t\in[0,S]\), the score \(\nabla\log p_{k,t}\) is \(L\)-Lipschitz.
+
+**[A\({}_{2}\)]** The target distribution has a bounded second moment, i.e., \(M\coloneqq\mathbb{E}_{p_{*}}[\left\|\,\cdot\,\right\|^{2}]<\infty\).
+
+Assumption **[A\({}_{1}\)]** corresponds to the \(L\)-smoothness condition of the log density \(f_{*}\) in traditional ULA analysis. It is often used to ensure that numerical discretization is feasible. We emphasize that Assumption **[A\({}_{1}\)]** can be easily relaxed to only assume the target distribution is smooth rather than the entire OU process, based on the technique in Chen et al. (2023a) (see their Lemmas 12 and 14). We do not include this additional relaxation in this paper to make our analysis clearer. Assumption **[A\({}_{2}\)]** are widely used in the common analysis of traditional gradient-based MCMC.
+
+Figure 1: The illustration of SDE (1) and (2), covering the definitions in Section 2. The top of the figure describes the underlying distribution of the segmented OU process, i.e., SDE (1), and the bottom presents the corresponding distribution in the segmented OU process, i.e., SDE (2). For the intermediate part, the upper half describes the gradients of the log densities along the forward SDE (1), while the lower half describes approximated scores used to update particles in the reverse SDE (2).
+
+## 3 Proposed Methods
+
+In this section, we introduce a new approach called Recursive Score Estimation (RSE) and describe the proposed Recursive Score Diffusion-based Monte Carlo (RS-DMC) method. We start by discussing the motivations and intuitions behind the use of recursion. Next, we provide implementation details for the RSE process and emphasize the importance of selecting an appropriate segment length. Finally, we present the RS-DMC method based on the RSE approach.
+
+### Difficulties of the vanilla DMC
+
+We consider the reverse segmented OU process, i.e., SDE 2 and begin with the original version of DMC in Huang et al. (2023), which can be seen as a special case of the reverse segmented OU process with a large segment length \(S=T\) and a small number of segments \(K=1\). According to the reverse SDE 2, for the \(r\)-th iteration within one single segment, we need to estimate \(\nabla\log p_{0,S-r\eta}\) to update the particles. Specifically, by Lemma 2.1, we have
+
+\[\nabla\log p_{0,S-r\eta}(\mathbf{x})=\mathbb{E}_{\mathbf{x}_{0}\sim q_{0,S-r\eta}(\cdot |\mathbf{x})}\left[-\frac{\mathbf{x}-e^{-(S-r\eta)}\mathbf{x}_{0}}{\left(1-e^{-2(S-r\eta) }\right)}\right]\]
+
+for any \(\mathbf{x}\in\mathbb{R}^{d}\), where the conditional distribution \(q_{0,S-r\eta}(\cdot|\mathbf{x})\) is
+
+\[q_{0,S-r\eta}(\mathbf{x}_{0}|\mathbf{x})\propto\exp\bigg{(}\log p_{0,0}(\mathbf{x}_{0})- \frac{\left\|\mathbf{x}-e^{-(S-r\eta)}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-r \eta)}\right)}\bigg{)}. \tag{3}\]
+
+Since the analytic form \(\nabla\log p_{0,0}=-f_{*}\) exists, we can use the ULA to draw samples from \(q_{0,S-r\eta}(\cdot|\mathbf{x})\) and calculate the empirical mean to estimate \(\nabla\log p_{0,S-r\eta}(\mathbf{x})\).
+
+However, sampling from \(q_{0,S-r\eta}(\cdot|\mathbf{x})\) is not an easy task. When \(r\) is very small, sampling \(q_{0,S-r\eta}(\cdot|\mathbf{x})\) via ULA is almost as difficult as sampling \(p_{0,0}(\mathbf{x}_{0})\) via ULA (see (3)), since the additive quadratic term, whose coefficient is \(e^{-2(S-r\eta)}/2(1-e^{-2(S-r\eta)})\), will be nearly negligible in this case. This is because that \(S=T\) is large and then \(e^{-2(S-r\eta)}/2(1-e^{-2(S-r\eta)})\sim\exp(-2T)\) becomes extremely small when \(r\eta=O(T)\). More specifically, as shown in Huang et al. (2023), when \(e^{-2(S-r\eta)}\leq 2L/(1+2L)\), the LSI parameter of \(q_{0,S-r\eta}(\cdot|\mathbf{x})\) can be as worse as \(\exp\big{(}-\mathcal{O}(1/\epsilon)\big{)}\). Then applying ULA for sampling this distribution needs a dramatically high gradient complexity that is exponential in \(1/\epsilon\).
+
+### Intuition of the recursion
+
+Therefore, the key to avoiding sampling such a hard distribution is to restrict the segment length. By Lemma 2.1, it can be straightforwardly verified that if the segment length satisfies \(S\leq\frac{1}{2}\log\big{(}\frac{2L+1}{2L}\big{)}\),
+
+\[-\nabla_{\mathbf{x}_{0}}^{2}\log q_{k,S-r\eta}(\mathbf{x}_{0}|\mathbf{x})\geq-\nabla_{\mathbf{ x}_{0}}^{2}\log p_{k,0}(\mathbf{x}_{0})+\frac{e^{-2S}}{1-e^{-2S}}\cdot\mathbf{I}\succeq \frac{e^{-2S}}{2(1-e^{-2S})} \tag{4}\]
+
+where the last inequality follows from Assumption **[A.1]**. This implies that \(q_{k,S-r\eta}(\mathbf{x}_{0}|\mathbf{x})\) is strongly log-concave for all \(r\leq|S/\eta|\), which can be efficiently sampled via the standard ULA. However, ULA requires to calculate the score function \(\nabla_{\mathbf{x}_{0}}\log q_{k,S-r\eta}(\mathbf{x}_{0}|\mathbf{x})\), which further needs to calculate \(\nabla\log p_{k,0}(\mathbf{x})\) according to Lemma 2.1. Different from the vanilla DMC where the formula of \(\nabla\log p_{0,0}(\mathbf{x})\) is known, the score \(\nabla\log p_{k,0}(\mathbf{x})\) in (4) is an unknown quantity, which also requires to be estimated. In fact, based on our definition, we can rewrite \(p_{k,0}(\mathbf{x})\) as \(p_{k-1,S}(\mathbf{x})\) (see Figure 1), then applying Lemma 2.1, we can again decompose the problem of estimating \(\nabla\log p_{k-1,S}(\mathbf{x})\) into the subproblems of sampling \(q_{k-1,S}(\cdot|\mathbf{x})\) and the estimation of \(\nabla\log p_{k-1,0}(\mathbf{x})\), which is naturally organized in a recursive manner. Therefore, by recursively adopting this subproblem decomposition, we summarize the recursive process for approximating \(\nabla\log p_{k,S-r\eta}(\mathbf{x})\) as follows and illustrate the diagram in Figure 2:
+
+* **Step 1:** We approximate the score \(\nabla\log p_{k,S-r\eta}(\mathbf{x})\) by a mean estimation with samples generated by running ULA over the intermediate target distribution \(q_{k,S-r\eta}(\cdot|\mathbf{x})\).
+* **Step 2:** When running ULA for \(q_{k,S-t}(\cdot|\mathbf{x})\), we estimate the score \(\nabla\log p_{k,0}=\nabla\log p_{k-1,S}\).
+* **Step 3:** We jump to Step 1 to approximate the score \(\nabla\log p_{k-1,S}(\mathbf{x})\) via drawing samples from \(q_{k-1,S}(\cdot|\mathbf{x})\), and continue the recursion.
+
+### Recursive Score Estimation and Reverse Diffusion Sampling
+
+**Recursive Score Estimation.** In the previous section, we explained the rough intuition behind introducing recursion. By conducting the recursion, we need to solve a series of sampling and mean estimation subproblems. Then, it is demanding to control the error propagation between these subproblems in order to finally ensure small sampling errors. In particular, this amounts to the adaptive adjustment of the sample numbers for mean estimation and iteration numbers for ULA in solving sampling subproblems. Specifically, if we require score estimation \(\mathbf{v}_{k,r\eta}^{\leftarrow}\): \(\mathbb{R}^{d}\rightarrow\mathbb{R}^{d}\) to satisfy
+
+\[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{ x})\right\|^{2}\leq\epsilon,\ \forall\mathbf{x}\in\mathbb{R}^{d} \tag{5}\]
+
+with a high probability, then the sample number in Step 1 and the number of calls of Step 2 (the iteration number of ULA) in Fig 2 will be two functions with respected to the target error \(\epsilon\), denoted as \(n_{k,r}(\epsilon)\) and \(m_{k,r}(\epsilon)\) respectively. Furthermore, when Step 2 is introduced to update ULA, we rely on an approximation of \(\nabla\log p_{k,0}\) instead of the exact score. To ensure (5) is met, the error resulting from estimating \(\nabla\log p_{k,0}\) should be typically smaller than \(\epsilon\). We express this requirement as:
+
+\[\left\|\nabla\log p_{k,0}(\mathbf{x})-\mathbf{v}_{k,0}^{\leftarrow}(\mathbf{x}) \right\|^{2}\leq l_{k,r}(\epsilon),\ \forall\mathbf{x}\in\mathbb{R}^{d}.\]
+
+where \(l_{k,r}(\epsilon)\) is a function of \(\epsilon\) that satisfies \(l_{k,r}(\epsilon)\leq\epsilon\). Under this condition, we provide Alg 1, i.e., RSE, to calculate the score function for the \(r\)-th iteration at the \(k\)-th segment, i.e., \(\nabla\log p_{k,S-r\eta}(\mathbf{x})\).
+
+**Quasi-polynomial Complexity.** We consider the ideal case for interpreting the complexity of our score estimation method. In particular, since the benign error propagation, i.e., \(l_{k,r}(\epsilon)=\epsilon\), is almost proven in Lemma E.7, we suppose the number of calls to the recursive function, \(\mathsf{RSE}(k-1,0,\mathbf{x}^{\prime},l_{k,r}(\epsilon))\), is uniformly bounded by \(m_{k,r}(\epsilon)\cdot n_{k,r}(\epsilon)\) for all feasible \((k,r)\) pairs when the RSE algorithm is executed with input \((k,r,\mathbf{x},\epsilon)\). Then, recall that we will conduct the recursion in at most \(K\) rounds, the total gradient complexity for estimating one score will be
+
+\[\left[m_{k,r}(\epsilon)\cdot n_{k,r}(\epsilon)\right]^{\mathcal{O}(K)}=\left[m _{k,r}(\epsilon)\cdot n_{k,r}(\epsilon)\right]^{\mathcal{O}(T/S)}.\]
+
+This formula highlights the importance of selecting a sufficiently large segment with length \(S\) to reduce the number of recursive function calls and improve gradient complexity. In our analysis, we set \(S=\frac{1}{2}\log\left(\frac{2L+1}{2L}\right)\), which is "just" small enough to ensure that all intermediate target distributions in the sampling subproblems are strongly log-concave. In this condition, due to the choice of \(T\) is \(\mathcal{O}(\log(d/\epsilon))\) in general cases and \(m_{k,r}(\cdot)\) and \(n_{k,r}(\cdot)\) are typically polynomial w.r.t. the target sampling error \(\epsilon\) and dimension \(d\) (see Theorem B.1 in Appendix B), we would expect a quasi-polynomial gradient complexity.
+
+**Diffusion-based Monte Carlo with Recursive Score Estimation.** Then based on the RSE algorithm in Alg 1, we can directly apply the DDPM (Ho et al., 2020) based method to perform the sampling, giving rise to the Recursive Score Diffusion-based Monte Carlo (RS-DMC) method. We summarize the proposed RS-DMC algorithm in Alg 2 (the detailed setup of \(m_{k,r}(\cdot)\), \(n_{k,r}(\cdot)\), \(l_{k,r}(\cdot)\) are provided in Theorem B.1 in Appendix B).
+
+Figure 2: The illustration of recursive score estimation (RSE). The upper half presents RSE from a local view, which shows how to utilize the former score, e.g., \(\nabla\log p_{k,0}(\mathbf{x}^{\prime})\) to update particles by ULA in the sampling subproblem formulated by the latter score, e.g., \(\nabla\log p_{k,S-t}(\mathbf{x})\). The lower half presents RSE from a global view, which is a series of interconnected mean estimation and sampling subproblems accordingly.
+
+```
+1:Input: The segment number \(k\in\mathbb{N}_{0,K-1}\), the iteration number \(r\in\mathbb{N}_{0,R-1}\), variable \(\mathbf{x}\) requiring the score function, error tolerance \(\epsilon\).
+2:if\(k=-1\)thenreturn\(-\nabla f_{*}(\mathbf{x})\)
+3: Initial the returned vector \(\mathbf{v}^{\prime}\leftarrow\mathbf{0}\)
+4:for\(i=1\) to \(n_{k,r}(\epsilon)\)do
+5: Draw \(\mathbf{x}^{\prime}_{0}\) from a initial distribution \(q^{\prime}_{0}\)
+6:for\(j\)\(\mathbf{\sim}\) to \(m_{k,r}(\epsilon,\mathbf{x})-1\)do
+7:\(\mathbf{v}^{\prime}_{j}\leftarrow\mathsf{RSE}\left(k-1,0,\mathbf{x}^{\prime}_{j},l_{k,r}(\epsilon)\right)\)\(\triangleright\) Recursive score estimation \(\nabla\log p_{k-1,S}(\mathbf{x}^{\prime}_{j})\)
+8:if\(r\neq 0\)then\(\mathbf{t}^{\prime}\gets S-r\eta\)else\(\triangleright\) The gap of time since the last call
+9: Update the particle \[\mathbf{x}^{\prime}_{j+1}\coloneqq\mathbf{x}^{\prime}_{j}+\tau_{r}\cdot\underbrace{ \left(\mathbf{v}^{\prime}_{j}+\frac{e^{-t^{\prime}}\mathbf{x}-e^{-2t^{\prime}}\mathbf{x}^ {\prime}_{j}}{1-e^{-2t^{\prime}}}\right)}_{\approx\nabla\log q_{k,S-r\eta}( \mathbf{x}^{\prime}_{j}|\mathbf{x})}+\sqrt{2\tau_{r}}\cdot\xi\]
+10: Update the score estimation of \(\mathbf{v}^{\prime}\approx\nabla\log p_{k,S-r\eta}(\mathbf{x})\) with empirical mean as \[\mathbf{v}^{\prime}\coloneqq\mathbf{v}^{\prime}+\frac{1}{n_{k,r}(\epsilon)}\bigg{(}- \frac{\mathbf{x}-e^{-t^{\prime}}\mathbf{x}^{\prime}_{m_{k,r}(\epsilon)}}{1-e^{-2t^{ \prime}}}\bigg{)}\] return\(\mathbf{v}^{\prime}\). \(\triangleright\) As the approximation of \(\nabla\log p_{k,S-r\eta}(\mathbf{x})\)
+```
+
+**Algorithm 1** Recursive Score Estimation (approximate \(\nabla\log p_{k,S-r\eta}(\mathbf{x})\)): \(\mathsf{RSE}(k,r,\mathbf{x},\epsilon)\)
+
+## 4 Analysis of RS-DMC
+
+In this section, we will establish the convergence guarantee for RS-DMC and reveal how the gradient complexity depends on the problem dimension and the target sampling error. We will also compare the gradient complexity of RS-DMC with other sampling methods to justify its strength. Additionally, we will provide a proof roadmap that briefly summarizes the critical theoretical techniques.
+
+### Theoretical Results
+
+The following theorem states that RS-DMC can provably converge to the target distribution in KL-divergence with quasi-polynomial gradient complexity.
+
+**Theorem 4.1** (Gradient complexity of RS-DMC, informal).: _Under Assumptions [A\({}_{1}\)]-[A\({}_{2}\)], let \(p^{\leftarrow}_{0,S}\) be the distribution of the samples generated by RS-DMC, then there exists a collection of appropriate hyperparameters \(n_{k,r},m_{k,r},\tau_{r},\eta,l_{k,r}\) and \(l\) such that with probability at least \(1-\epsilon\), it holds that \(\mathrm{KL}\left(p_{*}\|p^{\leftarrow}_{0,S}\right)=\tilde{O}(\epsilon)\). Besides, the gradient complexity of RS-DMC is_
+
+\[\exp\big{[}\mathcal{O}\left(\log^{3}\left((Ld+M)/\epsilon\right)\cdot\max \big{\{}\log\log Z^{2},1\big{\}}\,\right)\big{]}, \tag{6}\]
+
+_where \(Z\) denotes the maximum norm of particles which appears in Alg 2._We defer the detailed configurations of \(n_{k,r},m_{k,r},\tau_{r},\eta,l_{k,r}\), \(l\) and relative constants in the formal version of this theorem, i.e., Theorem B.1 Appendix B and Table 2 in Appendix A, respectively. Then, we show a comparison between our method and previous work.
+
+**Comparison with ULA.** The gradient complexity of ULA has been well studied for sampling the non-log-concave distribution. However, in order to prove the convergence in KL divergence or TV distance, they typically require additional isoperimetric conditions, such as Log-Sobolev and Poincare inequality (see Definitions 1 and 2). In particular, when \(p_{*}\) satisfies LSI with parameter \(\alpha\), Vempala & Wibisono (2019) proved the \(\mathcal{O}\left(de^{-1}\alpha^{-2}\right)\) in KL convergence. However, for general non-log-concave distributions, \(\alpha\) is not dimension-free. For instance, under the Dissipative condition (Hale, 2010), \(\alpha\) can be as worse as \(\exp(-\mathcal{O}(d))\)(Raginsky et al., 2017), leading to a \(\exp(\mathcal{O}(d))\) gradient complexity results (Xu et al., 2018).
+
+When the isoperimetric condition is absent, Balasubramanian et al. (2022) proved the convergence of ULA based on the Fisher information measure, i.e., \(\mathrm{FI}\left(p\|p_{*}\right)\coloneqq\mathbb{E}_{p}\big{[}\|\nabla\log(p/ p_{*})\big{]}^{2}\big{]}\), they showed that ULA can generate the samples that satisfy \(\mathrm{FI}\left(p\|p_{*}\right)\leq\epsilon\) for some small error tolerance \(\epsilon\). However, it may be unclear what can be entailed by such a guarantee \(\mathrm{FI}\left(p\|p_{*}\right)\leq\epsilon\). It has demonstrated that, in some cases, even if the Fisher information \(\mathrm{FI}\left(p\|p_{*}\right)\) is very small, the total variation distance/KL divergence remains bounded away from zero. This suggests that the convergence guarantee in Fisher information might be weaker than that in KL divergence (i.e., our convergence guarantee).
+
+**Comparison with RDS.** Then we make a detailed comparison with RDS in (Huang et al., 2023), which is the most similar algorithm compared to ours. Firstly, we would like to strengthen again that our convergence results are obtained on a milder assumption, while Huang et al. (2023) additionally requires the target distribution to have a heavier tail. Besides, as discussed in the introduction section, RDS has a much worse gradient complexity since it performs all score estimation straightforwardly, while RS-DMC is based on a recursive structure. Consequently, RDS involves many hard sampling subproblems that take exponential time to solve, while RS-DMC only involves strongly log-concave subsampling problems that can be efficiently solved within polynomial time. As a result, the gradient complexity of RDS is proved to be \(\mathrm{poly}(d)\cdot\mathrm{poly}(1/\epsilon)\cdot\exp\left(\mathcal{O}(1/ \epsilon)\right)\), which is significantly worse than the quasi-polynomial gradient complexity of RS-DMC.
+
+### Proof Sketch
+
+In this section, we aim to highlight the technical innovations by presenting the roadmap of our analysis. Due to space constraints, we have included the technical details in the Appendix.
+
+Firstly, by requiring Novikov's conditions, we can establish an upper bound on the KL divergence gap between the target distribution \(p_{*}\) and the underlying distribution of output particles, i.e., \(p_{0,S}^{-}\), by Girsanov's Theorem which demonstrates
+
+\[\mathrm{KL}\left(p_{*}\|p_{0,S}^{\leftarrow}\right)\leq \underbrace{\mathrm{KL}\left(p_{K-1,S}\|p_{K-1,0}^{\leftarrow} \right)}_{\mathrm{Term}\,1}+\underbrace{2\sum_{k=0}^{K-1}\sum_{r=0}^{R-1} \int_{0}^{\eta}\mathbb{E}_{\mathbf{x}_{k,r\eta}^{\leftarrow}}\left[\|\nabla \log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta}^{\leftarrow})-\mathbf{v}_{k,r\eta}^{ \leftarrow}(\mathbf{x}_{k,r\eta}^{\leftarrow})\|^{2}\right]\mathrm{d}t}_{ \mathrm{Term}\,3}\] \[+2\underbrace{\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta} \mathbb{E}_{(\mathbf{x}_{k,t+r\eta}^{\leftarrow},\mathbf{x}_{k,r\eta}^{ \leftarrow})}\left[\|\nabla\log p_{k,S-(t+r\eta)}(\mathbf{x}_{k,t+r\eta}^{ \leftarrow})-\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta}^{\leftarrow})\|^{2 }\right]\mathrm{d}t}_{\mathrm{Term}\,2}\,.\]
+
+Although Novikov's condition may not be met in general, we employ techniques in Chen et al. (2023) and sidestep this issue by utilizing a differential inequality argument as shown in Lemma F.3.
+
+**Upper bound Term 1.** Intuitively, \(\mathrm{Term}\,1\) appears since we utilize the standard Gaussian to initialize the reverse OU process (SDE (2)) rather than \(p_{K-1,S}\) which can hardly be sampled from directly in practice. Therefore, the first term can be bounded using exponential mixing of the forward (Ornstein-Uhlenbeck) process towards the standard Gaussian in Lemma C.3, i.e.,
+
+\[\mathrm{KL}\left(p_{K-1,S}\|p_{K-1,0}^{\leftarrow}\right)\leq\mathrm{KL}\left(p _{*}\|p_{K-1,0}^{\leftarrow}\right)\exp(-KS)\leq(Ld+M)\exp(-KS),\]
+
+where \(p_{K-1,0}^{\leftarrow}=\mathcal{N}(\boldsymbol{0},\boldsymbol{I})\) as shown SDE (2).
+
+**Upper bound Term 2.** Term 2 corresponds to the discretization error, which has been successfully addressed in previous work Chen et al. (2023);a). By utilizing the unique structure of the Ornstein-Uhlenbeck process, they managed to limit both the time and space discretization errors, which decrease as \(\eta\) becomes smaller. To ensure the completeness of our proof, we have included it in Lemma D.4, utilizing the segmented notation.
+
+**Upper bound Term 3.** Term 3 represents the accuracy of the score estimation. In diffusion models, due to the parameterization of the target density, this term is trained by a neural network and assumed to be less than \(\epsilon\) to ensure the convergence of the reverse process. However, in RS-DMC, the score estimation is obtained using a non-parametric approach, i.e., Alg 1. To this end, we can provide rigorous high probability bound for this term under Alg 1, which is stated in Lemma E.10.
+
+Roughly speaking, for Alg 2 with input each \((k,r,\mathbf{x},\epsilon)\), suppose the score estimation of \(\nabla\log p_{k,0}\) is given as \(\mathbf{v}_{k-1,0}^{*}\) satisfying the following event
+
+\[\bigcap_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r}(\mathbf{x},\epsilon)}\big{\|}\nabla \log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime} )\big{\|}^{2}\leq l_{k,r}(\epsilon)\]
+
+where \(\mathbb{S}_{k,r}(\mathbf{x},\epsilon)\) denotes the set of particles appear in Alg 1 except for the recursion. In this condition, Lemma E.7 provides the upper bound of score estimation error as:
+
+\[\big{\|}\mathbf{v}_{k,r_{0}}^{\leftarrow}(\mathbf{x})-\nabla\log p_{ k,S-r\eta}(\mathbf{x})\big{\|}^{2}\leq\frac{2e^{-2(S-r\eta)}}{(1-e^{-2(S-r\eta))^{2}}} \cdot\underbrace{\bigg{\|}-\frac{1}{n_{r,k}(\epsilon)}\sum_{i=1}^{n_{r,k}( \epsilon)}\mathbf{x}_{i}^{\prime}+\mathbb{E}_{\mathbf{x}^{\prime}\sim q_{k,S-r \eta}^{\prime}(\mid\mathbf{x}^{\prime}\mid)}\big{[}\mathbf{x}^{\prime}\big{]}\bigg{\|} ^{2}}_{\text{Term\,3}.1}\] \[+\frac{2e^{-2(S-r\eta)}}{(1-e^{-2(S-r\eta)})^{2}}\cdot\underbrace {\bigg{\|}-\mathbb{E}_{\mathbf{x}^{\prime}\sim q_{k,S-r\eta}^{\prime}(\mid\mathbf{x }^{\prime}\mid)}\big{[}\mathbf{x}^{\prime}\big{]}+\mathbb{E}_{\mathbf{x}^{ \prime}\sim q_{k,S-r\eta}(\mid\mathbf{x}^{\prime}\mid)}\big{[}\mathbf{x}^{\prime} \big{]}\bigg{\|}^{2}}_{\text{Term\,3}.2}\]
+
+where \(q_{k,S-r\eta}^{\prime}(\cdot|\mathbf{x})\) is the underlying distribution of output particles, i.e., \(\mathbf{x}_{m_{k,r}(k,r)}^{\prime}\) in Alg 1. Considering that the distribution \(q_{k,S-r\eta}\) is strongly log-concave (given in Eq. 4) and we can get a lower bound on the strongly log-concave constant (see Lemma E.2). Therefore, \(q_{k,S-r\eta}^{\prime}\) also satisfies the log-Sobolev inequality due to Lemma F.8, which can imply the variance upper bound (see Lemma F.11). Then, in our proof, we directly make use of the Sobolev inequality to derive the high-probability bound (or concentration results) for estimating the mean of \(q_{k,S-r\eta}^{\prime}(\cdot|\mathbf{x})\) in Term 3.1 with Lemma E.7 by selecting sufficiently large \(n_{k,r}(\epsilon)\). Besides, Term 3.2 can be upper bounded by \(\operatorname{KL}\big{(}q_{k,S-r\eta}^{\prime}(\cdot|\mathbf{x})\|q_{k,S-r\eta}( \cdot|\mathbf{x})\big{)}\), which can be well controlled by conducting the ULA with a sufficiently large iteration number \(m_{k,r}(\epsilon)\). Therefore, by conducting the following decomposition
+
+\[\mathbb{P}\big{[}\big{\|}\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta }^{\leftarrow})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r\eta}^{ \leftarrow})\big{\|}^{2}\leq\epsilon\big{]}\] \[\geq(1-\delta)\mathbb{P}\Big{[}\bigcap_{\mathbf{x}^{\prime}\in\mathbb{ S}_{k,r}(\mathbf{x},\epsilon)}\big{\|}\nabla\log p_{k,0}(\mathbf{x}^{\prime})- \mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\big{\|}^{2}\leq l_{k,r}( \epsilon)\Big{]}.\]
+
+We only need to use this proof process recursively with a proper choice of \(\delta\) (\(\delta\) as a function of \(\epsilon\)) to get the bound:
+
+\[\mathbb{P}\big{[}\big{\|}\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta }^{\leftarrow})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r\eta}^{ \leftarrow})\big{\|}^{2}\leq\epsilon\big{]}\geq 1-\epsilon,\]
+
+which implies Term \(3\leq\tilde{O}(\epsilon)\) with a probability at least \(1-\epsilon\). Due to the large amount of computation, we defer the details of the recursive proof procedure and the choice of \(\delta\) to the Appendix E.3.
+
+## 5 Conclusion
+
+In this paper, we propose a novel non-parametric score estimation algorithm, i.e., RSE, presented in Alg 1 and derive its corresponding reverse diffusion sampling algorithm, i.e., RS-DMC, and outlined in Alg 2. By introducing the segment length \(S\) to balance the challenges of score estimation and recursive calls, RS-DMC exhibits several advantages over Langevin-based MCMC, e.g., ULA, ULD, and MALA. It can achieve KL convergence beyond isoperimetric target distributions with a quasi-polynomial gradient complexity, i.e.,
+
+\[\exp\big{[}\mathcal{O}(\log^{3}(d/\epsilon)\cdot\max\big{\{}\log\log Z^{2},1 \big{\}})\big{]}.\]
+
+Additionally, the theoretical result also demonstrates the efficiency of RS-DMC in challenging sampling tasks. To the best of our knowledge, this is the first work that eliminates the exponential dependence with only smoothness and the second moment bounded assumptions.
+
+## References
+
+* Anderson (1982) Brian DO Anderson. Reverse-time diffusion equation models. _Stochastic Processes and their Applications_, 12(3):313-326, 1982.
+* Balasubramanian et al. (2022) Krishna Balasubramanian, Sinho Chewi, Murat A Erdogdu, Adil Salim, and Shunshi Zhang. Towards a theory of non-log-concave sampling: first-order stationarity guarantees for langevin monte carlo. In _Conference on Learning Theory_, pp. 2896-2923. PMLR, 2022.
+* Chafai (2004) Djalil Chafai. Entropies, convexity, and functional inequalities, on \(\backslash phi\)-entropies and \(\backslash phi\)-sobolev inequalities. _Journal of Mathematics of Kyoto University_, 44(2):325-363, 2004.
+* Chen et al. (2023a) Hongrui Chen, Holden Lee, and Jianfeng Lu. Improved analysis of score-based generative modeling: User-friendly bounds under minimal smoothness assumptions. In _International Conference on Machine Learning_, pp. 4735-4763. PMLR, 2023a.
+* Chen et al. (2023b) Sitan Chen, Sinho Chewi, Jerry Li, Yuanzhi Li, Adil Salim, and Anru R Zhang. Sampling is as easy as learning the score: theory for diffusion models with minimal data assumptions. In _International Conference on Learning Representations_, 2023b.
+* Cheng and Bartlett (2018) Xiang Cheng and Peter Bartlett. Convergence of langevin mcmc in kl-divergence. In _Algorithmic Learning Theory_, pp. 186-211. PMLR, 2018.
+* Cheng et al. (2018) Xiang Cheng, Niladri S Chatterji, Peter L Bartlett, and Michael I Jordan. Underdamped langevin mcmc: A non-asymptotic analysis. In _Conference on learning theory_, pp. 300-323. PMLR, 2018.
+* Duane et al. (1987) Simon Duane, Anthony D Kennedy, Brian J Pendleton, and Duncan Roweth. Hybrid monte carlo. _Physics letters B_, 195(2):216-222, 1987.
+* Dwivedi et al. (2018) Raaz Dwivedi, Yuansi Chen, Martin J Wainwright, and Bin Yu. Log-concave sampling: Metropolis-hastings algorithms are fast! In _Conference on learning theory_, pp. 793-797. PMLR, 2018.
+* Erdogdu and Hosseinzadeh (2021) Murat A Erdogdu and Rasa Hosseinzadeh. On the convergence of langevin monte carlo: The interplay between tail growth and smoothness. In _Conference on Learning Theory_, pp. 1776-1822. PMLR, 2021.
+* Hale (2010) Jack K Hale. _Asymptotic behavior of dissipative systems_. Number 25. American Mathematical Soc., 2010.
+* Ho et al. (2020) Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. _Advances in neural information processing systems_, 33:6840-6851, 2020.
+* Holzmuller and Bach (2023) David Holzmuller and Francis Bach. Convergence rates for non-log-concave sampling and log-partition estimation. _arXiv preprint arXiv:2303.03237_, 2023.
+* Huang et al. (2023) Xunpeng Huang, Hanze Dong, Yifan Hao, Yian Ma, and Tong Zhang. Monte carlo sampling without isoperimetry: A reverse diffusion approach, 2023.
+* Lee et al. (2022) Holden Lee, Jianfeng Lu, and Yixin Tan. Convergence for score-based generative modeling with polynomial complexity. _arXiv preprint arXiv:2206.06227_, 2022.
+* Ma et al. (2015) Y.-A Ma, T. Chen, and E. Fox. A complete recipe for stochastic gradient MCMC. In _Advances in Neural Information Processing Systems (NIPS) 28_, pp. 2899-2907. 2015.
+* Ma et al. (2021) Yi-An Ma, Niladri S Chatterji, Xiang Cheng, Nicolas Flammarion, Peter L Bartlett, and Michael I Jordan. Is there an analog of Nesterov acceleration for gradient-based MCMC? _Bernoulli_, 27(3), 2021.
+* Menz and Schlichting (2014) Georg Menz and Andre Schlichting. Poincare and logarithmic sobolev inequalities by decomposition of the energy landscape. 2014.
+* Montanari (2023) Andrea Montanari. Sampling, diffusions, and stochastic localization. _arXiv preprint arXiv:2305.10690_, 2023.
+
+* Mou et al. (2021) Wenlong Mou, Yi-An Ma, Martin J Wainwright, Peter L Bartlett, and Michael I Jordan. High-order langevin diffusion yields an accelerated mcmc algorithm. _The Journal of Machine Learning Research_, 22(1):1919-1959, 2021.
+* Mousavi-Hosseini et al. (2023) Alireza Mousavi-Hosseini, Tyler Farghly, Ye He, Krishnakumar Balasubramanian, and Murat A Erdogdu. Towards a complete analysis of langevin monte carlo: Beyond poincar\(\backslash\)'e inequality. _arXiv preprint arXiv:2303.03589_, 2023.
+* Neal (2010) R. M. Neal. MCMC using Hamiltonian dynamics. _Handbook of Markov Chain Monte Carlo_, 54:113-162, 2010.
+* Neal (1992) Radford Neal. Bayesian learning via stochastic dynamics. _Advances in neural information processing systems_, 5, 1992.
+* Raginsky et al. (2017) Maxim Raginsky, Alexander Rakhlin, and Matus Telgarsky. Non-convex learning via stochastic gradient langevin dynamics: a nonasymptotic analysis. In _Conference on Learning Theory_, pp. 1674-1703. PMLR, 2017.
+* Roberts and Stramer (2002) G. O. Roberts and O. Stramer. Langevin diffusions and Metropolis-Hastings algorithms. _Methodol. Comput. Appl. Probab._, 4:337-357, 2002.
+* Roberts and Tweedie (1996) Gareth O Roberts and Richard L Tweedie. Exponential convergence of langevin distributions and their discrete approximations. _Bernoulli_, pp. 341-363, 1996.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In _International Conference on Machine Learning_, pp. 2256-2265. PMLR, 2015.
+* Song et al. (2020) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. In _International Conference on Learning Representations_, 2020.
+* Vargas et al. (2023) Francisco Vargas, Will Grathwohl, and Arnaud Doucet. Denoising diffusion samplers. _arXiv preprint arXiv:2302.13834_, 2023.
+* Vempala and Wibisono (2019) Santosh Vempala and Andre Wibisono. Rapid convergence of the unadjusted langevin algorithm: Isoperimetry suffices. _Advances in neural information processing systems_, 32, 2019.
+* Xifara et al. (2014) T. Xifara, C. Sherlock, S. Livingstone, S. Byrne, and M. Girolami. Langevin diffusions and the Metropolis adjusted Langevin algorithm. _Stat. Probabil. Lett._, 91:14-19, 2014.
+* Xu et al. (2018) Pan Xu, Jinghui Chen, Difan Zou, and Quanquan Gu. Global convergence of Langevin dynamics based algorithms for nonconvex optimization. In _Advances in Neural Information Processing Systems_, pp. 3126-3137, 2018.
+
+###### Contents
+
+* 1 Introduction
+* 2 Preliminaries
+* 3 Proposed Methods
+	* 3.1 Difficulties of the vanilla DMC
+	* 3.2 Intuition of the recursion
+	* 3.3 Recursive Score Estimation and Reverse Diffusion Sampling
+* 4 Analysis of RS-DMC
+	* 4.1 Theoretical Results
+	* 4.2 Proof Sketch
+* 5 Conclusion
+* A Notations
+* B Proof of Theorem 4.1
+* C Lemmas for Bounding Initialization Error
+* D Lemmas for Bounding Discretization Error.
+* E Lemmas for Bounding Score Estimation Error
+* E.1 Score Estimation Error from Empirical Mean
+* E.2 Score Estimation Error from Mean Gap
+* E.3 Core Lemmas
+* F Auxiliary Lemmas
+* F.1 The chain rule of KL divergence
+* G Empirical Results
+
+## Appendix A Notations
+
+In this section, we summarize the notations defined in Section 2 in Table 1 for easy reference and cross-checking. Additionally, another important notation is the score estimation, denoted as \(\mathbf{v}_{k,\tau\eta}^{\leftarrow}\), which is used to approximate \(\nabla\log p_{k,S-\tau\eta}\). When \(r=0\), \(\mathbf{v}_{k,0}^{\leftarrow}\) is expected to approximate \(\nabla\log p_{k,S}\) which is not explicitly defined in SDE 1. However, sine \(\mathbf{x}_{k,S}=\mathbf{x}_{k+1,0}\) in Eq 1, the underlying distributions, i.e., \(p_{k,S}\) and \(p_{k+1,0}\), are equal, and \(\tilde{\mathbf{v}}_{k,0}\) can be considered as the score estimation of \(\nabla\log p_{k+1,0}\). For \(\nabla\log p_{0,0}\), which can be calculated exactly as \(\nabla f_{*}\), we define
+
+\[\mathbf{v}_{-1,0}^{\leftarrow}(\mathbf{x})=\nabla\log p_{0,0}(\mathbf{x})=-\nabla f_{* }(\mathbf{x}) \tag{7}\]
+
+as a complement.
+
+Isopermetric conditions and assumptions.According to the classical theory of Markov chains and diffusion processes, some conditions can lead to fast convergence over time without being as strict as log concavity. Isoperimetric inequalities, such as the log-Sobolev inequality (LSI) or the Poincare inequality (PI), are examples of these conditions defined as follows.
+
+**Definition 1** (Logarithmic Sobolev inequality).: _A distribution with density function \(p\) satisfies the log-Sobolev inequality with a constant \(\mu>0\) if for all smooth function \(g\colon\mathbb{R}^{d}\to\mathbb{R}\) with \(\mathbb{E}_{p}[g^{2}]\leq\infty,\)_
+
+\[\mathbb{E}_{p}\left[g^{2}\log g^{2}\right]-\mathbb{E}_{p}\left[g^{2}\right]\log \mathbb{E}_{p}\left[g^{2}\right]\leq 2\alpha^{-1}\mathbb{E}_{p}\left[\left\| \nabla g\right\|^{2}\right].\]
+
+By supposing \(g=1+\epsilon\hat{g}\) with \(\epsilon\to 0\), a weaker isoperimetric inequality, i.e., PI can be defined Menz & Schlichting (2014).
+
+**Definition 2** (Poincare inequality).: _A distribution with density function \(p\) satisfies the Poincare inequality with a constant \(\mu>0\) if for all smooth function \(\hat{g}\colon\mathbb{R}^{d}\to\mathbb{R}\),_
+
+\[\mathrm{Var}(\hat{g})\leq\alpha^{-1}\mathbb{E}_{p}\left[\left\|\nabla\hat{g} \right\|^{2}\right].\]
+
+We also provide a list of constants used in our following proof in Table 2 to prevent confusion.
+
+## Appendix B Proof of Theorem 4.1
+
+**Theorem B.1**.: _The formal version of Theorem 4.1 In Alg 2, suppose we set_
+
+\[S=1/2\cdot\log(1+1/2L),\quad K=2\log[(Ld+M)/\epsilon]\cdot S^{- 1},\] \[\eta=C_{\eta}(M+d)^{-1}\epsilon,\quad R=S/\eta,\] \[l(\epsilon)=10\epsilon,\quad l_{k,r}(\epsilon)=\epsilon/960,\] \[n_{k,r}(\epsilon)=C_{n}\cdot(d+M)\epsilon^{-2}\cdot\max\{d,-2\log \delta\},\] \[m_{k,r}(\epsilon,\mathbf{x})=C_{m}\cdot(d+M)^{3}\epsilon^{-3}\cdot \max\{\log\|\mathbf{x}\|^{2},1\},\] \[\tau_{r}=2^{-5}\cdot 3^{-2}\cdot e^{2(S-\eta\eta)}\left(1-e^{-2(S- \eta\eta)}\right)^{2}\cdot d^{-1}\epsilon\]
+
+\begin{table}
+\begin{tabular}{c l} \hline \hline \multicolumn{1}{c}{
+\begin{tabular}{c} Symbol \\ \end{tabular} } & \multicolumn{1}{c}{Description} \\ \hline \(\varphi_{\sigma^{2}}\) & The density function of the centered Gaussian distribution, i.e., \(\mathcal{N}\left(\mathbf{0},\sigma^{2}\mathbf{I}\right)\). \\ \hline \(p_{*},p_{0,0}\) & The target density function (initial distribution of the forward process) \\ \hline \(\{\mathbf{x}_{k,t}\}_{k\in\mathbb{N}_{0,K-1,t}\in[0,S]}\) & The forward process, i.e., SDE 1 \\ \(p_{k,t}\) & The density function of \(\mathbf{x}_{k,t}\), i.e., \(\mathbf{x}_{k,t}\sim p_{k,t}\) \\ \(p_{\infty}\) & The density function of the stationary distribution of the forward process \\ \hline \(\{\mathbf{x}_{k,t}^{-}\}_{k\in\mathbb{N}_{0,K-1,t}\in[0,S]}\) & The practical reverse process following from SDE 2 with initial distribution \(p_{\infty}\) \\ \(p_{k,t}^{-}\) & The density function of \(\mathbf{x}_{k,t}^{-}\), i.e., \(\mathbf{x}_{k,t}^{-}\sim p_{k,t}^{+}\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: The list of notations defined in Section 2, where \(\mathbb{N}_{a,b}\) is denoted as the set of natural numbers from \(a\in\mathbb{N}_{*}\) to any \(b\in\mathbb{N}_{+}\).
+
+_where \(\delta\) satisfies_
+
+\[\delta= {\rm pow}\left(2,-\frac{2}{S}\log\frac{Ld+M}{\epsilon}\right)\cdot{ \rm pow}\left(\frac{C_{\eta}S\epsilon^{2}}{4(d+M)}\cdot\log^{-2}\left(\frac{Ld+M }{\epsilon}\right)\cdot{\rm pow}\left(\left(\frac{Ld+M}{\epsilon}\right),\right.\right.\] \[\left.\left.-C_{u,2}\log\frac{Ld+M}{\epsilon}-C_{u,3}\right), \frac{2}{S}\log\frac{Ld+M}{\epsilon}+1\right),\]
+
+_and the initial underlying distribution \(q^{\prime}_{0}\) of the Alg 1 with input \((k,r,\mathbf{x},\epsilon)\) satisfies_
+
+\[q^{\prime}_{0}(\mathbf{x}^{\prime})\propto\exp\left(-\frac{\left\|\mathbf{x}-e^{-(S-r \eta)}\mathbf{x}^{\prime}\right\|^{2}}{2(1-e^{-2(S-r\eta)})}\right),\]
+
+_we have_
+
+\[\mathbb{P}\left[{\rm KL}\left(\hat{p}_{0,S}\|p^{\leftarrow}_{0,S}\right)=\tilde {O}(\epsilon)\right]\geq 1-\epsilon.\]
+
+_In this condition, the gradient complexity will be_
+
+\[\exp\left[\mathcal{O}\left(\log^{3}\left((Ld+M)/\epsilon\right)\cdot\max\left\{ \log\log Z^{2},1\right\}\right)\right]\]
+
+_where \(Z\) is the maximal norm of particles appeared in Alg 2._
+
+Proof of Theorem b.1.: According to Lemma F.3, suppose \(\hat{\mathbf{x}}_{k,t}=\mathbf{x}_{k,S-t}\) whose SDE can be presented as
+
+\[\mathbf{x}^{\leftarrow}_{k,0}\sim p_{K-1,S}\ {\rm when}\ k=K-1,\ { \rm else}\ \mathbf{x}^{\leftarrow}_{k,0}=\mathbf{x}^{\leftarrow}_{k+1,S}\quad k \in\mathbb{N}_{0,K-1}\] \[\mathrm{d}\mathbf{x}^{\leftarrow}_{k,t}=\left[\mathbf{x}^{ \leftarrow}_{k,t}+2\nabla\log p_{k,S-t}(\mathbf{x}^{\leftarrow}_{k,t})\right] \mathrm{d}t+\sqrt{2}\mathrm{d}B_{t}\qquad k\in\mathbb{N}_{0,K-1},t\in[0,S]\]
+
+due to Chen et al. (2023b). Then, we have \({\rm KL}\left(p_{*}\|p^{\leftarrow}_{0,S}\right)={\rm KL}\left(\hat{p}_{0,S} \|p^{\leftarrow}_{0,S}\right)\) which satisfies
+
+\[{\rm KL}\left(\hat{p}_{0,S}\|p^{\leftarrow}_{0,S}\right)\leq \underbrace{{\rm KL}\left(\hat{p}_{K-1,0}\|p^{\leftarrow}_{K-1,0 }\right)}_{\text{Term 1}}\] \[+\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta}\mathbb{E}_{( \mathbf{x}_{k,t+r\eta},\mathbf{x}_{k,r\eta})}\left[\left\|\nabla\log p_{k,S-(t +r\eta)}(\mathbf{x}_{k,t+r\eta})-\mathbf{v}^{\leftarrow}_{k,r\eta}(\hat{ \mathbf{x}}_{k,r\eta})\right\|^{2}\right]\mathrm{d}t. \tag{8}\]
+
+Upper bound Term 1.: Term 1 can be upper-bounded as
+
+\[\text{Term 1}={\rm KL}\left(p_{K-1,S}\|p^{\leftarrow}_{K-1,0}\right)\leq(Ld+M) \cdot\exp\left(-KS/2\right)\]
+
+with Lemma C.3 when \(p^{\leftarrow}_{K-1,0}\) is chosen as the standard Gaussian. Therefore, we choose
+
+\[S=\frac{1}{2}\log\frac{2L+1}{2L},\quad K=2\log\frac{Ld+M}{\epsilon}\cdot\left( \frac{1}{2}\log\frac{2L+1}{2L}\right)^{-1},\quad\text{and}\quad KS\geq 2\log \frac{Ld+M}{\epsilon},\]
+
+which make the inequality Term 1\(\leq\epsilon\) establish.
+
+For the remaining term of RHS of Eq 8, it can be decomposed as follows:
+
+\[\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta}\mathbb{E}_{(\hat {\mathbf{x}}_{k,t+r\eta},\hat{\mathbf{x}}_{k,r\eta})}\left[\left\|\nabla\log p _{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,t+r\eta})-\mathbf{v}^{\leftarrow}_{k,r \eta}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right]\mathrm{d}t \tag{9}\] \[\leq\underbrace{2\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta} \mathbb{E}\left[\left\|\nabla\log p_{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,t+r \eta})-\nabla\log p_{k,S-r\eta}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right] \mathrm{d}t}_{\text{Term 2}}\] \[+\underbrace{2\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta} \mathbb{E}_{(\hat{\mathbf{x}}_{k,t+r\eta},\hat{\mathbf{x}}_{k,r\eta})}\left[ \left\|\nabla\log p_{k,S-r\eta}(\hat{\mathbf{x}}_{k,r\eta})-\mathbf{v}^{ \leftarrow}_{k,r\eta}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right]\mathrm{d} t}_{\text{Term 3}}\]Upper bound Term 2.This term is mainly from the discretization error in the reverse process. Therefore, its analysis is highly related to Chen et al. (2023b;a). To ensure the completeness of our proof, we have included it in our analysis, utilizing the segmented notation presented in Section A. Specifically, we have
+
+\[\mathrm{Term}\;2\leq 4\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta}\mathbb{E}\left[ \left\|\nabla\log p_{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,t+r\eta})-\nabla\log p_ {k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right]\] \[+4\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta}\mathbb{E}\left[ \left\|\nabla\log\frac{p_{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,r\eta})}{p_{k,S-r \eta}(\hat{\mathbf{x}}_{k,r\eta})}\right\|^{2}\right]\mathrm{d}t\] \[\leq 4\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta}\left(\mathbb{E} \left[L^{2}\left\|\hat{\mathbf{x}}_{k,t+r\eta}-\hat{\mathbf{x}}_{k,r\eta} \right\|^{2}\right]+\mathbb{E}\left[\left\|\nabla\log\frac{p_{k,S-r\eta}(\hat{ \mathbf{x}}_{k,r\eta})}{p_{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,r\eta})}\right\| ^{2}\right]\right)\mathrm{d}t\]
+
+where the last inequality follows from Assumption **[A1]**. Combining this result with Lemma D.4, when the stepsize, i.e., \(\eta\) of the reverse process is \(\eta=C_{\eta}(M+d)^{-1}\epsilon\), then it has Term \(2\leq\epsilon\).
+
+Upper bound Term 3.Due to the randomness of \(\mathbf{v}_{k,r\eta}^{+}\), we consider a high probability bound, which is formulated as
+
+\[\mathbb{P}\left[\bigcap_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1} \\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x }_{k,r\eta}^{+})-\mathbf{v}_{k,r\eta}^{+}(\mathbf{x}_{k,r\eta}^{-})\right\|^{2 }\leq 10\epsilon\right]\geq 1-\epsilon, \tag{10}\]
+
+which means we choose \(l(\epsilon)=10\epsilon\). Lemma E.10 demonstrate that under the following settings, i.e.,
+
+\[l_{k,r}(\epsilon) =\epsilon/960,\] \[n_{k,r}(\epsilon) =C_{n}\cdot(d+M)\epsilon^{-2}\cdot\max\{d,-2\log\delta\},\] \[m_{k,r}(\epsilon,\boldsymbol{x}) =C_{m}\cdot(d+M)^{3}\epsilon^{-3}\cdot\max\{\log\|\boldsymbol{x}\|^{2 },1\},\]
+
+where \(\delta\) satisfies
+
+\[\delta\coloneqq \mathrm{pow}\left(2,-\frac{2}{S}\log\frac{Ld+M}{\epsilon}\right) \cdot\mathrm{pow}\left(\frac{C_{\eta}S\epsilon^{2}}{4(d+M)}\cdot\log^{-2} \left(\frac{Ld+M}{\epsilon}\right)\cdot\mathrm{pow}\left(\left(\frac{Ld+M}{ \epsilon}\right),\right.\right.\] \[\left.\left.-C_{u,2}\log\frac{Ld+M}{\epsilon}-C_{u,3}\right), \frac{2}{S}\log\frac{Ld+M}{\epsilon}+1\right),\]
+
+Eq 10 can be achieved with a gradient complexity:
+
+\[\exp\left[\mathcal{O}\left(\log^{3}\left((Ld+M)/\epsilon\right)\cdot\max\left\{ \log\log Z^{2},1\right\}\right)\right]\]
+
+where \(Z\) is the maximal norm of particles appeared in Alg 2. All constants can be found in Table 2. In this condition, we have
+
+\[\mathrm{Term}\;3\leq 4\cdot\frac{T}{\eta}\cdot(\eta\cdot 10\epsilon)\leq 40 \epsilon\log\frac{Ld+M}{\epsilon}=\tilde{O}(\epsilon).\]
+
+Combining the upper bound of Term 1, Term 2 and Term 3, we have
+
+\[\mathrm{KL}\left(\hat{p}_{0,S}\|p_{0,S}^{-}\right)=\tilde{O}(\epsilon).\]
+
+The proof is completed. 
+
+**Corollary B.2**.: _Suppose we set all parameters except for \(\delta\) to be the same as that in Theorem B.1, and define_
+
+\[\delta= \mathrm{pow}\left(2,-\frac{2}{S}\log\frac{Ld+M}{\epsilon}\right) \cdot\mathrm{pow}\left(\frac{C_{\eta}S\epsilon\delta^{\prime}}{4(d+M)}\cdot \log^{-2}\left(\frac{Ld+M}{\epsilon}\right)\cdot\mathrm{pow}\left(\left(\frac{ Ld+M}{\epsilon}\right),\right.\right.\] \[\left.\left.-C_{u,2}\log\frac{Ld+M}{\epsilon}-C_{u,3}\right), \frac{2}{S}\log\frac{Ld+M}{\epsilon}+1\right),\]we have_
+
+\[\mathbb{P}\left[\mathrm{KL}\left(\hat{p}_{0,S}\|p_{0,S}^{\leftarrow}\right)=\tilde {O}(\epsilon)\right]\geq 1-\delta^{\prime}.\]
+
+_In this condition, the gradient complexity will be_
+
+\[\exp\left[\mathcal{O}\left(\max\left\{\left(\log\frac{Ld+M}{\epsilon}\right)^{3 },\log\frac{Ld+M}{\epsilon}\cdot\log\frac{1}{\delta^{\prime}}\right\}\cdot\max \left\{\log\log Z^{2},1\right\}\right)\right]\]
+
+_where \(Z\) is the maximal norm of particles appeared in Alg 2._
+
+Proof.: In this corollary, we follow the same proof roadmap as that shown in Theorem B.1. Combining Eq 8 and Eq 9, we have
+
+\[\mathrm{KL}\left(\hat{p}_{0,S}\|p_{0,S}^{\leftarrow}\right)\leq \underbrace{\mathrm{KL}\left(\hat{p}_{K-1,0}\|p_{K-1,0}^{ \leftarrow}\right)}_{\mathrm{Term}1} \tag{11}\] \[\leq 2\underbrace{\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta} \mathbb{E}\left[\left\|\nabla\log p_{k,S-(t+\eta)}(\hat{\mathbf{x}}_{k,t+\eta \eta})-\nabla\log p_{k,S-r\eta}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right] \mathrm{d}t}_{\mathrm{Term}2}\] \[+ 2\underbrace{\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta} \mathbb{E}_{(\hat{\mathbf{x}}_{k,t+\eta},\hat{\mathbf{x}}_{k,r\eta})}\left[ \left\|\nabla\log p_{k,S-r\eta}(\hat{\mathbf{x}}_{k,r\eta})-\mathbf{v}_{k,r \eta}^{\leftarrow}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right] \mathrm{d}t}_{\mathrm{Term}3}\]
+
+It should be noted that the techniques for upper-bounding \(\mathrm{Term}\)\(1\) and \(\mathrm{Term}\)\(2\) are the same as that in Theorem B.1.
+
+Upper bound Term 3.Due to the randomness of \(\mathbf{v}_{k,r\eta}^{\leftarrow}\), we consider a high probability bound, which is formulated as
+
+\[\mathbb{P}\left[\bigcap_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x }_{k,r\eta}^{\leftarrow})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r \eta}^{\leftarrow})\right\|^{2}\leq 10\epsilon\right]\geq 1-\delta^{\prime}, \tag{12}\]
+
+which means we choose \(l(\epsilon)=10\epsilon\). Lemma E.11 demonstrate that under the following settings, i.e.,
+
+\[l_{k,r}(\epsilon)=\epsilon/960,\] \[n_{k,r}(\epsilon)=C_{n}\cdot(d+M)\epsilon^{-2}\cdot\max\{d,-2 \log\delta\},\] \[m_{k,r}(\epsilon,\mathbf{x})=C_{m}\cdot(d+M)^{3}\epsilon^{-3}\cdot \max\{\log\|\mathbf{x}\|^{2},1\},\]
+
+where \(\delta\) satisfies
+
+\[\delta\coloneqq \mathrm{pow}\left(2,-\frac{2}{S}\log\frac{Ld+M}{\epsilon}\right) \cdot\mathrm{pow}\left(\frac{C_{n}S\epsilon\delta^{\prime}}{4(d+M)}\cdot\log^ {-2}\left(\frac{Ld+M}{\epsilon}\right)\cdot\mathrm{pow}\left(\left(\frac{Ld+ M}{\epsilon}\right),\right.\right.\] \[\left.\left.-C_{u,2}\log\frac{Ld+M}{\epsilon}-C_{u,3}\right), \frac{2}{S}\log\frac{Ld+M}{\epsilon}+1\right),\]
+
+Eq 12 can be achieved with a gradient complexity:
+
+\[\exp\left[\mathcal{O}\left(\max\left\{\left(\log\frac{Ld+M}{\epsilon}\right)^ {3},\log\frac{Ld+M}{\epsilon}\cdot\log\frac{1}{\delta^{\prime}}\right\}\cdot \max\left\{\log\log Z^{2},1\right\}\right)\right]\]
+
+where \(Z\) is the maximal norm of particles appeared in Alg 2. All constants can be found in Table 2. In this condition, we have
+
+\[\mathrm{Term}\;3\leq 4\cdot\frac{T}{\eta}\cdot(\eta\cdot 10\epsilon)\leq 40 \epsilon\log\frac{Ld+M}{\epsilon}=\tilde{O}(\epsilon).\]
+
+Combining the upper bound of \(\mathrm{Term}\)\(1\), \(\mathrm{Term}\)\(2\) and \(\mathrm{Term}\)\(3\), we have
+
+\[\mathrm{KL}\left(\hat{p}_{0,S}\|p_{0,S}^{\leftarrow}\right)=\tilde{O}(\epsilon).\]
+
+The proof is completed.
+
+## Appendix C Lemmas for Bounding Initialization Error
+
+**Lemma C.1** (Lemma 11 in Vempala and Wibisono (2019)).: _Suppose \(p\propto\exp(-f)\) and \(f\colon\mathbb{R}^{d}\to\mathbb{R}\) is \(L\)-gradient Lipschitz continuous function. Then, we have_
+
+\[\mathbb{E}_{\mathbf{x}\sim p}\left[\left\|\nabla f(\mathbf{x})\right\|^{2} \right]\leq Ld\]
+
+**Lemma C.2**.: _Under the notation in Section A, suppose \(p\propto\exp(-f)\) satisfies Assumption **[A\({}_{1}\)]** and **[A\({}_{2}\)]**, then we have_
+
+\[\operatorname{KL}\left(p\|\varphi_{1}\right)\leq Ld+M\]
+
+Proof.: From the analytic form of the standard Gaussian, we have \(\nabla^{2}\log\varphi_{1}=\mathbf{I}\). Combining this fact with Lemma F.4, we have
+
+\[\operatorname{KL}\left(p\|\varphi_{1}\right)\leq \frac{1}{2}\int p(\mathbf{x})\left\|\nabla\log\frac{p(\mathbf{x})}{ \varphi_{1}(\mathbf{x})}\right\|^{2}\mathrm{d}\mathbf{x}\] \[\leq \int p(\mathbf{x})\left\|\nabla f(\mathbf{x})\right\|^{2}\mathrm{d}\mathbf{x }+\int p(\mathbf{x})\left\|\mathbf{x}\right\|^{2}\mathrm{d}\mathbf{x}\leq Ld+M.\]
+
+where the last inequality follows from Lemma C.1 and Assumption **[A\({}_{2}\)]**. Hence, the proof is completed. 
+
+**Lemma C.3** (Variant of Theorem 4 in Vempala and Wibisono (2019)).: _Under the notation in Section A, suppose \(\tilde{p}_{K-1,0}\) is chosen as the standard Gaussian distribution. Then, we have_
+
+\[\operatorname{KL}\left(p_{K-1,8}\|p_{\infty}\right)\leq(Ld+M)\cdot\exp\left(- KS/2\right).\]
+
+Proof.: Suppose another random variable \(\mathbf{z}_{t}\coloneqq\mathbf{x}_{\lfloor t/S\rfloor,t-\lfloor t/S\rfloor \cdot S}\) where \(\mathbf{x}_{k,t}\) is shown in SDE 1, we have
+
+\[\mathrm{d}\mathbf{z}_{t}=-\mathbf{z}_{t}\mathrm{d}t+\sqrt{2}\mathrm{d}B_{t}, \quad\mathbf{z}_{0}=\mathbf{x}_{0,0},\]
+
+where the underlying distribution of \(\mathbf{x}_{0,0}\) satisfies \(p_{0,0}=p_{*}\propto\exp(-f_{*})\). If we denote \(\mathbf{z}_{t}\sim p_{t}^{(z)}\), then Fokker-Planck equation of the previous SDE will be
+
+\[\partial_{t}p_{t}^{(z)}(\mathbf{z})=\nabla\cdot\left(p_{t}^{(z)}(\mathbf{z})\mathbf{z} \right)+\Delta p_{t}^{(z)}(\mathbf{z})=\nabla\cdot\left(p_{t}^{(z)}(\mathbf{z})\nabla \log\frac{p_{t}^{(z)}(\mathbf{z})}{\exp\left(-\frac{1}{2}\|\mathbf{z}\|^{2}\right)} \right).\]
+
+It implies that the stationary distribution is standard Gaussian, i.e., \(p_{\infty}^{(z)}\propto\exp(-1/2\cdot\|\mathbf{z}\|^{2})\). Then, we consider the KL convergence of \((\mathbf{z}_{t})_{t\geq 0}\), and have
+
+\[\frac{\operatorname{dKL}\left(p_{t}^{(z)}\|p_{\infty}^{(z)}\right) }{\mathrm{d}t}=\frac{\mathrm{d}}{\mathrm{d}t}\int p_{t}^{(z)}(\mathbf{z})\log\frac {p_{t}^{(z)}(\mathbf{z})}{p_{\infty}^{(z)}(\mathbf{z})}\mathrm{d}\mathbf{z}=\int\partial_ {t}p_{t}^{(z)}(\mathbf{z})\log\frac{p_{t}^{(z)}(\mathbf{z})}{p_{\infty}^{(z)}(\mathbf{z})} \mathrm{d}\mathbf{z} \tag{13}\] \[=\int\nabla\cdot\left(p_{t}^{(z)}(\mathbf{z})\nabla\log\frac{p_{t}^{ (z)}(\mathbf{z})}{p_{\infty}^{(z)}(\mathbf{z})}\right)\cdot\log\frac{p_{t}^{(z)}(\bm {z})}{p_{\infty}^{(z)}(\mathbf{z})}\mathrm{d}\mathbf{z}=-\int p_{t}^{(z)}(\mathbf{z}) \left\|\nabla\log\frac{p_{t}^{(z)}(\mathbf{z})}{p_{\infty}^{(z)}(\mathbf{z})}\right\| ^{2}\mathrm{d}\mathbf{z}.\]
+
+Combining the fact \(\nabla^{2}(-\log p_{\infty}^{(z)})=\mathbf{I}\) and Lemma F.4, we have
+
+\[\operatorname{KL}\left(p_{t}^{(z)}\|p_{\infty}^{(z)}\right)\leq 2\int p_{t}^{(z)} (\mathbf{z})\left\|\nabla\log\frac{p_{t}^{(z)}(\mathbf{z})}{p_{\infty}^{(z)}(\mathbf{z})} \right\|^{2}\mathrm{d}\mathbf{z}.\]
+
+Plugging this inequality into Eq 13, we have
+
+\[\frac{\operatorname{dKL}\left(p_{t}^{(z)}\|p_{\infty}^{(z)}\right)}{\mathrm{d} t}=-\int p_{t}^{(z)}(\mathbf{z})\left\|\nabla\log\frac{p_{t}^{(z)}(\mathbf{z})}{p_{ \infty}^{(z)}(\mathbf{z})}\right\|^{2}\mathrm{d}\mathbf{z}\leq-\frac{1}{2}\mathrm{KL} \left(p_{t}^{(z)}\|p_{\infty}^{(z)}\right).\]
+
+Integrating implies the desired bound,i.e.,
+
+\[\operatorname{KL}\left(p_{t}^{(z)}\|p_{\infty}^{(z)}\right)\leq \exp\left(-t/2\right)\cdot\operatorname{KL}\left(p_{t}^{(z)}\|p_{\infty}^{(z) }\right)\leq(Ld+M)\cdot\exp\left(-t/2\right)\]
+
+where the last inequality follows from Lemma C.2. It implies KL divergence between the underlying distribution of \(\mathbf{x}_{K-1,S}\) and \(p_{\infty}\) is
+
+\[\operatorname{KL}\left(p_{K-1,S}\|p_{\infty}\right)=\operatorname{KL}\left(p_{ KS}^{(z)}\|p_{\infty}^{(z)}\right)\leq(Ld+M)\cdot\exp\left(-KS/2\right)\]
+
+Hence, the proof is completed.
+
+## Appendix D Lemmas for Bounding Discretization Error.
+
+**Lemma D.1** (Lemma C.11 in Lee et al. (2022)).: _Suppose that \(p(\mathbf{x})\propto e^{-f(\mathbf{x})}\) is a probability density function on \(\mathbb{R}^{d}\), where \(f(\mathbf{x})\) is \(L\)-smooth, and let \(\varphi_{\sigma^{2}}(\mathbf{x})\) be the density function of \(\mathcal{N}(\mathbf{0},\sigma^{2}\mathbf{I}_{d})\). Then for \(L\leq\frac{1}{2\sigma^{2}}\), it has_
+
+\[\left\|\nabla\log\frac{p(\mathbf{x})}{(p*\varphi_{\sigma^{2}})\left(\mathbf{x}\right)} \right\|\leq 6L\sigma d^{1/2}+2L\sigma^{2}\left\|\nabla f(\mathbf{x})\right\|.\]
+
+**Lemma D.2** (Lemma 9 in Chen et al. (2023b)).: _Under the notation in Section A, suppose that Assumption **[A\({}_{1}\)]** and **[A\({}_{2}\)]** hold. For any \(k\in\mathbb{N}_{0,K-1}\) and \(t\in[0,S]\), we have_
+
+1. _Moment bound, i.e.,_ \[\mathbb{E}\left[\left\|\mathbf{x}_{k,t}\right\|^{2}\right]\leq d\lor M.\]
+2. _Score function bound, i.e.,_ \[\mathbb{E}\left[\left\|\nabla\log p_{k,t}(\mathbf{x}_{k,t})\right\|^{2}\right] \leq Ld.\]
+
+**Lemma D.3** (Variant of Lemma 10 in Chen et al. (2023b)).: _Under the notation in Section A,Suppose that Assumption **[A\({}_{2}\)]** holds. For any \(k\in\{0,1,\ldots,K-1\}\) and \(0\leq s\leq t\leq S\), we have_
+
+\[\mathbb{E}\left[\left\|\mathbf{x}_{k,t}-\mathbf{x}_{k,s}\right\|^{2}\right]\leq 2 \left(M+d\right)\cdot(t-s)^{2}+4d\cdot(t-s)\]
+
+Proof.: According to the forward process, we have
+
+\[\mathbb{E}\left[\left\|\mathbf{x}_{k,t}-\mathbf{x}_{k,s}\right\|^ {2}\right]= \mathbb{E}\left[\left\|\int_{s}^{t}-\mathbf{x}_{k,r}\mathrm{d}r+ \sqrt{2}\left(B_{t}-B_{s}\right)\right\|^{2}\right]\leq\mathbb{E}\left[2\left\| \int_{s}^{t}\mathbf{x}_{k,r}\mathrm{d}r\right\|^{2}+4\left\|B_{t}-B_{s}\right\| ^{2}\right]\] \[\leq 2\mathbb{E}\left[\left(\int_{s}^{t}\left\|\mathbf{x}_{k,r}\right\| \mathrm{d}r\right)^{2}\right]+4d\cdot(t-s)\leq 2\int_{s}^{t}\mathbb{E} \left[\left\|\mathbf{x}_{k,r}\right\|^{2}\right]\mathrm{d}r\cdot(t-s)+4d\cdot( t-s)\] \[\leq 2\left(M+d\right)\cdot(t-s)^{2}+4d\cdot(t-s)\,,\]
+
+where the third inequality follows from Holder's inequality and the last one follows from Lemma D.2. Hence, the proof is completed. 
+
+**Lemma D.4** (Errors from the discretization).: _Under the notation in Section A, if the step size of the outer loops satisfies_
+
+\[\eta\leq C_{1}(d+M)^{-1}\epsilon,\]
+
+_then, for any \(k\in\{0,1,\ldots,K-1\}\), \(r\in\{0,1,\ldots,R-1\}\) and \(t\in[0,\eta]\), we have_
+
+\[\mathbb{E}\left[L^{2}\left\|\hat{\mathbf{x}}_{k,t+r\eta}-\hat{\mathbf{x}}_{k,r \eta}\right\|^{2}\right]+\mathbb{E}\left[\left\|\nabla\log\frac{p_{k,S-r\eta} (\hat{\mathbf{x}}_{k,r\eta})}{p_{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,r\eta})} \right\|^{2}\right]\leq 4\epsilon.\]
+
+Proof.: We consider the following formulation with any \(t\in[0,\eta]\),
+
+\[\text{Term 2}=\underbrace{\mathbb{E}\left[\left\|\nabla\log\frac{p_{k,S-r\eta} (\hat{\mathbf{x}}_{k,r\eta})}{p_{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,r\eta})} \right\|^{2}\right]}_{\text{Term 2}.1}+\mathbb{E}\left[L^{2}\left\|\hat{\mathbf{x}}_{k,t+r \eta}-\hat{\mathbf{x}}_{k,r\eta}\right\|^{2}\right]. \tag{14}\]
+
+Upper bound Term 2.1.To establish the connection between \(p_{k,S-r\eta}\) and \(p_{k,S-(t+r\eta)}\), due to the transition kernel of the forward process (OU process), we have
+
+\[p_{k,S-r\eta}(\mathbf{x})= \int p_{k,S-(r\eta+t)}(\mathbf{y})\cdot\mathbb{P}\left[\mathbf{x},(k,S-r \eta)|\mathbf{y},(S-(r\eta+t))\right]\mathrm{d}\mathbf{y} \tag{15}\] \[= \int p_{k,S-(r\eta+t)}(\mathbf{y})\cdot\left(2\pi\left(1-e^{-2t} \right)\right)^{-\frac{d}{2}}\cdot\exp\left[\frac{-\left\|\mathbf{x}-e^{-t}y \right\|^{2}}{2(1-e^{-2t})}\right]\mathrm{d}\mathbf{y}\] \[= \int e^{td}p_{k,S-(r\eta+t)}(e^{t}\mathbf{z})\cdot\left(2\pi\left(1-e ^{-2t}\right)\right)^{-\frac{d}{2}}\cdot\exp\left[\frac{-\left\|\mathbf{x}-\mathbf{z} \right\|^{2}}{2(1-e^{-2t})}\right]\mathrm{d}\mathbf{z}\]where the last equation follows from setting \(\mathbf{z}\coloneqq e^{-t}\mathbf{y}\). We define
+
+\[p^{\prime}_{k,S-(r\eta+t)}(\mathbf{z})\coloneqq e^{td}p_{k,S-(r\eta+t)}(e^{t}\mathbf{z})\]
+
+which is also a density function. Therefore, for each element \(\hat{\mathbf{x}}_{k,r\eta}=\mathbf{x}\), we have
+
+\[\left\|\nabla\log\frac{p_{k,S-(r\eta+t)}(\mathbf{x})}{p_{k,S-r\eta}( \mathbf{x})}\right\|^{2}\leq 2\left\|\nabla\log\frac{p_{k,S-(r\eta+t)}(\mathbf{x})}{p_{k,S-(r\eta +t)}^{\prime}(\mathbf{x})}\right\|^{2}+2\left\|\nabla\log\frac{p^{\prime}_{k,S-(r \eta+t)}(\mathbf{x})}{p_{k,S-r\eta}(\mathbf{x})}\right\|^{2}\] \[= 2\left\|\nabla\log\frac{p_{k,S-(r\eta+t)}(\mathbf{x})}{p_{k,S-(r\eta +t)}^{\prime}(\mathbf{x})}\right\|^{2}+2\left\|\nabla\log\frac{p^{\prime}_{k,S-(r \eta+t)}(\mathbf{x})}{p^{\prime}_{k,S-(r\eta+t)}*\varphi_{(1-e^{-2t})}(\mathbf{x})} \right\|^{2}\]
+
+where the last inequality follows from Eq 15. For the first term, we have
+
+\[\left\|\nabla\log\frac{p_{k,S-(r\eta+t)}(\mathbf{x})}{p^{\prime}_{k,S- (r\eta+t)}(\mathbf{x})}\right\|=\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})-e^{t} \cdot\nabla\log p_{k,S-(r\eta+t)}(e^{t}\mathbf{x})\right\| \tag{16}\] \[\leq\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})-e^{t}\nabla\log p _{k,S-(r\eta+t)}(\mathbf{x})\right\|\] \[\quad+e^{t}\cdot\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})- \nabla\log p_{k,S-(r\eta+t)}(e^{t}\mathbf{x})\right\|\] \[\quad=(e^{t}-1)\cdot\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x}) \right\|+e^{t}\cdot(e^{t}-1)L\left\|\mathbf{x}\right\|.\]
+
+To upper bound the latter term, we expect to employ Lemma D.1. However, it requires a specific condition which denotes the smoothness of \(-\nabla\log p^{\prime}_{k,S-(r\eta+t)}\) should be upper bounded with the variance of \(\varphi_{(1-e^{-2t})}\) as
+
+\[\left\|-\nabla^{2}\log p^{\prime}_{k,S-(r\eta+t)}\right\|\leq\frac{1}{2(1-e^{ -2t})},\]
+
+which can be achieved by setting
+
+\[\eta\leq\min\left\{\frac{1}{4L},\frac{1}{2}\right\}.\]
+
+Since the smoothness of \(-\nabla\log p_{k,S-(r\eta+t)}\), i.e., Assumption **[A,1]**, implies \(-\nabla\log p^{\prime}_{k,S-(r\eta+t)}\) is \(e^{2t}L\)-smooth. Besides, there are
+
+\[t\leq\eta\leq\min\left\{\frac{1}{4L},\frac{1}{2}\right\}\leq\log\left(1+\frac{ 1}{2L}\right)\quad\text{ and }\quad e^{2t}L\leq\frac{1}{2(1-e^{-2t})}.\]
+
+Therefore, we have
+
+\[\left\|\nabla\log p^{\prime}_{k,S-(r\eta+t)}(\mathbf{x})-\nabla\log \left(p^{\prime}_{k,S-(r\eta+t)}*\varphi_{(1-e^{-2t})}\right)(\mathbf{x})\right\| \tag{17}\] \[\leq 6e^{2t}L\sqrt{1-e^{-2t}}d^{1/2}+2e^{3t}L(1-e^{-2t})\left\|\nabla \log p_{k,S-(r\eta+t)}(e^{t}\mathbf{x})\right\|\] \[\leq 6e^{2t}L\sqrt{1-e^{-2t}}d^{1/2}+2L\cdot e^{t}(e^{2t}-1)\left\| \nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})\right\|\] \[+2L\cdot e^{t}(e^{2t}-1)\left\|\nabla\log p_{k,S-(r\eta+t)}(e^{t} \mathbf{x})-\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})\right\|\] \[\leq 6e^{2t}L\sqrt{1-e^{-2t}}d^{1/2}+2L\cdot e^{t}(e^{2t}-1)\left\| \nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})\right\|\] \[+2L^{2}\cdot e^{t}(e^{2t}-1)(e^{t}-1)\left\|\mathbf{x}\right\|,\]
+
+where the first inequality follows from Lemma D.1, the last inequality follows from Assumption **[A,1]**. Due to the range, i.e., \(\eta\leq 1/2\), we have the following inequalities
+
+\[e^{2t}\leq e^{2\eta}\leq 1+4\eta\leq 3,\quad 1-e^{-2t}\leq 2t\leq 2\eta\quad \text{and}\quad e^{t}\leq e^{\eta}\leq 1+\frac{3}{2}\cdot\eta.\]
+
+In this condition, Eq 16 can be reformulated as
+
+\[\left\|\nabla\log\frac{p_{k,S-(r\eta+t)}(\mathbf{x})}{p^{\prime}_{k, S-(r\eta+t)}(\mathbf{x})}\right\|^{2}\leq 2\left[(e^{t}-1)^{2}\cdot\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x}) \right\|^{2}+e^{2t}\cdot(e^{t}-1)^{2}L^{2}\left\|\mathbf{x}\right\|^{2}\right]\] \[\leq 5\eta^{2}\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})\right\|^{2} +14L^{2}\eta^{2}\left\|\mathbf{x}\right\|^{2},\]and Eq 17 implies
+
+\[\left\|\nabla\log p^{\prime}_{k,S-(r\eta+t)}(\mathbf{x})-\nabla\log\left( p^{\prime}_{k,S-(r\eta+t)}*\phi_{(1-e^{-2t})}\right)(\mathbf{x})\right\|^{2}\] \[\leq 3\cdot\left[6^{2}e^{4t}L^{2}(1-e^{-2t})d+4L^{2}e^{2t}(e^{2t}-1)^{ 2}\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})\right\|^{2}+4L^{4}e^{2t}(e^{2t}- 1)^{2}(e^{t}-1)^{2}\left\|\mathbf{x}\right\|^{2}\right]\] \[\leq 3\cdot\left[2^{3}\cdot 3^{4}L^{2}\eta d+2^{6}\cdot 3L^{2} \eta^{2}\left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})\right\|^{2}+3^{3}\cdot 2 ^{4}L^{4}\eta^{4}\left\|\mathbf{x}\right\|^{2}\right]\] \[\leq 2^{3}\cdot 3^{5}L^{2}\eta d+2^{6}\cdot 3^{2}L^{2}\eta^{2} \left\|\nabla\log p_{k,S-(r\eta+t)}(\mathbf{x})\right\|^{2}+3^{4}\cdot L^{2}\eta^ {2}\left\|\mathbf{x}\right\|^{2},\]
+
+where the last inequality follows from \(\eta L\leq 1/4\). Hence, suppose \(L\geq 1\) without loss of generality, we have
+
+\[\text{Term 2.1}\leq 2\cdot\left(\mathbb{E}\left[\left\|\nabla \log\frac{p_{k,S-(r\eta+t)}(\hat{\mathbf{x}}_{k,r\eta})}{p^{\prime}_{k,S-(r\eta +t)}(\hat{\mathbf{x}}_{k,r\eta})}\right\|^{2}\right]+\mathbb{E}\left[\left\| \nabla\log\frac{p^{\prime}_{k,S-(r\eta+t)}(\hat{\mathbf{x}}_{k,r\eta})}{p_{k,S- r\eta}(\hat{\mathbf{x}}_{k,r\eta})}\right\|^{2}\right]\right)\] \[\leq 2^{4}\cdot 3^{5}L^{2}\eta d+2^{8}\cdot 3^{2}L^{2}\eta^{2} \mathbb{E}\left[\left\|\nabla\log p_{k,S-(r\eta+t)}(\hat{\mathbf{x}}_{k,r\eta} )\right\|^{2}\right]+2^{2}\cdot 3^{4}L^{2}\eta^{2}\mathbb{E}\left[\left\|\hat{\mathbf{x}}_{k,r \eta}\right\|^{2}\right]\] \[\leq 2^{14}L^{2}\eta d+2^{13}L^{2}\eta^{2}\mathbb{E}\left[\left\| \hat{\mathbf{x}}_{k,r\eta+t}\right\|^{2}\right]+2^{13}L^{4}\eta^{2}\mathbb{E} \left[\left\|\hat{\mathbf{x}}_{k,r\eta+t}-\hat{\mathbf{x}}_{k,r\eta}\right\|^{ 2}\right]\] \[+2^{10}L^{2}\eta^{2}\mathbb{E}\left[\left\|\hat{\mathbf{x}}_{k,r \eta}\right\|^{2}\right].\]
+
+Therefore, we have
+
+\[\text{Term 2}\leq 2^{14}L^{2}\eta d+2^{10}L^{2}\eta^{2}\mathbb{E}\left[\left\| \hat{\mathbf{x}}_{k,r\eta}\right\|^{2}\right]+2^{13}L^{2}\eta^{2}\mathbb{E} \left[\left\|\nabla\log p_{k,S-(r\eta+t)}(\hat{\mathbf{x}}_{k,r\eta+t})\right\| ^{2}\right]\] \[+\left(2^{13}L^{2}\eta^{2}+1\right)L^{2}\mathbb{E}\left[\left\| \hat{\mathbf{x}}_{k,r\eta+t}-\hat{\mathbf{x}}_{k,r\eta}\right\|^{2}\right]\] \[\leq 2^{14}L^{2}\eta d+2^{10}L^{2}\eta^{2}(M+d)+2^{13}L^{3}\eta^{2}d+ 2^{10}L^{2}\left(2(M+d)\eta^{2}+4d\eta\right)\]
+
+where the last inequality follows from Lemma D.2 and Lemma D.3. To diminish the discretization error, we require the step size of backward sampling, i.e., \(\eta\) satisfies
+
+\[\begin{cases}2^{14}L^{2}\eta d\leq\epsilon\\ 2^{10}\cdot L^{2}\eta^{2}(d+M)\leq\epsilon\\ 2^{13}\cdot L^{3}\eta^{2}d\leq\epsilon\\ 2^{10}\cdot L^{2}\left(2(M+d)\eta^{2}+4d\eta\right)\leq\epsilon\end{cases} \Leftarrow\begin{cases}\eta\leq 2^{-14}L^{-2}d^{-1}\epsilon\\ \eta\leq 2^{-5}\cdot L^{-1}\left(d+M\right)^{-0.5}\epsilon^{0.5}\\ \eta\leq 2^{-6}L^{-0.5}\left(d+M\right)^{-0.5}\epsilon^{0.5}\\ \eta\leq 2^{-13}L^{-2}d^{-1}\epsilon.\end{cases}\]
+
+Specifically, if we choose
+
+\[\eta\leq 2^{-14}L^{-2}\left(d+M\right)^{-1}\epsilon=C_{\eta}(d+M)^{-1}\epsilon,\]
+
+we have
+
+\[\mathbb{E}\left[L^{2}\left\|\hat{\mathbf{x}}_{k,t+r\eta}-\hat{\mathbf{x}}_{k,r \eta}\right\|^{2}\right]+\mathbb{E}\left[\left\|\nabla\log\frac{p_{k,S-r\eta} (\hat{\mathbf{x}}_{k,r\eta})}{p_{k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,r\eta})} \right\|^{2}\right]\leq 4\epsilon,\]
+
+and the proof is completed. 
+
+## Appendix E Lemmas for Bounding Score Estimation Error
+
+**Lemma E.1** (Recursive Form of Score Functions).: _Under the notation in Section A, for any \(k\in\mathbb{N}_{0,K-1}\) and \(t\in[0,S]\), the score function can be written as_
+
+\[\nabla_{\mathbf{x}}\log p_{k,S-t}(\mathbf{x})=\mathbb{E}_{\mathbf{x}\sim q_{k,S-t}(\cdot| \mathbf{x})}\left[-\frac{\mathbf{x}-e^{-(S-t)}\mathbf{x}^{\prime}}{\left(1-e^{-2(S-t)} \right)}\right]\]
+
+_where the conditional density function \(q_{k,S-t}(\cdot|\mathbf{x})\) is defined as_
+
+\[q_{k,S-t}(\mathbf{x}^{\prime}|\mathbf{x})\propto\exp\left(\nabla\log p_{k,0}(\mathbf{x}^{ \prime})-\frac{\left\|\mathbf{x}-e^{-(S-t)}\mathbf{x}^{\prime}\right\|^{2}}{2\left(1-e^ {-2(S-t)}\right)}\right).\]Proof.: When the OU process, i.e., SDE 1, is selected as the forward path, for any \(k\in\mathbb{N}_{0,K}\) and \(t\in[0,S]\), the transition kernel has a closed form, i.e.,
+
+\[p_{k,t|0}(\mathbf{x}|\mathbf{x}_{0})=\left(2\pi\left(1-e^{-2t}\right)\right)^{-d/2} \cdot\exp\left[\frac{-\left\|\mathbf{x}-e^{-t}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{ -2t}\right)}\right],\quad\forall\ 0\leq t\leq S.\]
+
+In this condition, we have
+
+\[p_{k,S-t}(\mathbf{x})= \int_{\mathbb{R}^{d}}p_{k,0}(\mathbf{x}_{0})\cdot p_{k,S-t|0}(\mathbf{x}| \mathbf{x}_{0})\mathrm{d}\mathbf{x}_{0}\] \[= \int_{\mathbb{R}^{d}}p_{k,0}(\mathbf{x}_{0})\cdot\left(2\pi\left(1-e^ {-2(S-t)}\right)\right)^{-d/2}\cdot\exp\left[\frac{-\left\|\mathbf{x}-e^{-(S-t)} \mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-t)}\right)}\right]\mathrm{d}\mathbf{x}_{0}\]
+
+Plugging this formulation into the following equation
+
+\[\nabla_{\mathbf{x}}\log p_{k,S-t}(\mathbf{x})=\frac{\nabla p_{k,S-t}(\mathbf{x})}{p_{k,S-t} (\mathbf{x})},\]
+
+we have
+
+\[\nabla_{\mathbf{x}}\log p_{k,S-t}(\mathbf{x})= \frac{\nabla\int_{\mathbb{R}^{d}}p_{k,0}(\mathbf{x}_{0})\cdot\left(2 \pi\left(1-e^{-2(S-t)}\right)\right)^{-d/2}\cdot\exp\left[\frac{-\left\|\mathbf{x} -e^{-(S-t)}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-t)}\right)}\right]\mathrm{ d}\mathbf{x}_{0}}{\int_{\mathbb{R}^{d}}p_{k,0}(\mathbf{x}_{0})\cdot\left(2\pi\left(1-e^{-2(S-t)} \right)\right)^{-d/2}\cdot\exp\left[\frac{-\left\|\mathbf{x}-e^{-(S-t)}\mathbf{x}_{0} \right\|^{2}}{2\left(1-e^{-2(S-t)}\right)}\right]\mathrm{d}\mathbf{x}_{0}}\] \[= \frac{\int_{\mathbb{R}^{d}}p_{k,0}(\mathbf{x}_{0})\cdot\exp\left( \frac{-\left\|\mathbf{x}-e^{-(S-t)}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-t)} \right)}\right)\cdot\left(-\frac{\mathbf{x}-e^{-(S-t)}\mathbf{x}_{0}}{\left(1-e^{-2(T -t)}\right)}\right)\mathrm{d}\mathbf{x}_{0}}{\int_{\mathbb{R}^{d}}p_{k,0}(\mathbf{x}_ {0})\cdot\exp\left(\frac{-\left\|\mathbf{x}-e^{-(S-t)}\mathbf{x}_{0}\right\|^{2}}{2 \left(1-e^{-2(S-t)}\right)}\right)\mathrm{d}\mathbf{x}_{0}}\] \[= \mathbb{E}_{\mathbf{x}_{0}\sim q_{k,S-t}(\cdot\left\|\mathbf{x}\right)} \left[-\frac{\mathbf{x}-e^{-(S-t)}\mathbf{x}_{0}}{\left(1-e^{-2(S-t)}\right)}\right] \tag{18}\]
+
+where the density function \(q_{T-t}(\cdot|\mathbf{x})\) is defined as
+
+\[q_{k,S-t}(\mathbf{x}_{0}|\mathbf{x})= \frac{p_{k,0}(\mathbf{x}_{0})\cdot\exp\left(\frac{-\left\|\mathbf{x}-e^{- (S-t)}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-t)}\right)}\right)}{\int_{ \mathbb{R}^{d}}p_{k,0}(\mathbf{x}_{0})\cdot\exp\left(\frac{-\left\|\mathbf{x}-e^{-(S-t )}\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-t)}\right)}\right)\mathrm{d}\mathbf{x} _{0}}\] \[\propto \exp\left(-f_{k,0}(\mathbf{x}_{0})-\frac{\left\|\mathbf{x}-e^{-(S-t)}\bm {x}_{0}\right\|^{2}}{2\left(1-e^{-2(S-t)}\right)}\right),\]
+
+where \(p_{k,0}\propto\exp(-f_{k,0})\). Hence, the proof is completed. 
+
+**Lemma E.2** (Strong log-concavity and L-smoothness of the auxiliary targets).: _Under the notation in Section A, for any \(k\in\mathbb{N}_{0,K-1}\), \(r\in\mathbb{N}_{0,R-1}\) and \(\mathbf{x}\in\mathbb{R}^{d}\), we define the auxiliary target distribution as_
+
+\[q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x})\propto\exp\left(\nabla\log p_{k,0}(\mathbf{x }^{\prime})-\frac{\left\|\mathbf{x}-e^{-(S-r\eta)}\mathbf{x}^{\prime}\right\|^{2}}{2 \left(1-e^{-2(S-r\eta)}\right)}\right).\]
+
+_We define_
+
+\[\mu_{r}:=\frac{1}{2}\cdot\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\quad\text{ and}\quad L_{r}:=\frac{3}{2}\cdot\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}.\]
+
+_Then, we have_
+
+\[\mu_{r}\mathbf{I}\preceq-\nabla^{2}\log q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x}) \preceq L_{r}\mathbf{I}\]
+
+_when the segment length \(S\) satisfies \(S=\frac{1}{2}\log\left(\frac{2L+1}{2L}\right)\)._Proof.: We begin with the formulation of \(\nabla^{2}\log q_{k,S-t}\), i.e.,
+
+\[-\nabla^{2}\log q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x})=-\nabla^{2}\log p_{k,0}(\bm {x}^{\prime})+\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\mathbf{I}. \tag{19}\]
+
+By supposing \(S=\frac{1}{2}\log\left(\frac{2L+1}{2L}\right)\), we have
+
+\[\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\geq\frac{e^{-2S}}{1-e^{-2S}}=2L\geq 2 \left\|\nabla^{2}\log p_{k,0}\right\|.\]
+
+Plugging this inequality into Eq 19, we have
+
+\[-\nabla^{2}p_{k,0}(\mathbf{x}^{\prime})+\frac{e^{-2(S-r\eta)}}{1-e^{-2 (S-r\eta)}}\cdot\mathbf{I}\preceq\left(\left\|\nabla^{2}\log p_{k,0}(\mathbf{x}^{\prime })\right\|+\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\right)\cdot\mathbf{I}\] \[\preceq\frac{3}{2}\cdot\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}} \cdot\mathbf{I}=L_{r}\mathbf{I}.\]
+
+Besides, it has
+
+\[-\nabla^{2}p_{k,0}(\mathbf{x}^{\prime})+\frac{e^{-2(S-r\eta)}}{1-e^{-2 (S-r\eta)}}\cdot\mathbf{I}\succeq\left(-\left\|\nabla^{2}\log p_{k,0}(\mathbf{x}^{\prime })\right\|+\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\right)\cdot\mathbf{I}\] \[\succeq\frac{1}{2}\cdot\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}} \cdot\mathbf{I}=\mu_{r}\mathbf{I}.\]
+
+Hence, the proof is completed. 
+
+### Score Estimation Error from Empirical Mean
+
+**Lemma E.3**.: _With a little abuse of notation, for each \(i\in\mathbb{N}_{1,n_{k},\cdot}\) in Alg 1, we denote the underlying distribution of **output particles** as \(\mathbf{x}^{\prime}_{i}\sim q^{\prime}_{k,S-r\eta}\) and suppose it satisfies LSI with the constant \(\mu^{\prime}_{r}\). Then, for any \(\mathbf{x}\in\mathbb{R}^{d}\), we have_
+
+\[\mathbb{P}\left[\left\|-\frac{1}{n_{k,r}}\sum_{i=1}^{n_{k,r}}\mathbf{x}^{ \prime}_{i}+\mathbb{E}_{\mathbf{x}^{\prime}\sim q^{\prime}_{k,S-r\eta}(\cdot| \mathbf{x})}\left[\mathbf{x}^{\prime}\right]\right\|\leq 2\epsilon^{\prime}\right]\geq 1-\delta\]
+
+_by requiring the sample number \(n_{k,r}\) to satisfy_
+
+\[n_{k,r}\geq\frac{\max\left\{d,-2\log\delta\right\}}{\mu^{\prime}_{r}\epsilon^{ \prime 2}}.\]
+
+Proof.: For any \(\mathbf{x}\in\mathbb{R}^{d}\), we set
+
+\[\mathbf{b}^{\prime}\coloneqq\mathbb{E}_{q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})} \left[\mathbf{x}^{\prime}\right]\quad\text{and}\quad\sigma^{\prime}\coloneqq \mathbb{E}_{\left\{\mathbf{x}^{\prime}_{i}\right\}_{i=1}^{n_{k,r}}\sim_{q^{ \prime}_{k,S-r\eta}(\cdot|\mathbf{x})}^{\eta(n_{k,r})}}\left[\left\|\sum_{i=1}^{n_ {k,r}}\mathbf{x}^{\prime}_{i}-\mathbb{E}\left[\sum_{i=1}^{n_{k,r}}\mathbf{x}^{ \prime}_{i}\right]\right\|\right].\]
+
+We begin with the following probability
+
+\[\mathbb{P}_{\left\{\mathbf{x}^{\prime}_{i}\right\}_{i=1}^{n_{k,r }}\sim_{q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})}^{\eta(n_{k,r})}}\left[\left\|- \frac{1}{n_{k,r}}\sum_{i=1}^{n_{k,r}}\mathbf{x}^{\prime}_{i}+\mathbb{E}_{ \mathbf{x}^{\prime}\sim q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^ {\prime}\right]\right\|^{2}\geq\left(\frac{\sigma^{\prime}}{n_{k,r}}+\epsilon^ {\prime}\right)^{2}\right] \tag{20}\] \[= \mathbb{P}_{\left\{\mathbf{x}^{\prime}_{i}\right\}_{i=1}^{n_{k,r }}\sim_{q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})}^{\eta(n_{k,r})}}\left[\left\| \sum_{i=1}^{n_{k,r}}\mathbf{x}^{\prime}_{i}-n_{k,r}\mathbf{b}^{\prime}\right\| \geq\sigma^{\prime}+n_{k,r}\epsilon^{\prime}\right]\]
+
+To lower bound this probability, we expect to utilize Lemma F.9 which requires the following two conditions:
+
+* The distribution of \(\sum_{i=1}^{n_{k,r}}\mathbf{x}^{\prime}_{i}\) satisfies LSI, and its LSI constant can be obtained.
+* The formulation \(\left\|\sum_{i=1}^{n_{k,r}}\mathbf{x}^{\prime}_{i}-n_{k,r}\mathbf{b}^{\prime} \right\|\geq\sigma^{\prime}+n_{k,r}\epsilon^{\prime}\) can be presented as \(F\geq\mathbb{E}[F]+\text{bias}\) where \(F\) is a \(1\)-Lipschitz function.
+
+For the first condition, by employing Lemma F.5, we have that the LSI constant of
+
+\[\sum_{i=1}^{n_{k,r}}\mathbf{x}_{i}^{\prime}\sim\underbrace{q_{k,S-r\eta}^{\prime}( \cdot|\mathbf{x})*q_{k,S-r\eta}^{\prime}(\cdot|\mathbf{x})\cdots*q_{k,S-r\eta}^{\prime} (\cdot|\mathbf{x})}_{n_{k,r}}\]
+
+is \(\mu_{r}^{\prime}/n_{k,r}\). For the second condition, we set the function \(F\left(\mathbf{x}\right)=\|\mathbf{x}-n_{k,r}\mathbf{b^{\prime}}\|:\mathbb{R}^{d}\to\mathbb{R}\) is \(1\)-Lipschitz because
+
+\[\left\|F\right\|_{\mathrm{Lip}}=\sup_{\mathbf{x}\neq\mathbf{y}}\frac{|F(\mathbf{x})-F(\mathbf{y })|}{\|\mathbf{x}-\mathbf{y}\|}=\sup_{\mathbf{x}\neq\mathbf{y}}\frac{\left\|\mathbf{x}\right\|-\|\bm {y}\|}{\|(\mathbf{x}-\mathbf{y})\|}=1.\]
+
+Besides, we have
+
+\[F\left(\sum_{i=1}^{n_{k,r}}\mathbf{x}_{i}^{\prime}\right)=\left\|\sum_{i=1}^{n_ {k,r}}\mathbf{x}_{i}^{\prime}-n_{k,r}\mathbf{b^{\prime}}\right\|\quad\mathrm{and} \quad\mathbb{E}\left[F\left(\sum_{i=1}^{n_{k,r}}\mathbf{x}_{i}^{\prime}\right) \right]=\sigma^{\prime}\]
+
+where the second equation follows from the definition of \(\sigma^{\prime}\). Therefore, with Lemma F.9, we have
+
+\[\mathbb{P}_{\left\{\mathbf{x}_{i}^{\prime}\right\}_{i=1}^{n_{k,r}}\sim q_{k,S- r\eta}^{\prime\left(n_{k,r}\right)}(\cdot|\mathbf{x})}\left[\left\|\sum_{i=1}^{n_{k,r}} \mathbf{x}_{i}^{\prime}-n_{k,r}\mathbf{b^{\prime}}\right\|\geq\sigma^{\prime}+n_{k,r}\epsilon^{\prime}\right]\leq\exp\left(-\frac{\mu_{r}^{\prime}\epsilon^{ \prime 2}n_{k,r}}{2}\right). \tag{21}\]
+
+Then, we consider the range of \(\sigma^{\prime}\) and have
+
+\[\sigma^{\prime}= n_{k,r}\cdot\mathbb{E}_{\left\{\mathbf{x}_{i}^{\prime}\right\}_{ i=1}^{n_{k,r}}\sim q_{k,S-r\eta}^{\prime\left(n_{k,r}\right)}(\cdot|\mathbf{x})}\left\| \frac{1}{n_{k,r}}\sum_{i=1}^{n_{k,r}}\mathbf{x}_{i}^{\prime}-\mathbf{b^{\prime}}\right\| \tag{22}\] \[\leq n_{k,r}\cdot\sqrt{\mathrm{var}\left(\frac{1}{n_{k,r}}\sum_{i=1}^{n _{k,r}}\mathbf{x}_{i}^{\prime}\right)}=\sqrt{n_{k,r}\mathrm{var}\left(\mathbf{ x}_{i}^{\prime}\right)}\leq\sqrt{\frac{n_{k,r}d}{\mu_{r}^{\prime}}},\]
+
+the first inequality follows from Holder's inequality and the last follows from Lemma F.11. Combining Eq 21 and Eq 22, it has
+
+\[\mathbb{P}_{\left\{\mathbf{x}_{i}^{\prime}\right\}_{i=1}^{n_{k,r}}\sim q_{k,S- r\eta}^{\prime\left(n_{k,r}\right)}(\cdot|\mathbf{x})}\left[\left\|-\frac{1}{n_{k,r}} \sum_{i=1}^{n_{k,r}}\mathbf{x}_{i}^{\prime}+\mathbb{E}_{\mathbf{x}^{\prime}\sim q _{k,S-r\eta}^{\prime}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime}\right]\right\|^ {2}\geq\left(\sqrt{\frac{d}{\mu_{r}^{\prime}n_{k,r}}}+\epsilon^{\prime}\right) ^{2}\right]\leq\exp\left(-\frac{\mu_{r}^{\prime}\epsilon^{\prime 2}n_{k,r}}{2}\right).\]
+
+By requiring
+
+\[\frac{d}{\mu_{r}^{\prime}n_{k,r}}\leq\epsilon^{\prime 2}\quad\text{and}\quad-\frac{\mu_{r}^{\prime}\epsilon^{2}n_{k,r}}{2}\leq\log\delta, \tag{23}\]
+
+we have
+
+\[\mathbb{P}\left[\left\|-\frac{1}{n_{k,r}}\sum_{i=1}^{n_{k,r}} \mathbf{x}_{i}^{\prime}+\mathbb{E}_{\mathbf{x}^{\prime}\sim q_{k,S-r\eta}^{ \prime}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime}\right]\right\|\leq 2\epsilon^{\prime}\right]\] \[=1-\mathbb{P}\left[\left\|-\frac{1}{n_{k,r}}\sum_{i=1}^{n_{k,r}} \mathbf{x}_{i}^{\prime}+\mathbb{E}_{\mathbf{x}^{\prime}\sim q_{k,S-r\eta}^{ \prime}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime}\right]\right\|\geq 2\epsilon^{ \prime}\right]\geq 1-\delta.\]
+
+Noted that Eq. 23 implies the sample number \(n_{k,r}\) should satisfy
+
+\[n_{k,r}\geq\frac{d}{\mu_{r}^{\prime}\epsilon^{\prime 2}}\quad\text{and}\quad n_{k,r}\geq\frac{2\log\delta^{-1}}{\mu_{r}^{\prime}\epsilon^{ \prime 2}}.\]
+
+Hence, the proof is completed. 
+
+### Score Estimation Error from Mean Gap
+
+**Lemma E.4**.: _For any given \((k,r,\mathbf{x})\) in Alg 1, suppose the distribution \(q_{k,S-r\eta}(\cdot|\mathbf{x})\) satisfies_
+
+\[\mu_{r}\mathbf{I}\preceq-\nabla^{2}\log q_{k,S-r\eta}(\cdot|\mathbf{x})\preceq L_{r} \mathbf{I},\]
+
+_and \(\mathbf{x}_{j}^{\prime}\sim q_{j}^{\prime}(\cdot|\mathbf{x})\) corresponds to Line 9 of Alg 1. If \(0<\tau_{r}\leq\mu_{r}/(8L_{r}^{2})\), we have_
+
+\[\mathrm{KL}\left(q_{j+1}^{\prime}(\cdot|\mathbf{x})\|q_{k,S-r\eta}(\cdot|\mathbf{x}) \right)\leq e^{-\mu_{r}\tau_{r}}\mathrm{KL}\left(q_{j}^{\prime}(\cdot|\mathbf{x}) \|q_{k,S-r\eta}(\cdot|\mathbf{x})\right)+28L_{r}^{2}d\tau_{r}^{2}\]
+
+_when the score estimation satisfies \(\left\|\nabla\log p_{k,0}-\mathbf{v}^{\prime}\right\|_{\infty}\leq L_{r}\sqrt{2d \tau_{r}}\)._Proof.: Suppose the loop in Line 6 of Alg 1 aims to draw a sample from the target distribution \(q_{k,S-r\eta}(\cdot|\mathbf{x})\) satisfying
+
+\[q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x})\propto\exp(-g_{k,r}(\mathbf{x}^{\prime})) \coloneqq\exp\left(-f_{k,0}(\mathbf{x}^{\prime})-\frac{\left\|\mathbf{x}-e^{-(S-r\eta) }\mathbf{x}^{\prime}\right\|^{2}}{2(1-e^{-2(S-r\eta)})}\right).\]
+
+The score function of the target, i.e., \(\nabla g_{k,r}(\mathbf{x}^{\prime})\), satisfies
+
+\[\nabla g_{k,r}(\mathbf{x}^{\prime})=\nabla f_{k,0}(\mathbf{x}^{\prime})+\frac{-e^{-(S-r \eta)}\mathbf{x}+e^{-2(S-r\eta)}\mathbf{x}^{\prime}}{1-e^{-2(S-r\eta)}}.\]
+
+At the \(j\)-th iteration corresponding to Line 9 in Alg 1. The previous score is approximated by
+
+\[\nabla g^{\prime}(\mathbf{x}^{\prime})=\mathbf{v}^{\prime}(\mathbf{x}^{\prime})+\frac{-e^ {-(S-r\eta)}\mathbf{x}+e^{-2(S-r\eta)}\mathbf{x}^{\prime}}{1-e^{-2(S-r\eta)}}.\]
+
+where \(\mathbf{v}^{\prime}(\cdot)\) is used to approximate \(\nabla\log p_{k,0}(\cdot)\) by calling Alg 1 recursively. Suppose \(\mathbf{x}^{\prime}_{j}=\mathbf{z}_{0}\), the \(j\)-th iteration is equivalent to the following SDE
+
+\[\mathrm{d}\mathbf{z}_{t}=-\nabla g^{\prime}(\mathbf{z}_{0})\mathrm{d}t+\sqrt{2} \mathrm{d}B_{t},\]
+
+we denote the underlying distribution of \(\mathbf{z}_{t}\) as \(q_{t}\). Similarly, we set \(q_{0t}\) as the joint distribution of \((\mathbf{z}_{0},\mathbf{z}_{t})\), and have
+
+\[q_{0t}(\mathbf{z}_{0},\mathbf{z}_{t})=q_{0}(\mathbf{z}_{0})\cdot q_{t|0}(\mathbf{z}_{t}|\mathbf{z} _{0}).\]
+
+According to the Fokker-Planck equation, we have
+
+\[\partial_{t}q_{t|0}(\mathbf{z}_{t}|\mathbf{z}_{0})=\nabla\cdot\left(q_{t|0}(\mathbf{z}_{t} |\mathbf{z}_{0})\cdot\nabla g^{\prime}(\mathbf{z}_{0})\right)+\Delta q_{t|0}(\mathbf{z}_{ t}|\mathbf{z}_{0})\]
+
+In this condition, we have
+
+\[\partial_{t}q_{t}(\mathbf{z}_{t})= \int\frac{\partial q_{t|0}(\mathbf{z}_{t}|\mathbf{z}_{0})}{\partial t} \cdot q_{0}(\mathbf{z}_{0})\mathrm{d}\mathbf{z}_{0}\] \[= \int\left[\nabla\cdot\left(q_{t|0}(\mathbf{z}_{t}|\mathbf{z}_{0})\cdot \nabla g^{\prime}(\mathbf{z}_{0})\right)+\Delta q_{t|0}(\mathbf{z}_{t}|\mathbf{z}_{0}) \right]\cdot q_{0}(\mathbf{z}_{0})\mathrm{d}\mathbf{z}_{0}\] \[= \nabla\cdot\left(q_{t}(\mathbf{z}_{t})\int q_{0|t}(\mathbf{z}_{0}|\mathbf{z}_ {t})\nabla g^{\prime}(\mathbf{z}_{0})\mathrm{d}\mathbf{z}_{0}\right)+\Delta q_{t}(\bm {z}_{t}).\]
+
+For abbreviation, we suppose
+
+\[q_{*}(\cdot)\coloneqq q_{k,S-r\eta}(\cdot|\mathbf{x})\quad\text{and}\quad g_{*} \coloneqq g_{k,r}.\]
+
+With these notations, the dynamic of the KL divergence between \(q_{t}\) and \(q_{*}\) is
+
+\[\partial_{t}\mathrm{KL}\left(q_{t}\|q_{*}\right)=\int\partial_{t} q_{t}(\mathbf{z}_{t})\log\frac{q_{t}(\mathbf{z}_{t})}{q_{*}(\mathbf{z}_{t})}\mathrm{d} \mathbf{z}_{t} \tag{24}\] \[= \int\nabla\cdot\left[q_{t}(\mathbf{z}_{t})\left(\int q_{0|t}(\mathbf{z}_{0 }|\mathbf{z}_{t})\nabla g^{\prime}(\mathbf{z}_{0})\mathrm{d}\mathbf{z}_{0}+\nabla\log q_{t} (\mathbf{z}_{t})\right)\right]\cdot\log\frac{q_{t}(\mathbf{z}_{t})}{q_{*}(\mathbf{z}_{t})} \mathrm{d}\mathbf{z}_{t}\] \[= -\int q_{t}(\mathbf{z}_{t})\left(\left\|\nabla\log\frac{q_{t}(\mathbf{z}_ {t})}{q_{*}(\mathbf{z}_{t})}\right\|^{2}+\left\langle\int q_{0|t}(\mathbf{z}_{0}|\mathbf{z} _{t})\nabla g^{\prime}(\mathbf{z}_{0})\mathrm{d}\mathbf{z}_{0}+\nabla\log q_{*}(\mathbf{z} _{t}),\nabla\log\frac{q_{t}(\mathbf{z}_{t})}{q_{*}(\mathbf{z}_{t})}\right\rangle\right) \mathrm{d}\mathbf{z}_{t}\] \[= -\int q_{t}(\mathbf{z}_{t})\left\|\nabla\log\frac{q_{t}(\mathbf{z}_{t})}{ q_{*}(\mathbf{z}_{t})}\right\|^{2}\mathrm{d}\mathbf{z}_{t}+\int q_{0t}(\mathbf{z}_{0},\mathbf{z}_{t}) \left\langle\nabla g^{\prime}(\mathbf{z}_{0})-\nabla g_{*}(\mathbf{z}_{t}),\nabla\log \frac{q_{t}(\mathbf{z}_{t})}{q_{*}(\mathbf{z}_{t})}\right\rangle\mathrm{d}(\mathbf{z}_{0}, \mathbf{z}_{t})\] \[\leq -\frac{3}{4}\int q_{t}(\mathbf{z}_{t})\left\|\nabla\log\frac{q_{t}(\mathbf{z }_{t})}{q_{*}(\mathbf{z}_{t})}\right\|^{2}+2\int q_{0t}(\mathbf{z}_{0},\mathbf{z}_{t}) \left\|\nabla g^{\prime}(\mathbf{z}_{0})-\nabla g_{*}(\mathbf{z}_{0})\right\|^{2} \mathrm{d}(\mathbf{z}_{0},\mathbf{z}_{t})\] \[+2\int q_{0t}(\mathbf{z}_{0},\mathbf{z}_{t})\left\|\nabla g_{*}(\mathbf{z}_{0} )-\nabla g_{*}(\mathbf{z}_{t})\right\|^{2}\mathrm{d}(\mathbf{z}_{0},\mathbf{z}_{t}).\]Upper bound the first term in Eq 24.The target distribution \(q_{*}\) satisfies \(\mu_{r}\)-strong convexity, i.e.,
+
+\[\mu_{r}\mathbf{I}\preceq-\nabla^{2}\log q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x})=- \nabla^{2}\log(q_{*}(\mathbf{x}^{\prime})),\]
+
+It means \(q_{*}\) satisfies LSI with the constant \(\mu_{r}\) due to Lemma F.4. Hence, we have
+
+\[-\frac{3}{4}\int q_{t}(\mathbf{z}_{t})\left\|\nabla\log\frac{q_{t}(\mathbf{z}_{t})}{q_ {*}(\mathbf{z}_{t})}\right\|^{2}\leq-\frac{3\mu_{r}}{2}\mathrm{KL}\left(q_{t}\|q_{ *}\right). \tag{25}\]
+
+Upper bound the second term in Eq 24.We assume that there is a uniform upper bound \(\epsilon_{g}\) satisfying
+
+\[\left\|\nabla g^{\prime}(\mathbf{z})-\nabla g_{*}(\mathbf{z})\right\|\leq\epsilon_{g} \quad\Rightarrow\quad\int q_{0t}(\mathbf{z}_{0},\mathbf{z}_{t})\left\|\nabla g^{\prime }(\mathbf{z}_{0})-\nabla g_{*}(\mathbf{z}_{0})\right\|^{2}\mathrm{d}(\mathbf{z}_{0},\mathbf{z }_{t})\leq\epsilon_{g}^{2}. \tag{26}\]
+
+Upper bound the third term in Eq 24.Due to the monotonicity of \(e^{-t}/(1-e^{-t})\), we have
+
+\[2L\leq\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\leq\frac{e^{-2\eta}}{1-e^{-2 \eta}}\leq\eta^{-1}\]
+
+where we suppose \(\eta\leq 1/2\) without loss of the generality to establish the last inequality. Hence, the target distribution \(q_{*}\) satisfies
+
+\[-\nabla^{2}\log q_{*}=-\nabla^{2}\log q_{k,S-r\eta}(\cdot|\mathbf{x}) =-\nabla^{2}\log p_{k,0}+\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\] \[\preceq \left\|\nabla^{2}\log p_{k,0}\right\|\mathbf{I}+\frac{e^{-2(S-r\eta) }}{1-e^{-2(S-r\eta)}}\mathbf{I}\coloneqq L_{r}\mathbf{I}\preceq(L+\eta^{-1})\mathbf{I},\]
+
+where the last inequality follows from Assumption **[A,1]**. This result implies the smoothness of \(q_{*}\), and we have
+
+\[\int q_{0t}(\mathbf{z}_{0},\mathbf{z}_{t})\left\|\nabla g_{*}(\mathbf{z}_{0} )-\nabla g_{*}(\mathbf{z}_{t})\right\|^{2}\mathrm{d}(\mathbf{z}_{0},\mathbf{z}_{t}) \tag{27}\] \[\leq L_{r}^{2}\int q_{0t}(\mathbf{z}_{0},\mathbf{z}_{t})\left\|\mathbf{z}_{t}- \mathbf{z}_{0}\right\|^{2}\mathrm{d}(\mathbf{z}_{0},\mathbf{z}_{t})=L_{r}^{2}\cdot\mathbb{ E}_{q_{0t}}\left[\left\|-t\nabla g^{\prime}(\mathbf{z}_{0})+\sqrt{2t}\xi\right\|^{2}\right]\] \[= L_{r}^{2}\cdot\left(2td+t^{2}\mathbb{E}_{q_{0}}\left\|\nabla g^ {\prime}(\mathbf{z}_{0})-\nabla g_{*}(\mathbf{z}_{0})+\nabla g_{*}(\mathbf{z}_{0})\right\| ^{2}\right)\] \[\leq 2L_{r}^{2}\cdot\left(td+t^{2}\epsilon_{g}^{2}+t^{2}\mathbb{E}_{ q_{0}}\left\|\nabla g_{*}(\mathbf{z}_{0})\right\|^{2}\right)\] \[\leq 2L_{r}^{2}dt+2L_{r}^{2}\epsilon_{g}^{2}t^{2}+4L_{r}^{3}dt^{2}+ \frac{8L_{r}^{4}t^{2}}{\mu_{r}}\mathrm{KL}\left(q_{0}\|q_{*}\right),\]
+
+where the last inequality follows from Lemma F.12.
+
+Hence, Combining Eq 24, Eq 25, Eq 26, Eq 27 with \(t\leq\tau_{r}\leq 1/(2L_{r})\) and \(\epsilon_{g}^{2}\leq 2L_{r}^{2}d\tau_{r}\), we have
+
+\[\partial_{t}\mathrm{KL}\left(q_{t}\|q_{*}\right)\leq -\frac{3\mu_{r}}{2}\mathrm{KL}\left(q_{t}\|q_{*}\right)+2\epsilon_ {g}^{2}+\frac{16L_{r}^{4}t^{2}}{\mu_{r}}\mathrm{KL}\left(q_{0}\|q_{*}\right) +4L_{r}^{2}dt+4L_{r}^{2}\epsilon_{g}^{2}t^{2}+8L_{r}^{3}dt^{2}\] \[\leq -\frac{3\mu_{r}}{2}\mathrm{KL}\left(q_{t}\|q_{*}\right)+4L_{r}^{ 2}d\tau_{r}+\frac{16L_{r}^{4}\tau_{r}^{2}}{\mu_{r}}\mathrm{KL}\left(q_{0}\|q_ {*}\right)+4L_{r}^{2}d\tau_{r}+8L_{r}^{4}d\tau_{r}^{3}+8L_{r}^{3}d\tau_{r}^{2}\] \[\leq -\frac{3\mu_{r}}{2}\mathrm{KL}\left(q_{t}\|q_{*}\right)+\frac{16L _{r}^{4}t^{2}}{\mu_{r}}\mathrm{KL}\left(q_{0}\|q_{*}\right)+14L_{r}^{2}d\tau_ {r}.\]
+
+Multiplying both sides by \(\exp(\frac{3\mu_{r}t}{2})\), then the previous inequality can be written as
+
+\[\frac{\mathrm{d}}{\mathrm{d}t}\left(e^{\frac{3\mu_{r}t}{2}}\mathrm{KL}\left(q_ {t}\|q_{*}\right)\right)\leq e^{\frac{3\mu_{r}t}{2}}\cdot\left(\frac{16L_{r}^{4 }\tau_{r}^{2}}{\mu_{r}}\mathrm{KL}\left(q_{0}\|q_{*}\right)+14L_{r}^{2}d\tau_{r }\right).\]
+
+Integrating from \(t=0\) to \(t=\tau_{r}\), we have
+
+\[e^{\frac{3\mu_{r}\tau_{r}}{2}}\mathrm{KL}\left(q_{t}\|q_{*}\right) -\mathrm{KL}\left(q_{0}\|q_{*}\right)\leq \frac{2}{3\mu_{r}}\cdot\left(e^{\frac{3\mu_{r}\tau_{r}}{2}}-1 \right)\cdot\left(\frac{16L_{r}^{4}\tau_{r}^{2}}{\mu_{r}}\mathrm{KL}\left(q_{0 }\|q_{*}\right)+14L_{r}^{2}d\tau_{r}\right)\] \[\leq 2\tau_{r}\cdot\left(\frac{16L_{r}^{4}\tau_{r}^{2}}{\mu_{r}} \mathrm{KL}\left(q_{0}\|q_{*}\right)+14L_{r}^{2}d\tau_{r}\right)\]where the last inequality establishes due to the fact \(e^{c}\leq 1+2c\) when \(0<c\leq\frac{3}{2}\cdot\mu_{r}\tau_{r}\leq 1\). It means we have
+
+\[\mathrm{KL}\left(q_{t}\|q_{*}\right)\leq e^{-\frac{3q_{rr}\tau_{r}}{2}}\cdot \left(1+\frac{32L_{r}^{4}\tau_{r}^{3}}{\mu_{r}}\right)\mathrm{KL}\left(q_{0}\|q _{*}\right)+e^{-\frac{3q_{rr}\tau_{r}}{2}}\cdot 28L_{r}^{2}d\tau_{r}^{2}.\]
+
+By requiring \(0<\tau_{r}\leq\mu_{r}/(8L_{r}^{2})\), we have
+
+\[1+\frac{32L_{r}^{4}\tau_{r}^{3}}{\mu_{r}}\leq 1+\frac{\mu_{r}\tau_{r}}{2}\leq e ^{\frac{q_{rr}\tau_{r}}{2}}\quad\text{and}\quad e^{-\frac{3q_{rr}\tau_{r}}{2}} \leq 1.\]
+
+Hence, there is
+
+\[\mathrm{KL}\left(q_{t}\|q_{*}\right)\leq e^{-\mu_{r}\tau_{r}}\mathrm{KL}\left( q_{0}\|q_{*}\right)+28L_{r}^{2}d\tau_{r}^{2}, \tag{28}\]
+
+and the proof is completed. 
+
+**Lemma E.5**.: _In Alg 1, suppose the input is \((k,r,\mathbf{x},\epsilon)\) and \(k>0\), if we choose the initial distribution of the inner loop to be_
+
+\[q_{0}^{\prime}(\mathbf{x}^{\prime})\propto\exp\left(-\frac{\left\|\mathbf{x}-e^{-(S-r \eta)}\mathbf{x}^{\prime}\right\|^{2}}{2(1-e^{-2(S-r\eta)})}\right),\]
+
+_then suppose \(q_{k,S-r\eta}(\cdot|\mathbf{x})\) satisfies LSI with the constant \(\mu_{r}\) and \(L_{r}\) smoothness. Their KL divergence can be upper-bounded as_
+
+\[\log\mathrm{KL}\left(q_{0}^{\prime}(\cdot)\|q_{k,S-r\eta}(\cdot|\mathbf{x})\right) \leq\log\left\|\mathbf{x}\right\|^{2}+\log\left[\frac{L_{r}^{2}M}{\mu_{r}^{2}} \cdot\frac{de^{S}}{1-e^{-2S}}\right]+\frac{Me^{-S}}{1-e^{-2S}}.\]
+
+Proof.: According to Lemma E.1, the density \(q_{k,S-r\eta}(\cdot|\mathbf{x})\) can be presented as
+
+\[q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x})\propto\exp\left(-f_{k,0}(\mathbf{x}^{\prime} )-\frac{\left\|\mathbf{x}-e^{-(S-r\eta)}\mathbf{x}^{\prime}\right\|^{2}}{2(1-e^{-2(S -r\eta)})}\right)\]
+
+where \(f_{k,0}(\mathbf{x}^{\prime})=\nabla\log p_{k,0}(\mathbf{x}^{\prime})\). Since it satisfies LSI with the constant, i.e, \(\mu_{r}\), due to Definition 1, we have
+
+\[\begin{split}&\mathrm{KL}\left(q_{0}^{\prime}(\cdot)\|q_{k,S-r\eta }(\cdot|\mathbf{x})\right)\leq\frac{1}{2\mu_{r}}\cdot\int q_{0}^{\prime}(\mathbf{x}^{ \prime})\left\|\nabla f_{k,0}(\mathbf{x}^{\prime})\right\|^{2}\mathrm{d}\mathbf{x}^{ \prime}\\ &\leq\mu_{r}^{-1}\cdot\left(\int q_{0}^{\prime}(\mathbf{x}^{\prime}) \left\|\nabla f_{k,0}(\mathbf{x}^{\prime})-\nabla f_{k,0}(\mathbf{0})\right\|^{2} \mathrm{d}\mathbf{x}^{\prime}+\int q_{0}^{\prime}(\mathbf{x}^{\prime})\left\|\nabla f_ {k,0}(\mathbf{0})\right\|^{2}\mathrm{d}\mathbf{x}^{\prime}\right).\end{split} \tag{29}\]
+
+For the first term, we have
+
+\[\begin{split}&\int q_{0}^{\prime}(\mathbf{x}^{\prime})\left\|\nabla f _{k,0}(\mathbf{x}^{\prime})-\nabla f_{k,0}(\mathbf{0})\right\|^{2}\mathrm{d}\mathbf{x}^{ \prime}\\ &\leq L_{r}^{2}\cdot\int q_{0}^{\prime}(\mathbf{x}^{\prime})\left\| \mathbf{x}^{\prime}\right\|^{2}\mathrm{d}\mathbf{x}^{\prime}=L_{r}^{2}\cdot\mathbb{E}_ {q_{0}}\left[\left\|\mathbf{x}^{\prime}\right\|^{2}\right]=L_{r}^{2}\cdot\left[ \mathrm{Var}(\mathbf{x}^{\prime})+\left\|\mathbb{E}\mathbf{x}^{\prime}\right\|^{2} \right]\end{split}\]
+
+where the first inequality follows from **[A,]**. The high-dimensional Gaussian distribution, i.e., \(q_{0}^{\prime}\) satisfies
+
+\[\left\|\mathbb{E}_{q_{0}^{\prime}}\left[\mathbf{x}^{\prime}\right]\right\|=e^{S-r \eta}\left\|\mathbf{x}\right\|\quad\text{and}\quad\mathrm{Var}(\mathbf{x}^{\prime}) \leq d\cdot\left(e^{2(S-r\eta)}-1\right),\]
+
+where the last inequality follows from Lemma F.11, hence we have
+
+\[\int q_{0}^{\prime}(\mathbf{x}^{\prime})\left\|\nabla f_{k,0}(\mathbf{x}^{\prime})- \nabla f_{k,0}(\mathbf{0})\right\|^{2}\mathrm{d}\mathbf{x}^{\prime}\leq L_{r}^{2} \cdot e^{2(S-r\eta)}(d+\left\|\mathbf{x}\right\|^{2}). \tag{30}\]
+
+Then we consider to bound the second term of Eq 29. According to the definition of \(\nabla f_{k,0}\), with the transition kernel of the OU process, we have
+
+\[\begin{split}&-\nabla f_{k,0}(\mathbf{x}^{\prime})=\nabla\log p_{k,0} (\mathbf{x}^{\prime})=\frac{\nabla p_{k,0}(\mathbf{x}^{\prime})}{p_{k,0}(\mathbf{x}^{ \prime})}\\ &=\frac{\int_{\mathbb{R}^{d}}p_{*}(\mathbf{x}_{0})\cdot\exp\left(- \frac{\left\|\mathbf{x}-e^{-kS}\mathbf{x}_{0}\right\|^{2}}{2(1-e^{-2kS})}\right) \cdot\left(-\frac{\mathbf{x}-e^{-kS}\mathbf{x}_{0}}{(1-e^{-2(T-\eta)})}\right)\mathrm{ d}\mathbf{x}_{0}}{\int_{\mathbb{R}^{d}}p_{*}(\mathbf{x}_{0})\cdot\exp\left(-\frac{ \left\|\mathbf{x}-e^{-kS}\mathbf{x}_{0}\right\|^{2}}{2(1-e^{-2kS})}\right)\mathrm{d}\bm {x}_{0}}.\end{split}\]Therefore, we have
+
+\[\|\nabla f_{k,0}(\mathbf{0})\|^{2}= \left\|\frac{\int_{\mathbb{R}^{d}}p_{*}(\mathbf{x}_{0})\cdot\exp\left( \frac{-e^{-2kS}\left\|\mathbf{x}_{0}\right\|^{2}}{2(1-e^{-2kS})}\right)\cdot\frac{e^ {-kS}\mathbf{x}_{0}}{(1-e^{-2kS})}\mathrm{d}\mathbf{x}_{0}}\right\|^{2} \tag{31}\] \[\leq \frac{e^{-kS}}{1-e^{-2kS}}\cdot\int p_{*}(\mathbf{x}_{0})\cdot\left\| \mathbf{x}_{0}\right\|^{2}\mathrm{d}\mathbf{x}_{0}\cdot\frac{\int p_{*}(\mathbf{x}_{0}) \cdot\exp\left(\frac{-e^{-2kS}\left\|\mathbf{x}_{0}\right\|^{2}}{(1-e^{-2kS})} \right)\mathrm{d}\mathbf{x}}{\left(\int_{\mathbb{R}^{d}}p_{*}(\mathbf{x}_{0})\cdot\exp \left(\frac{-e^{-2kS}\left\|\mathbf{x}_{0}\right\|^{2}}{2(1-e^{-2kS})}\right) \mathrm{d}\mathbf{x}_{0}\right)^{2}}\] \[\leq \frac{e^{-kS}}{1-e^{-2kS}}\cdot M\cdot\left(\int_{\mathbb{R}^{d}} p_{*}(\mathbf{x}_{0})\cdot\exp\left(\frac{-e^{-2kS}\left\|\mathbf{x}_{0}\right\|^{2}}{2 \left(1-e^{-2kS}\right)}\right)\mathrm{d}\mathbf{x}_{0}\right)^{-1}\]
+
+where the first inequality follows from Holders' inequality, the second inequality follows from **[A\({}_{2}\)]**. With, the following range:
+
+\[\frac{e^{-2kS}}{1-e^{-2kS}}\leq\frac{e^{-kS}}{1-e^{-2kS}}\leq\frac{e^{-S}}{1-e^ {-2kS}}\]
+
+we plug Eq 30 and Eq 31 into Eq 29 and obtain
+
+\[\log\mathrm{KL}\left(q_{0}^{\prime}(\cdot)\|q_{k,S-r\eta}(\cdot| \mathbf{x})\right)\leq \log\left[\mu_{r}^{-1}\cdot\left(L_{r}^{2}\cdot e^{2(S-r\eta)}(d+ \left\|\mathbf{x}\right\|^{2})\right.\right.\] \[\left.\left.+\frac{e^{-kS}}{1-e^{-2kS}}\cdot M\left(\int_{\mathbb{ R}^{d}}p_{*}(\mathbf{x}_{0})\cdot\exp\left(\frac{-e^{-2kS}\left\|\mathbf{x}_{0}\right\|^ {2}}{2\left(1-e^{-2kS}\right)}\right)\mathrm{d}\mathbf{x}_{0}\right)^{-1}\right)\right]\]
+
+Without loss of generality, we suppose both RHS of Eq 30 and Eq 31 are larger than \(1\). Then, we have
+
+\[\log\mathrm{KL}\left(q_{0}^{\prime}(\cdot)\|q_{k,S-r\eta}(\cdot| \mathbf{x})\right)\] \[\leq\log\left[\frac{L_{r}^{2}}{\mu_{r}^{2}}\cdot e^{2(S-r\eta)}M \cdot\frac{e^{-kS}}{1-e^{-2kS}}\cdot(d+\left\|\mathbf{x}\right\|^{2})\right]-\log \left[\int_{\mathbb{R}^{d}}p_{*}(\mathbf{x}_{0})\cdot\exp\left(\frac{-e^{-2kS} \left\|\mathbf{x}_{0}\right\|^{2}}{2\left(1-e^{-2kS}\right)}\right)\mathrm{d}\mathbf{ x}_{0}\right]\] \[\leq\log\left[\frac{L_{r}^{2}M}{\mu_{r}^{2}}\cdot\frac{e^{S}}{1- e^{-2S}}\cdot(d+\left\|\mathbf{x}\right\|^{2})\right]+\frac{e^{-2kS}}{2\left(1-e^{-2kS} \right)}\cdot\int_{\mathbb{R}^{d}}p_{*}(\mathbf{x}_{0})\left\|\mathbf{x}_{0}\right\|^ {2}\mathrm{d}\mathbf{x}_{0}\] \[\leq\log\left[\frac{L_{r}^{2}M}{\mu_{r}^{2}}\cdot\frac{e^{S}}{1- e^{-2S}}\cdot(d+\left\|\mathbf{x}\right\|^{2})\right]+\frac{Me^{-S}}{1-e^{-2S}}\leq \log\left\|\mathbf{x}\right\|^{2}+\log\left[\frac{L_{r}^{2}M}{\mu_{r}^{2}}\cdot \frac{de^{S}}{1-e^{-2S}}\right]+\frac{Me^{-S}}{1-e^{-2S}}.\]
+
+Hence, the proof is completed. 
+
+**Corollary E.6**.: _For any given \((k,r)\) in Alg 1 and \(\mathbf{x}\in\mathbb{R}^{d}\), suppose the distribution \(q_{k,S-r\eta}(\cdot|\mathbf{x})\) satisfies_
+
+\[\mu_{r}\mathbf{I}\preceq-\nabla^{2}\log q_{k,S-r\eta}(\cdot|\mathbf{x})\preceq L_{r} \mathbf{I},\]
+
+_and \(\mathbf{x}_{j}^{\prime}\sim q_{j}^{\prime}(\cdot|\mathbf{x})\). If \(0<\tau_{r}\leq\mu_{r}/(8L_{r}^{2})\), we have_
+
+\[\mathrm{KL}\left(q_{j}^{\prime}\|q_{*}\right)\leq\exp\left(-\mu_{r}\tau_{r}j \right)\cdot\mathrm{KL}\left(q_{0}^{\prime}\|q_{*}\right)+\frac{32L_{r}^{2}d \tau_{r}}{\mu_{r}}\]
+
+_when the score estimation satisfies \(\left\|\nabla\log p_{k,0}-\mathbf{v}^{\prime}\right\|_{\infty}\leq L_{r}\sqrt{2d \tau_{r}}\)._
+
+Proof.: Due to the range \(0<\tau_{r}\leq\mu_{r}/8L_{r}^{2}\), we have \(\mu_{r}\tau_{r}\leq 1/8\). In this condition, we have
+
+\[1-\exp\left(-\mu_{r}\tau_{r}\right)\geq\frac{7}{8}\cdot\mu_{r}\tau_{r}.\]
+
+Plugging this into the following inequality obtained by the recursion of Eq. 28, we have
+
+\[\mathrm{KL}\left(q_{j}^{\prime}\|q_{*}\right)\leq \exp\left(-\mu_{r}\tau_{r}j\right)\cdot\mathrm{KL}\left(q_{0}^{ \prime}\|q_{*}\right)+\frac{28L_{r}^{2}d\tau_{r}^{2}}{\left(1-\exp\left(-\mu_{r }\tau_{r}\right)\right)}\] \[\leq \exp\left(-\mu_{r}\tau_{r}j\right)\cdot\mathrm{KL}\left(q_{0}^{ \prime}\|q_{*}\right)+\frac{32L_{r}^{2}d\tau_{r}}{\mu_{r}}.\]In this condition, if we require the KL divergence to satisfy \(\mathrm{KL}\left(q^{\prime}_{j}\|q_{*}\right)\leq\epsilon\), a sufficient condition is that
+
+\[\exp\left(-\mu_{r}\tau_{r}j\right)\cdot\mathrm{KL}\left(q^{\prime}_{0}\|q_{*} \right)\leq\frac{\epsilon}{2}\quad\text{and}\quad\frac{32L_{r}^{2}d\tau}{\mu_ {r}}\leq\frac{\epsilon}{2},\]
+
+which is equivalent to
+
+\[\tau_{r}\leq\frac{\mu_{r}\epsilon}{64L_{r}^{2}d}\quad\text{and}\quad j\geq \frac{1}{\mu_{r}\tau_{r}}\cdot\log\frac{2\mathrm{KL}\left(q^{\prime}_{0}\|q_{*} \right)}{\epsilon}.\]
+
+According to the upper bound of \(\mathrm{KL}\left(q^{\prime}_{0}\|q_{*}\right)\) shown in Lemma E.5, we require
+
+\[j\geq\frac{1}{\mu_{r}\tau_{r}}\cdot\left[\log\frac{\|\mathbf{x}\|^{2}}{\epsilon}+ \log\left(\frac{2L_{r}^{2}M}{\mu_{r}^{2}}\cdot\frac{de^{S}}{1-e^{-2S}}\right) +\frac{Me^{-S}}{1-e^{-2S}}\right].\]
+
+### Core Lemmas
+
+**Lemma E.7**.: _In Alg 1, for any \(k\in\mathbb{N}_{0,K-1}\), \(r\in\mathbb{N}_{0,R-1}\) and \(\mathbf{x}\in\mathbb{R}^{d}\), we have_
+
+\[\mathbb{P}\left[\left\|\mathbf{v}^{\mathsf{-}}_{k,r\eta}(\mathbf{x})-\nabla\log p_ {k,S-r\eta}(\mathbf{x})\right\|^{2}\leq 10\epsilon\right]\geq 1-\delta\]
+
+_by requiring the segment length \(S\), the sample number \(n_{k,r}\) and the step size of inner loops \(\tau_{r}\) and the iteration number of inner loops \(m_{k,r}\) satisfy_
+
+\[S=\frac{1}{2}\log\frac{2L+1}{2L},\quad n_{k,r}\geq\frac{4}{ \epsilon(1-e^{-2(S-r\eta)})}\cdot\max\left\{d,-2\log\delta\right\},\] \[\tau_{r}\leq\frac{\mu_{r}}{64L_{r}^{2}d}\cdot(1-e^{-2(S-r\eta)}) \epsilon\quad\text{and}\quad m_{k,r}\geq\frac{64L_{r}^{2}d}{\mu_{r}^{2}(1-e^ {-2(S-r\eta)})\epsilon}\cdot\left[\log\frac{d\|\mathbf{x}\|^{2}}{(1-e^{-2(S-r\eta )})\epsilon}+C_{m,1}\right],\]
+
+_where \(C_{m,1}=\log\left(2M\cdot 3^{2}\cdot 5L\right)+M\cdot 3L\). In this condition that choosing the \(\tau_{r}\) to its upper bound, we required the score estimation in the inner loop satisfies_
+
+\[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{v}^{\prime}_{k,0}(\mathbf{x}^{ \prime})\right\|\leq\frac{e^{-(S-r\eta)}\epsilon^{0.5}}{8}.\]
+
+Proof.: With a little abuse of notation, for each loop \(i\in\mathbb{N}_{1,n_{k,r}}\) in Line 4 of Alg 1, we denote the underlying distribution of **output particles** as \(\mathbf{x}^{\prime}_{i}\sim q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})\) for any \(k\in\mathbb{N}_{0,K-1}\), \(r\in\mathbb{N}_{0,R-1}\) and \(\mathbf{x}\in\mathbb{R}^{d}\) in this lemma. According to Line 10 in Alg 1, we have
+
+\[\left\|\mathbf{v}^{\mathsf{-}}_{k,r\eta}(\mathbf{x})-\nabla\log p_{k, S-r\eta}(\mathbf{x})\right\|^{2} \tag{32}\] \[= \left\|\frac{1}{n_{r,k}}\sum_{i=1}^{n_{r,k}}\left(-\frac{\mathbf{x}- e^{-(S-r\eta)}\mathbf{x}^{\prime}_{i}}{1-e^{-2(S-r\eta)}}\right)-\mathbb{E}_{ \mathbf{x}^{\prime}\sim q_{k,S-r\eta}(\cdot|\mathbf{x})}\left[-\frac{\mathbf{x}-e^{-( S-r\eta)}\mathbf{x}^{\prime}}{1-e^{-2(S-r\eta)}}\right]\right\|^{2}\] \[= \frac{e^{-2(S-r\eta)}}{\left(1-e^{-2(S-r\eta)}\right)^{2}}\cdot \left\|-\frac{1}{n_{r,k}}\sum_{i=1}^{n_{r,k}}\mathbf{x}^{\prime}_{i}-\mathbb{E }_{\mathbf{x}^{\prime}\sim q_{k,S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^{ \prime}\right]\right\|^{2}\] \[\leq \frac{2e^{-2(S-r\eta)}}{\left(1-e^{-2(S-r\eta)}\right)^{2}}\cdot \left\|-\frac{1}{n_{r,k}}\sum_{i=1}^{n_{r,k}}\mathbf{x}^{\prime}_{i}+\mathbb{E }_{\mathbf{x}^{\prime}\sim q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^ {\prime}\right]\right\|^{2}\] \[+\frac{2e^{-2(S-r\eta)}}{\left(1-e^{-2(S-r\eta)}\right)^{2}}\cdot \left\|-\mathbb{E}_{\mathbf{x}^{\prime}\sim q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x })}\left[\mathbf{x}^{\prime}\right]+\mathbb{E}_{\mathbf{x}^{\prime}\sim q_{k, S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime}\right]\right\|^{2}\]
+
+In the following, we respectively upper bound the concentration error and the mean gap between \(q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})\) and \(q_{k,S-r\eta}(\cdot|\mathbf{x})\) corresponding to the former and the latter term in Eq 32.
+
+Upper bound the concentration error.The choice of \(S\), i.e., \(S=\frac{1}{2}\log\left(\frac{2L+1}{2L}\right)\), Lemma E.2 demonstrate that suppose
+
+\[\mu_{r}=\frac{1}{2}\cdot\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}\quad\mathrm{ and}\quad L_{r}=\frac{3}{2}\cdot\frac{e^{-2(S-r\eta)}}{1-e^{-2(S-r\eta)}}.\]
+
+Then, we have
+
+\[\mu_{r}\mathbf{I}\preceq-\nabla^{2}\log q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x}) \preceq L_{r}\mathbf{I}.\]
+
+According to Alg 1, we utilize ULA as the inner loop (Line 4 - Line 9) to sample from \(q_{k,S-r\eta}(\cdot|\mathbf{x})\). By requiring the step size, i.e., \(\tau_{r}\) to satisfy \(\tau_{r}\leq 1/L_{r}\), with Lemma F.8, we know that the underlying distribution of output particles of the inner loops satisfies, i.e., \(q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})\) satisfies LSI with a constant \(\mu^{\prime}_{r}\) satisfying
+
+\[\mu^{\prime}_{r}\geq\frac{\mu_{r}}{2}\geq\frac{e^{-2(S-r\eta)}}{4(1-e^{-2(S-r \eta)})}.\]
+
+In this condition, we employ Lemma E.3, by requiring
+
+\[\begin{split} n_{k,r}\geq&\frac{4}{\epsilon(1-e^{-2 (S-r\eta)})}\cdot\max\left\{d,-2\log\delta\right\}\\ \geq&\frac{1}{\mu^{\prime}_{r}}\cdot\left(\frac{e^{-( S-r\eta)}}{(1-e^{-2(S-r\eta)})e^{0.5}}\right)^{2}\cdot\max\left\{d,-2\log \delta\right\}.\end{split}\]
+
+and obtain
+
+\[\begin{split}&\mathbb{P}\left[\frac{2e^{-2(S-r\eta)}}{\left(1-e^{-2 (S-r\eta)}\right)^{2}}\cdot\left\|-\frac{1}{n_{r,k}}\sum_{i=1}^{n_{r,k}}\mathbf{ x}^{\prime}_{i}+\mathbb{E}_{\mathbf{x}^{\prime}\sim q^{\prime}_{k,S-r\eta}(\cdot| \mathbf{x})}\left[\mathbf{x}^{\prime}\right]\right\|^{2}\leq 2\epsilon\right]\\ =&\mathbb{P}\left[\left\|-\frac{1}{n_{r,k}}\sum_{i=1} ^{n_{r,k}}\mathbf{x}^{\prime}_{i}+\mathbb{E}_{\mathbf{x}^{\prime}\sim q^{ \prime}_{k,S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime}\right]\right\|\leq \frac{(1-e^{-2(S-r\eta)})e^{0.5}}{e^{-(S-r\eta)}}\right]\geq 1-\delta.\end{split}\]
+
+Upper bound the mean gap.According to Lemma E.2 and Lemma F.4, we know \(q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x})\) satisfies LSI with constant
+
+\[\mu_{r}\geq\frac{e^{-2(S-r\eta)}}{2(1-e^{-2(S-r\eta)})}.\]
+
+By introducing the optimal coupling between \(q_{k,S-r\eta}(\cdot|\mathbf{x})\) and \(q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})\), we have
+
+\[\begin{split}&\left\|-\mathbb{E}_{\mathbf{x}^{\prime}\sim q^{ \prime}_{k,S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime}\right]+\mathbb{E}_ {\mathbf{x}^{\prime}\sim q_{k,S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime }\right]\right\|^{2}\\ \leq& W_{2}^{2}\left(q^{\prime}_{k,S-r\eta}(\cdot|\bm {x}),q_{k,S-r\eta}(\cdot|\mathbf{x})\right)\leq\frac{2}{\mu_{r}}\mathrm{KL}\left(q ^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})\|q_{k,S-r\eta}(\cdot|\mathbf{x})\right),\end{split} \tag{33}\]
+
+where the last inequality follows from Talagrand inequality Vempala & Wibisono (2019). Hence, the mean gap can be upper-bounded as
+
+\[\begin{split}&\frac{2e^{-2(S-r\eta)}}{\left(1-e^{-2(S-r\eta)} \right)^{2}}\cdot\left\|-\mathbb{E}_{\mathbf{x}^{\prime}\sim q^{\prime}_{k,S- r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime}\right]+\mathbb{E}_{ \mathbf{x}^{\prime}\sim q_{k,S-r\eta}(\cdot|\mathbf{x})}\left[\mathbf{x}^{\prime} \right]\right\|^{2}\\ \leq&\frac{2e^{-2(S-r\eta)}}{\left(1-e^{-2(S-r\eta)} \right)^{2}}\cdot\frac{2}{\mu_{r}}\mathrm{KL}\left(q^{\prime}_{k,S-r\eta}( \cdot|\mathbf{x})\|q_{k,S-r\eta}(\cdot|\mathbf{x})\right)\\ \leq&\frac{8}{(1-e^{-2(S-r\eta)})}\mathrm{KL}\left(q ^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})\|q_{k,S-r\eta}(\cdot|\mathbf{x})\right).\end{split}\]
+
+To provide \(\epsilon\)-level upper bound, we expect the required accuracy of KL convergence of inner loops to satisfy
+
+\[\mathrm{KL}\left(q^{\prime}_{k,S-r\eta}(\cdot|\mathbf{x})\|q_{k,S-r\eta}(\cdot|\bm {x})\right)\leq(1-e^{-2(S-r\eta)})\epsilon.\]
+
+According to Corollary E.6, to achieve such accuracy, we require the step size and the iteration number of inner loops to satisfy
+
+\[\tau_{r}\leq\frac{\mu_{r}}{64L_{r}^{2}d}\cdot(1-e^{-2(S-r\eta)})\epsilon\quad \mathrm{and}\]
+
+\[m_{k,r}\geq\frac{1}{\mu_{r}}\cdot\frac{64L_{r}^{2}d}{\mu_{r}(1-e^{-2(S-r\eta)} )\epsilon}\cdot\left[\log\frac{\|\mathbf{x}\|^{2}}{(1-e^{-2(S-r\eta)})\epsilon}+ \log\left(\frac{2L_{r}^{2}M}{\mu_{r}^{2}}\cdot\frac{de^{S}}{1-e^{-2S}}\right) +\frac{Me^{-S}}{1-e^{-2S}}\right].\]To simplify notation, we suppose \(L\geq 1\) without loss of generality, and we the following equations:
+
+\[\frac{L_{r}}{\mu_{r}}=3,\quad e^{S}=\exp\left(\frac{1}{2}\log\frac{2 L+1}{2L}\right)=\sqrt{\frac{2L+1}{2L}},\] \[\left(1-e^{-2S}\right)^{-1}=(2L+1),\]
+
+which implies
+
+\[\log\frac{d\|\mathbf{x}\|^{2}}{(1-e^{-2(S-r\eta)})\epsilon}+\log\left( 2M\cdot 3^{2}\cdot 5L\right)+M\cdot 3L\] \[\geq\log\frac{d\|\mathbf{x}\|^{2}}{(1-e^{-2(S-r\eta)})\epsilon}+\log \left(2M\cdot\frac{L_{r}^{2}}{\mu_{r}^{2}}\cdot\sqrt{\frac{2L+1}{2L}}\cdot(2L+ 1)\right)+M\cdot(2L+1)\cdot\sqrt{\frac{2L}{2L+1}}\] \[=\log\frac{d\|\mathbf{x}\|^{2}}{(1-e^{-2(S-r\eta)})\epsilon}+\log \left(\frac{2L_{r}^{2}M}{\mu_{r}^{2}}\cdot\frac{e^{S}}{1-e^{-2S}}\right)+\frac {Me^{-S}}{1-e^{-2S}}.\]
+
+Therefore, we only require \(m_{k,r}\) satisfies
+
+\[m_{k,r}\geq\frac{1}{\mu_{r}}\cdot\frac{64L_{r}^{2}d}{\mu_{r}(1-e^{ -2(S-r\eta)})\epsilon}\cdot\left[\log\frac{d\|\mathbf{x}\|^{2}}{(1-e^{-2(S-r\eta)}) \epsilon}+C_{m,1}\right]\]
+
+where \(C_{m,1}=\log\left(2M\cdot 3^{2}\cdot 5L\right)+M\cdot 3L\). For simplicity, we choose \(\tau_{r}\) as its upper bound and lower bound, respectively. In this condition, we still require
+
+\[\|\nabla\log p_{k,0}-\mathbf{v}^{\prime}\|\leq\frac{e^{-(S-r\eta)}e^{0.5}}{8}\leq \frac{1}{4}\cdot\sqrt{\frac{\mu_{r}(1-e^{-2(S-r\eta)})}{2}\cdot\epsilon}\leq L _{r}\sqrt{2d\tau_{r}}\]
+
+where the first inequality follows from the range of \(\mu_{r}\), and the last inequality is satisfied when we choose \(\tau_{r}\) to its upper bound. Hence, the proof is completed. 
+
+**Lemma E.8** (Errors from fine-grained score estimation).: _Under the notation in Section A, suppose the step size satisfy \(\eta=C_{\eta}(d+M)^{-1}\epsilon\), we have_
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x})-\mathbf{v }_{k,r\eta}^{\leftarrow}(\mathbf{x})\right\|^{2}\leq 10\epsilon,\forall\mathbf{x} \in\mathbb{R}^{d}\right]\] \[\geq (1-\delta)\cdot\left(\min_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r}( \mathbf{x},\epsilon)}\mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})- \mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{ \epsilon}{96}\right]\right)^{n_{k,r}(10\epsilon)\cdot m_{k,r}(10\epsilon,\mathbf{ x})},\]
+
+_where \(\mathbb{S}_{k,r}(\mathbf{x},10\epsilon)\) denotes the set of particles appear in Alg 1 when the input is \((k,r,\mathbf{x},10\epsilon)\). For any \((k,r)\in\mathbb{N}_{0,K-1}\times\mathbb{N}_{0,R-1}\) by requiring_
+
+\[n_{k,r}(10\epsilon)=C_{n}\cdot\frac{(d+M)\cdot\max\{d,-2\log \delta\}}{(10\epsilon)^{2}}\quad\mathrm{where}\quad C_{n}=2^{6}\cdot 5^{2} \cdot C_{\eta}^{-1},\] \[m_{k,r}(10\epsilon,\mathbf{x})=C_{m}\cdot\frac{(d+M)^{3}\cdot\max\{ \log\|\mathbf{x}\|^{2},1\}}{(10\epsilon)^{3}}\quad\mathrm{where}\quad C_{m}=2^{9} \cdot 3^{2}\cdot 5^{3}\cdot C_{m,1}C_{\eta}^{-1.5}.\]
+
+Proof.: According to Line 9 of Alg 1, for any \(\mathbf{x}\in\mathbb{R}^{d}\), the score estimation \(\mathbf{v}_{k,r\eta}^{\leftarrow}\) is constructed by estimating the mean in RHS of the following expectation using \(n_{k,r}\) samples (i.e., calculating the empirical mean):
+
+\[\nabla_{\mathbf{x}}\log p_{k,S-r\eta}(\mathbf{x})= \mathbb{E}_{\mathbf{x}^{\prime}\sim q_{k,S-r\eta}(\cdot|\mathbf{x})} \left[-\frac{\mathbf{x}-e^{-(S-r\eta)}\mathbf{x}^{\prime}}{\left(1-e^{-2(S-r\eta )}\right)}\right] \tag{34}\] \[\mathrm{where}\quad q_{k,S-r\eta}(\mathbf{x}^{\prime}|\mathbf{x})\propto \exp\left(\log\ p_{k,0}(\mathbf{x}^{\prime})-\frac{\left\|\mathbf{x}-e^{-(S-r \eta)}\mathbf{x}^{\prime}\right\|^{2}}{2\left(1-e^{-2(S-r\eta)}\right)}\right). \tag{35}\]
+
+Then in order to guarantee an accurate estimation for \(\nabla_{\mathbf{x}}\log p_{k,S-r\eta}(\mathbf{x})\), i.e., denoted by \(\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x})\), with Lemma E.7, we require 1. Get a precise estimation for \(\nabla\log p_{k,0}(\mathbf{x}^{\prime})\), in order to guarantee that the estimation for \(\nabla\log q_{k,S-\tau\eta}(\mathbf{x}^{\prime}|\mathbf{x})\) is accurate. In particular, we require \[\big{\|}\nabla\log p_{k,0}(\mathbf{x}^{\prime}_{i,j})-\mathbf{v}^{+}_{k-1,0}(\mathbf{x }^{\prime}_{i,j})\big{\|}\leq\frac{e^{-(S-\tau\eta)}\epsilon^{0.5}}{8}.\]
+2. Based on the \(\nabla\log q_{k,S-\tau\eta}(\mathbf{x}^{\prime}|\mathbf{x})\), we run ULA with appropriate step size \(\tau_{r}\) and iteration number \(m_{k,r}\) satisfying \[\tau_{r}\leq\frac{\mu_{r}}{64L_{r}^{2}d}\cdot(1-e^{-2(S-\tau\eta)})_{\epsilon} \quad\text{and}\quad m_{k,r}\geq\frac{1}{\mu_{r}}\cdot\frac{64L_{r}^{2}d}{\mu_ {r}(1-e^{-2(S-\tau\eta)})\epsilon}\cdot\log\frac{2C_{0}}{(1-e^{-2(S-\tau\eta)} )\epsilon}\] (36) to generate samples \(\mathbf{x}^{\prime}\) whose underlying distribution \(q^{\prime}_{k,S-\tau\eta}(\cdot|\mathbf{x})\) is sufficiently close to \(q_{k,S-\tau\eta}(\mathbf{x}^{\prime}|\mathbf{x})\), i.e., \[\operatorname{KL}\big{(}q^{\prime}_{k,S-\tau\eta}(\cdot|\mathbf{x})\|q_{k,S-\tau \eta}(\cdot|\mathbf{x})\big{)}\leq(1-e^{-2(S-\tau\eta)})\epsilon.\]
+3. Generate a sufficient number of samples satisfying \[n_{k,r}\geq\frac{4}{\epsilon(1-e^{-2(S-\tau\eta)})}\cdot\max\left\{d,-2\log \delta\right\}.\] (37) such that the empirical estimation of the expectation in (34) is accurate, i.e., \[\mathbb{P}\left[\left\|\nabla\log p_{k,S-\tau\eta}(\mathbf{x})-\tilde {\mathbf{v}}_{k,\tau\eta}(\mathbf{x})\right\|^{2}\leq 10\epsilon\right]\] \[=\mathbb{P}\left[\left\|\nabla\log p_{k,S-\tau\eta}(\mathbf{x})-\frac {1}{n_{k,r}}\sum_{i=1}^{n_{k,r}}\left[-\frac{\mathbf{x}-e^{-(S-\tau\eta)}\mathbf{x}^{ \prime}_{i,m_{k,r}}}{\left(1-e^{-2(S-\tau\eta)}\right)}\right]\right\|\leq 10 \epsilon\right]\geq 1-\delta.\]
+
+Due to the fact \(r\eta\geq 0\), the first condition can be achieved by requiring
+
+\[\big{\|}\nabla\log p_{k,0}(\mathbf{x}^{\prime}_{i,j})-\mathbf{v}^{-}_{k-1,0}(\mathbf{x }^{\prime}_{i,j})\big{\|}\leq\sqrt{\frac{2}{3}}\cdot\frac{\epsilon^{0.5}}{8} \leq\sqrt{\frac{2L}{2L+1}}\cdot\frac{\epsilon^{0.5}}{8}=\frac{e^{-S}\epsilon^ {0.5}}{8}\leq\frac{e^{-(S-\tau\eta)}\epsilon^{0.5}}{8},\]
+
+where the second inequality is established by supposing \(L\geq 1\) without loss of generality, and the last equation follows from the choice of \(S\).
+
+To investigate the setting of hyper-parameters, i.e., the number of samples for empirical mean estimation \(n_{k,r}\) and the number of iterations for ULA \(m_{k,r}\). We first reformulate them as two functions, i.e.,
+
+\[n_{k,r}(10\epsilon)=C_{n}\cdot\frac{(d+M)\cdot\max\{d,-2\log \delta\}}{(10\epsilon)^{2}}\quad\text{where}\quad C_{n}=2^{6}\cdot 5^{2}\cdot C_{ \eta}^{-1},\] \[m_{k,r}(10\epsilon,\mathbf{x})=C_{m}\cdot\frac{(d+M)^{3}\cdot\max\{ \log\|\mathbf{x}\|^{2},1\}}{(10\epsilon)^{3}}\quad\text{where}\quad C_{m}=2^{9} \cdot 3^{2}\cdot 5^{3}\cdot C_{m,1}C_{\eta}^{-1.5}.\]
+
+since this presentation helps to explain the connection between them and the input of Alg 1. Different from the results shown in Lemma E.7, \(n_{k,r}(\cdot)\) and \(m_{k,r}(\cdot,\cdot)\) is independent with \(k\) and \(r\). However, these choices will still make Eq 36 and Eq 37 establish, because
+
+\[n_{k,r}(10\epsilon)= \frac{16}{\epsilon}\cdot\frac{(d+M)}{C_{\eta}\epsilon}\cdot\max \left\{d,-2\log\delta\right\}\geq\frac{16}{\epsilon\eta}\cdot\max\left\{d,-2 \log\delta\right\}\] \[\geq \frac{16}{\epsilon(1-e^{-2\eta})}\cdot\max\left\{d,-2\log\delta \right\}\geq\frac{16}{\epsilon(1-e^{-2(S-\tau\eta)})}\cdot\max\left\{d,-2 \log\delta\right\}\] \[m_{k,r}(10\epsilon,\mathbf{x})= 576\cdot\frac{(d+M)^{3}}{\epsilon^{3}}\cdot\frac{C_{m,1}}{C_{ \eta}^{1.5}}\cdot\max\{\log\|\mathbf{x}\|^{2},1\}\geq 64\cdot\frac{L_{r}^{2}}{\mu_{r}^{2}} \cdot\left(\frac{d}{\epsilon\eta}\right)^{1.5}\cdot C_{m,1}\cdot\max\{\log\| \mathbf{x}\|^{2},1\}\] \[\geq 64\cdot\frac{L_{r}^{2}}{\mu_{r}^{2}}\cdot\frac{d}{\epsilon\eta} \log\frac{d}{\epsilon\eta}\cdot C_{m,1}\cdot\max\{\log\|\mathbf{x}\|^{2},1\}\geq 6 4\cdot\frac{L_{r}^{2}}{\mu_{r}^{2}}\cdot\frac{d}{\epsilon\eta}\left(\log \frac{d\|\mathbf{x}\|^{2}}{\epsilon\eta}+C_{m,1}\right)\] \[\geq 64\cdot\frac{L_{r}^{2}}{\mu_{r}^{2}}\cdot\frac{d}{\epsilon(1-e^{ -2\eta})}\left(\log\frac{d\|\mathbf{x}\|^{2}}{\epsilon(1-e^{-2\eta})}+C_{m,1}\right)\] \[\geq \frac{64L_{r}^{2}d}{\mu_{r}^{2}(1-e^{-2(S-\tau\eta)})\epsilon} \cdot\left(\log\frac{d\|\mathbf{x}\|^{2}}{(1-e^{-2(S-\tau\eta)})\epsilon}+C_{m,1}\right)\]with the proper choice of step size, i.e., \(\eta=C_{\eta}(d+M)^{-1}\epsilon\). With these settings, Lemma E.7 demonstrates that
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x})-\mathbf{v}_{k,r\eta}^{ \leftarrow}(\mathbf{x})\right\|^{2}\leq 10\epsilon,\forall\mathbf{x}\in\mathbb{R}^{d}\right]\]
+
+where \(\mathbb{S}_{k,r}(\mathbf{x},10\epsilon)\) denotes the set of particles appear in Alg 1 when the input is \((k,r,\mathbf{x},10\epsilon)\) except for the recursion. It satisfies \(|\mathbb{S}_{k,r}(\mathbf{x},10\epsilon)|=n_{k,r}(10\epsilon)\cdot m_{k,r}(10 \epsilon,\mathbf{x})\). Furthermore, we have
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x})-\mathbf{v }_{k,r\eta}^{\leftarrow}(\mathbf{x})\right\|^{2}\leq 10\epsilon\right] \tag{38}\] \[\geq\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x})- \mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x})\right\|^{2}\leq 10\epsilon\right| \bigcap_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r}(\mathbf{x},10\epsilon)}\left\|\nabla \log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime} )\right\|^{2}\leq\frac{\epsilon}{96}\right]\] \[\geq(1-\delta)\cdot\mathbb{P}\left[\bigcap_{\mathbf{x}^{\prime}\in \mathbb{S}_{k,r}(\mathbf{x},10\epsilon)}\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})- \mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon }{96}\right].\]
+
+Considering that for each \(\mathbf{x}^{\prime}_{i,j}\), the score estimation, i.e., \(\mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime}_{i,j})\) is independent, hence, we have
+
+\[\mathbb{P}\left[\bigcap_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r}(\mathbf{ x},10\epsilon)}\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{v}_{k-1,0} ^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon}{96}\right] \tag{39}\] \[=\prod_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r}(\mathbf{x},10\epsilon)} \mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{v}_{k-1,0} ^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon}{96}\right]\] \[\geq\left(\min_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r}(\mathbf{x}, \epsilon)}\mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{v }_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon}{96} \right]\right)^{\mathbb{S}_{k,r}(\mathbf{x},\epsilon)|}\]
+
+Therefore, combining Eq 38 and Eq 39, we have
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x})-\mathbf{v }_{k,r\eta}^{\leftarrow}(\mathbf{x})\right\|^{2}\leq 10\epsilon\right]\] \[\geq (1-\delta)\cdot\left(\min_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r}( \mathbf{x},\epsilon)}\mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})- \mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon }{96}\right]\right)^{n_{k,r}(10\epsilon)\cdot m_{k,r}(10\epsilon,\mathbf{x})},\]
+
+and the proof is completed. 
+
+**Corollary E.9** (Errors from coarse-grained score estimation).: _Under the notation in Section A, suppose the step size satisfy \(\eta=C_{1}(d+M)^{-1}\epsilon\), we have_
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k+1,0}(\mathbf{x})-\mathbf{v}_{ k,0}^{\leftarrow}(\mathbf{x})\right\|^{2}\leq 10\epsilon,\forall\mathbf{x}\in\mathbb{R}^{ d}\right] \tag{40}\] \[\geq (1-\delta)\cdot\left(\min_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,0}( \mathbf{x},\epsilon)}\mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})- \mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon }{96}\right]\right)^{n_{k,0}(10\epsilon)\cdot m_{k,0}(10\epsilon,\mathbf{x})},\]
+
+_where \(\mathbb{S}_{k,0}(\mathbf{x},10\epsilon)\) denotes the set of particles appear in Alg 1 when the input is \((k,0,\mathbf{x},10\epsilon)\). For any \(k\in\mathbb{N}_{1,K-1}\) by requiring_
+
+\[n_{k,0}(10\epsilon)=C_{n}\cdot\frac{(d+M)\cdot\max\{d,-2\log \delta\}}{(10\epsilon)^{2}}\quad\mathrm{where}\quad C_{n}=2^{6}\cdot 5^{2} \cdot C_{\eta}^{-1},\] \[m_{k,0}(10\epsilon,\mathbf{x})=C_{m}\cdot\frac{(d+M)^{3}\cdot\max\{ \log\|\mathbf{x}\|^{2},1\}}{(10\epsilon)^{3}}\quad\mathrm{where}\quad C_{m}=2^{ 9}\cdot 3^{2}\cdot 5^{3}\cdot C_{m,1}C_{\eta}^{-1.5}.\]
+
+_Besides, for any \(\mathbf{x}\in\mathbb{R}^{d}\), we have_
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{0,0}(\mathbf{x}^{\prime})-\mathbf{v}_{-1,0}^{ \leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon}{96},\forall\mathbf{x} ^{\prime}\in\mathbb{R}^{d}\right]=1\]
+
+_by requiring \(\bar{\mathbf{v}}_{-1,0}(\mathbf{x}^{\prime})=-\nabla f_{*}(\mathbf{x}^{\prime})\), which corresponds to Line 2 in Alg 1._Proof.: When \(k>0\), plugging \(r=0\) into Lemma E.8, we can obtain the result except inequality Eq 40. Instead, we have
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S}(\mathbf{x})-\mathbf{v}_{k,0} ^{\leftarrow}(\mathbf{x})\right\|^{2}\leq 10\epsilon,\forall\mathbf{x}\in\mathbb{R}^{d}\right] \tag{41}\] \[\geq (1-\delta)\cdot\left(\min_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,0}(\bm {x},\epsilon)}\mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})- \mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{ \epsilon}{96}\right]\right)^{n_{k,0}(10\epsilon)\cdot m_{k,0}(10\epsilon,\mathbf{x} )}.\]
+
+Since the forward process, i.e., SDE 1, satisfies \(\mathbf{x}_{k,S}=\mathbf{x}_{k+1,0}\), we have
+
+\[p_{k,S}(\mathbf{x})=p_{k+1,0}(\mathbf{x})=\int p_{*}(\mathbf{y})\cdot\left(2\pi\left(1-e^{ -2(k+1)S}\right)\right)^{-d/2}\cdot\exp\left[\frac{-\left\|\mathbf{x}-e^{-(k+1)S} \mathbf{y}\right\|^{2}}{2\left(1-e^{-2(k+1)S}\right)}\right]\mathrm{d}\mathbf{y},\]
+
+which means \(\nabla\log p_{k,S}=\nabla\log p_{k+1,0}\). Therefore, Eq 40 is established.
+
+When \(k=0\), due to the definition of \(\hat{\mathbf{v}}_{-1,0}\) in Eq 7, we know Eq 41 is established. Hence, the proof is completed. 
+
+**Lemma E.10** (Errors from score estimation).: _Under the notation in Section A, suppose the step size satisfy \(\eta=C_{\eta}(d+M)^{-1}\epsilon\), we have_
+
+\[\mathbb{P}\left[\bigcap_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta}^{\leftarrow})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r\eta}^{ \leftarrow})\right\|^{2}\leq 10\epsilon\right]\geq 1-\epsilon\]
+
+_with Alg 1 by properly choosing the number for mean estimations and ULA iterations. The total gradient complexity will be at most_
+
+\[\exp\left[\mathcal{O}\left(\left(\log\frac{Ld+M}{\epsilon}\right)^{3}\cdot\max \left\{\log\log Z^{2},1\right\}\right)\right],\]
+
+_where \(Z\) is the maximal norm of particles that appear in Alg 2._
+
+Proof.: We begin with lower bounding the following probability with \((i,j)\in\mathbb{N}_{0,K-1}\times\mathbb{N}_{0,R-1}\) and \((i,j)\neq(0,0)\),
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta}^{\leftarrow}) -\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r\eta}^{\leftarrow})\right\|^{2} \leq 10\epsilon\right].\]
+
+In the following part of this Lemma, we set \(\eta=C_{\eta}(d+M)^{-1}\epsilon\) and denote \(\delta\) as a tiny positive constant waiting for determining. With Lemma E.8, we have
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta} ^{\leftarrow})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r\eta}^{\leftarrow} )\right\|^{2}\leq 10\epsilon\right]\] \[\geq (1-\delta)\cdot\left(\min_{\mathbf{x}^{\prime}\in\mathbb{S}_{k,r\eta} (\mathbf{x}_{k,r\eta}^{\leftarrow};10\epsilon)}\mathbb{P}\left[\left\|\nabla\log p_ {k,0}(\mathbf{x}^{\prime})-\mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime}) \right\|^{2}\leq\frac{10\epsilon}{960}\right]\right)^{n_{k,r}(10\epsilon) \cdot m_{k,r}(10\epsilon,\mathbf{x}_{k,r\eta}^{\leftarrow})}. \tag{42}\]
+
+Then, if \(k\geq 1\), for each item of the latter term, supposing \(10\epsilon^{\prime}=\epsilon/96\), Lemma E.9 shows
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{ v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{\epsilon}{96} \right]=\mathbb{P}\left[\left\|\nabla\log p_{k,0}(\mathbf{x}^{\prime})-\mathbf{v}_{k-1,0}^{\leftarrow}(\mathbf{x}^{\prime})\right\|^{2}\leq 10\epsilon^{\prime}\right]\] \[\geq (1-\delta)\cdot\left(\min_{\mathbf{x}^{\prime\prime}\in\mathbb{S}_{k -1,0}(\mathbf{x}^{\prime},10\epsilon^{\prime})}\mathbb{P}\left[\left\|\nabla\log p _{k-1,0}(\mathbf{x}^{\prime\prime})-\mathbf{v}_{k-2,0}^{\leftarrow}(\mathbf{x}^{ \prime\prime})\right\|^{2}\leq\frac{\epsilon^{\prime}}{96}\right]\right)^{n_{k,0 }(10\epsilon^{\prime})\cdot m_{k,r}(10\epsilon^{\prime},\mathbf{x}^{\prime})}\] \[= (1-\delta)\cdot\left(\min_{\mathbf{x}^{\prime\prime}\in\mathbb{S}_{k -1,0}(\mathbf{x}^{\prime\prime},\epsilon/96)}\mathbb{P}\left[\left\|\nabla\log p_ {k-1,0}(\mathbf{x}^{\prime\prime})-\mathbf{v}_{k-2,0}^{\leftarrow}(\mathbf{x}^{\prime \prime})\right\|^{2}\leq\frac{\epsilon}{96\cdot 960}\right]\right)^{n_{k,0}(\epsilon/96) \cdot m_{k,0}(\epsilon/96,\mathbf{x}^{\prime\prime})}.\]
+
+Only particles that appear in the iteration will appear in powers of Eq 42. To simplify the notation, we set \(Z\) as the upper bound of the norm of particles appear in Alg 2,
+
+\[m_{k,r}(10\epsilon,\mathbf{x})\leq m_{k,r}(10\epsilon)\coloneqq C_{m} \cdot\frac{(d+M)^{3}\cdot\max\{2\log Z,1\}}{(10\epsilon)^{3}}\] \[\mathrm{and}\quad u_{k,r}(\epsilon)\coloneqq n_{k,r}(\epsilon) \cdot m_{k,r}(\epsilon).\]Plugging this inequality into Eq 42, we have
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta}^{ \leftarrow})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r\eta}^{\leftarrow}) \right\|^{2}\leq 10\epsilon\right]\] \[\geq (1-\delta)^{1+u_{k,r}(10\epsilon)}\cdot\left(\mathbb{P}\left[ \left\|\nabla\log p_{k-1,0}(\mathbf{x}^{\prime\prime})-\mathbf{v}_{k-2,0}^{ \leftarrow}(\mathbf{x}^{\prime\prime})\right\|^{2}\leq\frac{10\epsilon}{(960)^{2} }\right]\right)^{u_{k,r}(10\epsilon)\cdot u_{k,0}(\frac{10\epsilon}{960})}.\]
+
+Using Lemma E.9 recursively, we will have
+
+\[\mathbb{P}\left[\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r\eta}^ {\leftarrow})-\mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{x}_{k,r\eta}^{\leftarrow} )\right\|^{2}\leq 10\epsilon\right]\] \[\geq (1-\delta)^{1+u_{k,r}(10\epsilon)+u_{k,r}(10\epsilon)\cdot u_{k,0 }(\frac{10\epsilon}{960})+\ldots+u_{k,r}(10\epsilon)\cdot\prod_{i=k}^{2}u_{i,0} \left(\frac{10\epsilon}{960^{k-i+1}}\right)} \tag{43}\] \[\left(\mathbb{P}\left[\left\|\nabla\log p_{0,0}(\mathbf{x}^{\prime})- \tilde{\mathbf{v}}_{-1,0}(\mathbf{x}^{\prime})\right\|^{2}\leq\frac{10\epsilon}{(9 60)^{k+1}},\forall\mathbf{x}^{\prime}\in\mathbb{R}^{d}\right]\right)^{u_{k,r}(10 \epsilon)\prod_{i=k}^{2}u_{i,0}\left(\frac{10\epsilon}{960^{k-i+1}}\right)}\] \[= (1-\delta)^{1+u_{k,r}(10\epsilon)+u_{k,r}(10\epsilon)\cdot u_{k,0 }(\frac{10\epsilon}{960})+\ldots+u_{k,r}(10\epsilon)\cdot\prod_{i=k}^{2}u_{i,0 }\left(\frac{10\epsilon}{960^{k-i+1}}\right)}\] \[\geq 1-\delta\cdot\left(1+u_{k,r}(10\epsilon)+u_{k,r}(10\epsilon) \cdot u_{k,0}\left(\frac{10\epsilon}{960}\right)+\ldots+u_{k,r}(10\epsilon) \cdot\prod_{i=k}^{2}u_{i,0}\left(\frac{10\epsilon}{960^{k-i+1}}\right)\right)\]
+
+where the third inequality follows from the case \(k=0\) in Lemma E.9 and the last inequality follows from union bound.
+
+Then, we start to upper bound the coefficient of \(\delta\). According to Lemma E.8 and Lemma E.9, it can be noted that the function \(u_{k,r}(\cdot)\) is independent with \(k\) and \(r\). It is actually because we provide a union bound for the sample number \(n_{k,r}\) and the iteration number \(m_{k,r}\) when \((k,r)\in\mathbb{N}_{0,K-1}\times\mathbb{N}_{0,R-1}\). Therefore, the explicit form of the uniformed \(u\) is defined as
+
+\[u(10\epsilon)=\underbrace{C_{n}C_{m}\cdot(d+m_{2}^{2})^{4}\cdot\max\{d,\log(1/ \delta^{2})\}\cdot\max\{2\log Z,1\}}_{\text{independent with }\epsilon} \cdot(10\epsilon)^{-5}\]
+
+Then, we have
+
+\[u\left(\frac{10\epsilon}{960}\right)=u(10\epsilon)\cdot 960^{5}\quad\text{and}\quad u \left(\frac{10\epsilon}{960^{i}}\right)=u(10\epsilon)\cdot 960^{5i}.\]
+
+Combining this result with Eq 43, we obtain
+
+\[1+u_{k,r}(10\epsilon)+u_{k,r}(10\epsilon)\cdot u_{k,0}\left( \frac{10\epsilon}{960}\right)+\ldots+u_{k,r}(10\epsilon)\cdot\prod_{i=k}^{2}u _{i,0}\left(\frac{10\epsilon}{960^{k-i+1}}\right)\] \[\leq(k+1)\cdot u(10\epsilon)\cdot\prod_{i=k}^{2}u\left(\frac{10 \epsilon}{960^{5(k-i+1)}}\right)=(k+1)\cdot u(10\epsilon)\cdot\prod_{i=k}^{2} \left(u(10\epsilon)\cdot 960^{k-i+1}\right)\] \[=(k+1)\cdot 960^{2.5k(k-1)}\cdot u(10\epsilon)^{k}\leq K\cdot 960^{2.5(K-1)(K-2)}\cdot u(10\epsilon)^{K-1}.\]
+
+Considering that \(K=2/S\cdot\log[(Ld+M)/\epsilon]\), to bound RHS of the previous inequality, we have
+
+\[\log\left(960^{2.5(K-1)(K-2)}\cdot u(10\epsilon)^{K-1}\right)=2.5(K-1)(K-2) \log(960)+(K-1)\log(u(10\epsilon))\]
+
+\[\leq 2.5\cdot\log(960)\cdot\left(\frac{2}{S}\log\frac{Ld+M}{\epsilon}\right)^{2 }+\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\left(\log C_{n}C_{m}+4\log(d+M)+ \log d+\log\left(2\log\frac{1}{\delta}\right)\right.\]
+
+To make the result more clear, we set
+
+\[C_{u,1}\coloneqq\log(C_{n}C_{m})+\log 2+\log\left(2\max\left\{\log Z,\frac{1}{2}\right\}\right)-5\log 10\]
+
+which is independent with \(d\), \(\epsilon\) and \(\delta\). Then, it has
+
+\[\log\left(960^{2.5(K-1)(K-2)}\cdot u(10\epsilon)^{K-1}\right)\] \[\leq \frac{70}{S^{2}}\left(\log\frac{Ld+M}{\epsilon}\right)^{2}+\frac{2 }{S}\log\frac{Ld+M}{\epsilon}\cdot\left[C_{u,1}+5\log(d+M)+\log\log\frac{1}{ \delta}+5\log\frac{1}{\epsilon}\right].\]which means
+
+\[\begin{split}& 960^{2.5(K-1)(K-2)}\cdot u(10\epsilon)^{K-1}\\ &\leq\exp\left[\frac{70}{S^{2}}\left(\log\frac{Ld+M}{\epsilon} \right)^{2}+\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\left(C_{u,1}+5\log(d+M)+ \log\log\frac{1}{\delta}+5\log\frac{1}{\epsilon}\right)\right]\\ &\leq\mathrm{pow}\left(\frac{Ld+M}{\epsilon},\left(\left(\frac{70} {S^{2}}+\frac{10}{S}\right)\log\frac{Ld+M}{\epsilon}+\frac{2}{S}\log\log\frac{ 1}{\delta}+\frac{2C_{u,1}}{S}\right)\right)\end{split} \tag{44}\]
+
+where the last inequality suppose \(L\geq 1\) as the previous settings. To simplify notation, we set
+
+\[C_{u,2}\coloneqq\frac{70}{S^{2}}+\frac{10}{S}\quad\mathrm{and}\quad C_{u,3} \coloneqq\frac{2C_{u,1}}{S}.\]
+
+Plugging this result into Eq 43, we have
+
+\[\begin{split}&\mathbb{P}\left[\left\|\nabla\log p_{k,S-rn}(\mathbf{x}_{k,rn}^{\leftarrow})-\mathbf{v}_{k,rn}^{\leftarrow}(\mathbf{x}_{k,rn}^{\leftarrow}) \right\|^{2}\leq 10\epsilon\right]\\ &\geq 1-\delta\cdot K\cdot\mathrm{pow}\left(\frac{Ld+M}{\epsilon},C_{u, 2}\log\frac{Ld+M}{\epsilon}+\frac{2}{S}\log\log\frac{1}{\delta}+C_{u,3}\right).\end{split} \tag{45}\]
+
+With these conditions, we can lower bound score estimation errors along Alg 2. That is
+
+\[\begin{split}&\mathbb{P}\left[\bigcap_{\begin{subarray}{c}k\in \mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\left\|\nabla\log p_{k,S-rn}(\mathbf{x}_{k,rn}^{ \leftarrow})-\mathbf{v}_{k,rn}^{\leftarrow}(\mathbf{x}_{k,rn}^{\leftarrow}) \right\|^{2}\leq 10\epsilon\right]\\ &=\prod_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\mathbb{P}\left[\left\|\nabla\log p_{k,S-rn} (\mathbf{x}_{k,rn}^{\leftarrow})-\mathbf{v}_{k,rn}^{\leftarrow}(\mathbf{x}_{k,rn}^{ \leftarrow})\right\|^{2}\leq 10\epsilon\right]\end{split}\]
+
+where the first inequality establishes because the random variables, \(\mathbf{v}_{k,rn}^{\leftarrow}\), are independent for each \((k,r)\) pair. By introducing Eq 45, we have
+
+\[\begin{split}&\prod_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\mathbb{P}\left[\left\|\nabla\log p_{k,S- rn}(\mathbf{x}_{k,rn}^{\leftarrow})-\mathbf{v}_{k,rn}^{\leftarrow}(\mathbf{x}_{k,rn}^{ \leftarrow})\right\|^{2}\leq 10\epsilon\right]\\ \geq&\left(1-\delta\cdot K\cdot\mathrm{pow}\left( \frac{Ld+M}{\epsilon},C_{u,2}\log\frac{Ld+M}{\epsilon}+\frac{2}{S}\log\log \frac{1}{\delta}+C_{u,3}\right)\right)^{KR}\\ \geq& 1-\delta\cdot K^{2}R\cdot\mathrm{pow}\left( \frac{Ld+M}{\epsilon},C_{u,2}\log\frac{Ld+M}{\epsilon}+\frac{2}{S}\log\log \frac{1}{\delta}+C_{u,3}\right)\\ =& 1-\delta\cdot\frac{4(d+M)}{SC_{u}\epsilon}\left( \log\frac{Ld+M}{\epsilon}\right)^{2}\cdot\mathrm{pow}\left(\frac{Ld+M}{ \epsilon},C_{u,2}\log\frac{Ld+M}{\epsilon}+\frac{2}{S}\log\log\frac{1}{\delta} +C_{u,3}\right)\end{split} \tag{46}\]
+
+where the first inequality follows from Eq 45 and the second inequality follows from the union bound, and the last inequality follows from the combination of the choice of the step size, i.e., \(\eta=C_{1}(d+M)^{-1}\epsilon\) and the definition of \(K\) and \(R\), i.e.,
+
+\[K=\frac{T}{S}=\frac{2}{S}\log\frac{C_{0}}{\epsilon},\quad R=\frac{S}{\eta}= \frac{S(d+M)}{C_{\eta}\epsilon}.\]
+
+It means when \(\delta\) is small enough, we can control the recursive error with a high probability, i.e.,
+
+\[\prod_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\mathbb{P}\left[\left\|\nabla\log p_{k,S- rn}(\mathbf{x}_{k,rn}^{\leftarrow})-\mathbf{v}_{k,rn}^{\leftarrow}(\mathbf{x}_{k,rn}^{ \leftarrow})\right\|^{2}\leq 10\epsilon\right]\geq 1-\epsilon. \tag{47}\]
+
+Compared with Eq 46, Eq 47 can be achieved by requiring
+
+\[\underbrace{\frac{4(d+M)}{SC_{u}\epsilon}\left(\log\frac{Ld+M}{\epsilon} \right)^{2}\cdot\mathrm{pow}\left(\frac{Ld+M}{\epsilon},C_{u,2}\log\frac{Ld+M} {\epsilon}+C_{u,3}\right)}_{\text{defined as}\,C_{B}}\cdot\delta\mathrm{pow} \left(\frac{Ld+M}{\epsilon},\frac{2}{S}\log\log\frac{1}{\delta}\right)\leq\epsilon.\]which can be obtained by requiring
+
+\[\begin{split}& C_{B}\delta(-\log\delta)^{\frac{2}{3}\log\frac{Ld+M} {\epsilon}}\leq\epsilon\quad\Leftrightarrow\quad(-\log\delta)^{\frac{2}{3}\log \frac{Ld+M}{\epsilon}}\leq\frac{\epsilon}{C_{B}\delta}\\ &\quad\Leftrightarrow\quad\frac{2}{S}\log\frac{Ld+M}{\epsilon} \cdot\log\log\frac{1}{\delta}\leq\log\frac{\epsilon}{C_{B}\delta}\end{split} \tag{48}\]
+
+We suppose \(\delta=\epsilon/C_{B}\cdot a^{-2/S\cdot\log((Ld+M)/\epsilon)}\) and the last inequality of Eq 48 becomes
+
+\[\mathrm{LHS}=\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\log\left[\log\frac{C_{B}} {\epsilon}+\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\log a\right]\leq\frac{2}{ S}\log\frac{Ld+M}{\epsilon}\cdot\log a=\mathrm{RHS},\]
+
+which is hold if we require
+
+\[a\geq\max\left\{\frac{2C_{B}}{\epsilon},\left(\frac{Ld+M}{\epsilon}\right)^{2/ S},1\right\}.\]
+
+Because in this condition, we have
+
+\[\log\frac{C_{B}}{\epsilon}+\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\log a\leq \log\frac{a}{2}+(\log a)^{2}\leq\frac{2a}{5}+\frac{3a}{5}=a\quad\text{when} \quad a\geq 1,\]
+
+where the first inequality follows from the monotonicity of function \(\log(\cdot)\). Therefore, we have
+
+\[\log\left[\log\frac{C_{B}}{\epsilon}+\frac{2}{S}\log\frac{Ld+M}{\epsilon} \cdot\log a\right]\leq\log a\]
+
+and Eq 48 establishes. Without loss of generality, we suppose \(3C_{B}/\epsilon\) dominates the lower bound of \(a\). Hence, the choice of \(\delta\) can be determined.
+
+After determining the choice of \(\delta\), the only problem left is the gradient complexity of Alg 2. The number of gradients calculated in Alg 2 is equal to the number of calls for \(\tilde{\mathbf{v}}_{-1,0}\). According to Eq 43, we can easily note that the number of calls of \(\tilde{\mathbf{v}}_{-1,0}\) is
+
+\[u_{k,r}(10\epsilon)\cdot\prod_{i=k}^{1}u_{i,0}\left(\frac{10\epsilon}{960^{k- i+1}}\right)=u(10\epsilon)\prod_{i=k}^{1}u\left(\frac{10\epsilon}{960^{k-i+1}}\right)\]
+
+for each \((k,r)\) pair. We can upper bound RHS of the previous equation as
+
+\[\begin{split}& u(10\epsilon)\prod_{i=k}^{1}u\left(\frac{10 \epsilon}{960^{k-i+1}}\right)=u(10\epsilon)\cdot\prod_{i=k}^{2}\left(u(10 \epsilon)\cdot 960^{k-i+1}\right)\\ =& 960^{2.5k(k-1)}\cdot u(10\epsilon)^{k}\leq 960^{2.5(K-1)(K-2)}\cdot u(10\epsilon)^{K-1}.\end{split}\]
+
+Combining this result with the total number of \((k,r)\) pair, i.e., \(T/\eta\), the total gradient complexity can be relaxed as
+
+\[\begin{split}&\frac{T}{\eta}\cdot 960^{2.5k(k-1)}\cdot u(10 \epsilon)^{k}\leq K^{2}R\cdot 960^{2.5(K-1)(K-2)}\cdot u(10\epsilon)^{K-1}\\ &\leq\frac{4(d+M)}{SC_{\eta}\epsilon}\left(\log\frac{Ld+M}{ \epsilon}\right)^{2}\cdot\mathrm{pow}\left(\frac{Ld+M}{\epsilon},C_{u,2}\log \frac{Ld+M}{\epsilon}+\frac{2}{S}\log\log\frac{1}{\delta}+C_{u,3}\right)\\ &=C_{B}\cdot(-\log\delta)^{\frac{2}{3}\log\frac{Ld+M}{\epsilon}} \leq\frac{\epsilon}{\delta}=C_{B}\cdot a^{\frac{2}{3}\log\frac{Ld+M}{\epsilon }}\end{split} \tag{49}\]
+
+where the first inequality follows from the fact \(T/\eta=KR\), the second inequality follows from the combination of the choice of the step size, i.e., \(\eta=C_{1}(d+M)^{-1}\epsilon\) and the definition of \(K\) and \(R\), i.e.,
+
+\[K=\frac{T}{S}=\frac{2}{S}\log\frac{C_{0}}{\epsilon},\quad R=\frac{S}{\eta}= \frac{S(d+M)}{C_{1}\epsilon}\]and the last inequality follows from 48. Choosing \(a\) as its lower bound, i.e., \(2C_{B}/\epsilon\), RHS of Eq 49 satisfies
+
+\[\begin{split}& C_{B}\cdot a^{\frac{2}{3}\log\frac{Ld+M}{\epsilon}}=C _{B}\cdot\left(\frac{2C_{B}}{\epsilon}\right)^{\frac{2}{3}\log\frac{Ld+M}{ \epsilon}}\leq\left(\frac{2C_{B}}{\epsilon}\right)^{\frac{4}{3}\log\frac{Ld+M} {\epsilon}}\\ &\leq\mathrm{pow}\left(\frac{8(d+M)}{SC_{\eta}\epsilon^{2}}\cdot \left(\log\frac{Ld+M}{\epsilon}\right)^{2},\frac{4}{S}\log\frac{Ld+M}{\epsilon }\right)\\ &\quad\cdot\mathrm{pow}\left(\frac{Ld+M}{\epsilon},\frac{4C_{u,2}} {S}\left(\log\frac{Ld+M}{\epsilon}\right)^{2}+\frac{4C_{u,3}}{S}\left(\log \frac{Ld+M}{\epsilon}\right)\right)\\ &=\exp\left[\mathcal{O}\left(\left(\log\frac{Ld+M}{\epsilon} \right)^{3}\right)\right].\end{split} \tag{50}\]
+
+If we consider the effect of the norm of particles since we have
+
+\[C_{u,3}=\frac{2C_{u,1}}{S}=\mathcal{O}\left(\left(\max\left\{\log\log Z^{2},1 \right\}\right)\right),\]
+
+Combining this result with Eq 50, the proof is completed. 
+
+**Lemma E.11**.: _Under the notation in Section A, suppose the step size satisfy \(\eta=C_{\eta}(d+M)^{-1}\epsilon\), we have_
+
+\[\mathbb{P}\left[\bigcap_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\left\|\nabla\log p_{k,S-r\eta}(\mathbf{x}_{k,r \eta}^{+})-\mathbf{v}_{k,r\eta}^{-}(\mathbf{x}_{k,r\eta}^{-})\right\|^{2}\leq 10\epsilon \right]\geq 1-\delta^{\prime}\]
+
+_with Alg 1 by properly choosing the number for mean estimations and ULA iterations. The total gradient complexity will be at most_
+
+\[\exp\left(\mathcal{O}\left(\max\left\{\left(\log\frac{Ld+M}{\epsilon}\right)^{ 3},\log\frac{Ld+M}{\epsilon}\cdot\log\frac{1}{\delta^{\prime}}\right\}\cdot \max\left\{\log\log Z^{2},1\right\}\right)\right),\]
+
+_where \(Z\) is the maximal norm of particles appeared in Alg 2._
+
+Proof.: In this lemma, we follow the same proof roadmap as that shown in Lemma E.10. According to Eq 46, we have
+
+\[\begin{split}&\prod_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\mathbb{P}\left[\left\|\nabla\log p_{k,S-r \eta}(\mathbf{x}_{k,r\eta}^{-})-\mathbf{v}_{k,r\eta}^{+}(\mathbf{x}_{k,r\eta}^{-})\right\| ^{2}\leq 10\epsilon\right]\\ \geq& 1-\delta\cdot\frac{4(d+M)}{SC_{\eta}\epsilon} \left(\log\frac{Ld+M}{\epsilon}\right)^{2}\cdot\mathrm{pow}\left(\frac{Ld+M}{ \epsilon},C_{u,2}\log\frac{Ld+M}{\epsilon}+\frac{2}{S}\log\log\frac{1}{\delta} +C_{u,3}\right)\end{split}\]
+
+where the parameter \(\delta\) satisfies Lemma E.8 under certain conditions. It means we can control the recursive error with a high probability, i.e.,
+
+\[\prod_{\begin{subarray}{c}k\in\mathbb{N}_{0,K-1}\\ r\in\mathbb{N}_{0,R-1}\end{subarray}}\mathbb{P}\left[\left\|\nabla\log p_{k,S-r \eta}(\mathbf{x}_{k,r\eta}^{-})-\mathbf{v}_{k,r\eta}^{-}(\mathbf{x}_{k,r\eta}^{-})\right\| ^{2}\leq 10\epsilon\right]\geq 1-\delta^{\prime}. \tag{51}\]
+
+when \(\delta\) satisfies
+
+\[\underbrace{\frac{4(d+M)}{SC_{\eta}\epsilon}\left(\log\frac{Ld+M}{\epsilon} \right)^{2}\cdot\mathrm{pow}\left(\frac{Ld+M}{\epsilon},C_{u,2}\log\frac{Ld+ M}{\epsilon}+C_{u,3}\right)}_{\text{defined as $C_{B}$}}\cdot\mathrm{pow}\left(\frac{Ld+M}{\epsilon},\frac{2}{S}\log\log \frac{1}{\delta}\right)\leq\delta^{\prime}.\]
+
+We can reformulate the above inequality as follows.
+
+\[\begin{split}& C_{B}\delta(-\log\delta)^{\frac{2}{3}\log\frac{Ld+M} {\epsilon}}\leq\delta^{\prime}\quad\Leftrightarrow\quad(-\log\delta)^{\frac{2 }{3}\log\frac{Ld+M}{\epsilon}}\leq\frac{\delta^{\prime}}{C_{B}\delta}\\ &\Leftrightarrow\quad\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot \log\log\frac{1}{\delta}\leq\log\frac{\delta^{\prime}}{C_{B}\delta}.\end{split} \tag{52}\]By requiring \(\delta=\delta^{\prime}/C_{B}\cdot a^{-2/S\cdot\log((Ld+M)/\epsilon)}\), the last inequality of the above can be written as
+
+\[\mathrm{LHS}=\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\log\left[\log\frac{C_{B}} {\delta^{\prime}}+\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\log a\right]\leq \frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot\log a=\mathrm{RHS},\]
+
+when the choice of \(a\) satisfies
+
+\[a\geq\max\left\{\frac{2C_{B}}{\delta^{\prime}},\left(\frac{Ld+M}{\epsilon} \right)^{2/S},1\right\}. \tag{53}\]
+
+Since we have
+
+\[\log\frac{C_{B}}{\delta^{\prime}}+\frac{2}{S}\log\frac{Ld+M}{\epsilon}\cdot \log a\leq\log\frac{a}{2}+(\log a)^{2}\leq\frac{2a}{5}+\frac{3a}{5}=a\quad \mathrm{when}\quad a\geq 1,\]
+
+where the first inequality follows from the monotonicity of function \(\log(\cdot)\). Then, it has
+
+\[\log\left[\log\frac{C_{B}}{\delta^{\prime}}+\frac{2}{S}\log\frac{Ld+M}{ \epsilon}\cdot\log a\right]\leq\log a\]
+
+and Eq 52 establishes.
+
+To achieve the accurate score estimation with a high probability shown in Eq 51, the total gradient complexity will be
+
+\[\frac{T}{\eta}\cdot 960^{2.5k(k-1)}\cdot u(10c)^{k}\leq C_{B}\cdot a^{\frac{2} {S}\log\frac{Ld+M}{\epsilon}}\]
+
+shown in Eq 49. Plugging the choice of \(a\) (Eq 53) into the above inequality, we have
+
+\[C_{B}\cdot a^{\frac{2}{S}\log\frac{Ld+M}{\epsilon}} \leq C_{B}\cdot\max\left\{\mathrm{pow}\left(\frac{2C_{B}}{\delta^ {\prime}},\frac{2}{S}\log\frac{Ld+M}{\epsilon}\right),\mathrm{pow}\left(\frac {Ld+M}{\epsilon},\frac{4}{S^{2}}\log\frac{Ld+M}{\epsilon}\right)\right\}\] \[\leq\max\left\{\underbrace{\mathrm{pow}\left(\frac{2C_{B}}{ \delta^{\prime}},\frac{4}{S}\log\frac{Ld+M}{\epsilon}\right)}_{\mathrm{Term~{} Comp.1}},\underbrace{C_{B}\cdot\mathrm{pow}\left(\frac{Ld+M}{\epsilon}, \frac{4}{S^{2}}\log\frac{Ld+M}{\epsilon}\right)}_{\mathrm{Term~{}Comp.2}}\right\}\]
+
+It can be easily noted that Term \(\mathrm{Comp.2}\) will be dominated by Term \(\mathrm{Comp.1}\). Then, we provide the upper bound of \(\mathrm{Comp.1}\) as
+
+\[\log\left(\mathrm{Comp.1}\right)= \frac{4}{S}\log\frac{Ld+M}{\epsilon}\cdot\left(\log 2C_{B}+\log(1/ \delta^{\prime})\right)\] \[= \frac{4}{S}\log\frac{Ld+M}{\epsilon}\cdot\left(\log\frac{8}{SC_{ \eta}}+\log\frac{d+M}{\epsilon}+2\log\log\frac{Ld+M}{\epsilon}\right.\] \[\left.+\log\frac{Ld+M}{\epsilon}\cdot\left(C_{u,2}\log\frac{Ld+M }{\epsilon}+C_{u,3}\right)+\log(1/\delta^{\prime})\right)\] \[= \mathcal{O}\left(\max\left\{\left(\log\frac{Ld+M}{\epsilon}\right) ^{3},\log\frac{Ld+M}{\epsilon}\cdot\log\frac{1}{\delta^{\prime}}\right\} \right),\]
+
+which means
+
+\[C_{B}\cdot a^{\frac{2}{S}\log\frac{Ld+M}{\epsilon}}\leq\exp\left(\mathcal{O} \left(\max\left\{\left(\log\frac{Ld+M}{\epsilon}\right)^{3},\log\frac{Ld+M}{ \epsilon}\cdot\log\frac{1}{\delta^{\prime}}\right\}\right)\right).\]
+
+Hence, the proof is completed. 
+
+## Appendix F Auxiliary Lemmas
+
+### The chain rule of Kl divergence
+
+**Lemma F.1** (Lemma 6 in Chen et al. (2023a)).: _Consider the following two Ito processes,_
+
+\[\mathrm{d}\mathbf{x}_{t}= \mathbf{f}_{1}(\mathbf{x}_{t},t)\mathrm{d}t+g(t)\mathrm{d}B_{t}, \quad\mathbf{x}_{0}=\mathbf{a},\] \[\mathrm{d}\mathbf{y}_{t}= \mathbf{f}_{2}(\mathbf{y}_{t},t)\mathrm{d}t+g(t)\mathrm{d}B_{t}, \quad\mathbf{y}_{0}=\mathbf{a},\]
+
+_where \(\mathbf{f}_{1},\mathbf{f}_{2}\colon\mathbb{R}^{d}\to\mathbb{R}\) and \(g\colon\mathbb{R}\to\mathbb{R}\) are continuous functions and may depend on \(\mathbf{a}\). We assume the uniqueness and regularity conditions:_* _The two SDEs have unique solutions._
+* \(\mathbf{x}_{t},\mathbf{y}_{t}\) _admit densities_ \(p_{t},q_{t}\in C^{2}(\mathbb{R}^{d})\) _for_ \(t>0\)_._
+
+_Define the relative Fisher information between \(p_{t}\) and \(q_{t}\) by_
+
+\[\mathrm{FI}\left(p_{t}\|q_{t}\right)\coloneqq\int p_{t}(\mathbf{x})\left\|\nabla \log\frac{p_{t}(\mathbf{x})}{q_{t}(\mathbf{x})}\right\|^{2}\mathrm{d}\mathbf{x}.\]
+
+_Then for any \(t>0\), the evolution of \(\mathrm{KL}\left(p_{t}\|q_{t}\right)\) is given by_
+
+\[\frac{\partial}{\partial t}\mathrm{KL}\left(p_{t}\|q_{t}\right)=-\frac{g^{2}(t )}{2}\mathrm{FI}\left(p_{t}\|q_{t}\right)+\mathbb{E}\left[\left\langle\mathbf{f}_ {1}(\mathbf{x}_{t},t)-\mathbf{f}_{2}(\mathbf{x}_{t},t),\nabla\log\frac{p(\mathbf{x }_{t})}{q(\mathbf{x}_{t})}\right\rangle\right].\]
+
+Lemma F.1 is applied to show the KL convergence between the underlying distribution of the SDEs that have the same diffusion term and a bounded difference between their drift terms.
+
+**Lemma F.2** (Lemma 7 in Chen et al. (2023a)).: _Under the notation in Section A, for \(k\in\mathbb{N}_{0,K-1}\) and \(r\in\mathbb{N}_{0,R-1}\), consider the reverse SDE starting from \(\mathbf{x}_{k,r\eta}^{\leftarrow}=\mathbf{a}\)_
+
+\[\mathrm{d}\hat{\mathbf{x}}_{k,t}=\left[\hat{\mathbf{x}}_{k,t}+2\nabla\log p_{k,S-t}(\hat{\mathbf{x}}_{k,t})\right]\mathrm{d}t+\sqrt{2}\mathrm{d}B_{t},\quad \mathbf{x}_{k,r\eta}^{\leftarrow}=\mathbf{a} \tag{54}\]
+
+_and its discrete approximation_
+
+\[\mathrm{d}\mathbf{x}_{k,t}^{\leftarrow}=\left[\mathbf{x}_{k,t}^{\leftarrow}+2 \mathbf{v}_{k,r\eta}^{\leftarrow}\left(\mathbf{x}_{k,r\eta}^{\leftarrow}\right) \right]\mathrm{d}t+\sqrt{2}\mathrm{d}B_{t},\quad\mathbf{x}_{k,r\eta}^{ \leftarrow}=\mathbf{a} \tag{55}\]
+
+_for time \(t\in[k\eta,(k+1)\eta]\). Let \(\hat{p}_{k,t|r\eta}\) be the density of \(\hat{\mathbf{x}}_{k,t}\) given \(\hat{\mathbf{x}}_{k,r\eta}\) and \(p_{k,t|r\eta}^{\leftarrow}\) be the density of \(\mathbf{x}_{k,t}^{\leftarrow}\) given \(\mathbf{x}_{k,r\eta}^{\leftarrow}\). Then, we have_
+
+* _For any_ \(\mathbf{a}\in\mathbb{R}^{d}\)_, the two processes satisfy the uniqueness and regularity condition stated in Lemma F.1, which means SDE_ 54 _and SDE_ 55 _have unique solutions and_ \(\hat{p}_{k,t|r\eta}(\cdot|\mathbf{a}),p_{k,t|r\eta}^{\leftarrow}(\cdot|\mathbf{a})\in C ^{2}(\mathbb{R}^{d})\) _for_ \(t\in(r\eta,(r+1)\eta]\)_._
+* _For a.e.,_ \(\mathbf{a}\in\mathbb{R}^{d}\)_, we have_ \[\lim_{t\to r\eta_{+}}\mathrm{KL}\left(\hat{p}_{k,t|r\eta}(\cdot|\mathbf{a})\|\hat {p}_{k,t|r\eta}(\cdot|\mathbf{a})\right)=0.\]
+
+**Lemma F.3** (Variant of Proposition 8 in Chen et al. (2023a)).: _Under the notation in Section A and Algorithm 2, we have_
+
+\[\mathrm{KL}\left(\hat{p}_{0,S}\|p_{0,S}^{\leftarrow}\right)\leq \mathrm{KL}\left(\hat{p}_{K-1,0}\|p_{K-1,0}^{\leftarrow}\right)\] \[+\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta}\mathbb{E}_{(\hat{ \mathbf{x}}_{k,t+r\eta},\hat{\mathbf{x}}_{k,r\eta})}\left[\left\|\nabla\log p_{ k,S-(t+r\eta)}(\hat{\mathbf{x}}_{k,t+r\eta})-\mathbf{v}_{k,r\eta}^{ \leftarrow}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right]\mathrm{d}t.\]
+
+Proof.: Under the notation in Section A, for \(k\in\mathbb{N}_{0,K-1}\) and \(r\in\mathbb{N}_{0,R-1}\), let \(\hat{p}_{k,t|r\eta}\) be the density of \(\hat{\mathbf{x}}_{k,t}\) given \(\hat{\mathbf{x}}_{k,r\eta}\) and \(p_{k,t|r\eta}^{\leftarrow}\) be the density of \(\mathbf{x}_{k,t}^{\leftarrow}\) given \(\mathbf{x}_{k,r\eta}^{\leftarrow}\). According to Lemma F.2 and Lemma F.1, for any \(\mathbf{x}_{k,r\eta}^{\leftarrow}=\mathbf{a}\), we have
+
+\[\frac{\mathrm{d}}{\mathrm{d}t}\mathrm{KL}\left(\hat{p}_{k,t|r\eta }(\cdot|\mathbf{a})\|p_{k,t|r\eta}^{\leftarrow}(\cdot|\mathbf{a})\right)\] \[=-\mathrm{FI}\left(\hat{p}_{k,t|r\eta}(\cdot|\mathbf{a})\|p_{k,t|r\eta }^{\leftarrow}(\cdot|\mathbf{a})\right)+2\mathbb{E}_{\mathbf{x}\sim\hat{p}_{k,t|r \eta}(\cdot|\mathbf{a})}\left[\left\langle\nabla\log p_{k,S-t}(\mathbf{x})- \mathbf{v}_{k,r\eta}^{\leftarrow}(\mathbf{a}),\nabla\log\frac{\hat{p}_{k,t|r\eta} (\mathbf{x}|\mathbf{a})}{p_{k,t|r\eta}^{\leftarrow}(\mathbf{x}|\mathbf{a})}\right\rangle\right]\] \[\leq\mathbb{E}_{\mathbf{x}\sim\hat{p}_{k,t|r\eta}(\cdot|\mathbf{a})} \left[\left\|\nabla\log p_{k,S-t}(\mathbf{x})-\mathbf{v}_{k,r\eta}^{\leftarrow} (\mathbf{a})\right\|^{2}\right].\]
+
+Due to Lemma F.2, for any \(\mathbf{a}\in\mathbb{R}^{d}\), we have
+
+\[\lim_{t\to r\eta_{+}}\mathrm{KL}\left(\hat{p}_{k,t|r\eta}(\cdot|\mathbf{a})\|p_{k,t|r\eta}^{\leftarrow}(\cdot|\mathbf{a})\right)=0,\]which implies
+
+\[\mathrm{KL}\left(\hat{p}_{k,t|\tau\eta}(\cdot|\mathbf{a})\|p_{k,t|\tau\eta}^{+ \leftarrow}(\cdot|\mathbf{a})\right)=\int_{\tau\eta}^{t}\mathbb{E}_{\mathbf{x}\sim\hat{p} _{t|\tau\eta}(\cdot|\mathbf{a})}\left[\left\|\nabla\log p_{k,S-\tau}(\mathbf{x})- \mathbf{v}_{k,r\eta}^{+}(\mathbf{a})\right\|^{2}\right]\mathrm{d}\tau.\]
+
+Integrating both sides of the equation, we have
+
+\[\mathbb{E}_{\hat{\mathbf{x}}_{k,\tau\eta}\sim\hat{p}_{k,r\eta}}\left[\mathrm{KL} \left(\hat{p}_{k,t|\tau\eta}(\cdot|\hat{\mathbf{x}}_{k,r\eta})\|p_{k,t|\tau\eta} ^{+}(\cdot|\hat{\mathbf{x}}_{k,r\eta})\right)\right]\leq\int_{r\eta}^{t} \mathbb{E}\left[\left\|\nabla\log p_{k,S-\tau}(\hat{\mathbf{x}}_{k,r\eta})- \mathbf{v}_{k,r\eta}^{+}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right]\mathrm{ d}\tau.\]
+
+According to the chain rule of KL divergence Chen et al. (2023a), we have
+
+\[\mathrm{KL}\left(\hat{p}_{k,(t+1)\eta}\|p_{k,(t+1)\eta}^{+ \leftarrow}(\tau+1)\eta\right)\] \[\leq\mathrm{KL}\left(\hat{p}_{k,r\eta}\|p_{k,r\eta}^{+}\right)+ \mathbb{E}_{\hat{\mathbf{x}}_{k,r\eta}\sim\hat{p}_{k,r\eta}}\left[\mathrm{KL} \left(\hat{p}_{k,(r+1)\eta|r\eta}(\cdot|\hat{\mathbf{x}}_{k,r\eta})\|p_{k,(r+1 )\eta|r\eta}^{\leftarrow}(\cdot|\hat{\mathbf{x}}_{k,r\eta})\right)\right]\] \[\leq\mathrm{KL}\left(\hat{p}_{k,r\eta}\|p_{k,r\eta}^{+}\right)+ \int_{0}^{\eta}\mathbb{E}_{(\hat{\mathbf{x}}_{k,t+r\eta},\hat{\mathbf{x}}_{k,r \eta})}\left[\left\|\nabla\log p_{k,S-(t+\tau\eta)}(\hat{\mathbf{x}}_{k,t+\tau \eta})-\mathbf{v}_{k,r\eta}^{+}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right] \mathrm{d}t.\]
+
+Summing over \(r\in\{0,1,\ldots,R-1\}\), it has
+
+\[\mathrm{KL}\left(\hat{p}_{k,R\eta}\|p_{k,R\eta}^{+}\right)\leq\mathrm{KL} \left(\hat{p}_{k,0}\|p_{k,0}^{+}\right)+\sum_{r=0}^{R-1}\int_{0}^{\eta} \mathbb{E}_{(\hat{\mathbf{x}}_{k,t+r\eta},\hat{\mathbf{x}}_{k,r\eta})}\left[ \left\|\nabla\log p_{k,S-(t+\tau\eta)}(\hat{\mathbf{x}}_{k,t+r\eta})-\mathbf{ v}_{k,r\eta}^{+}(\hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right]\mathrm{d}t.\]
+
+Similarly, by considering all segments, we have
+
+\[\mathrm{KL}\left(\hat{p}_{0,S}\|p_{0,S}^{\leftarrow}\right)\leq \mathrm{KL}\left(\hat{p}_{K-1,0}\|p_{K-1,0}^{\leftarrow}\right)\] \[+\sum_{k=0}^{K-1}\sum_{r=0}^{R-1}\int_{0}^{\eta}\mathbb{E}_{(\hat{ \mathbf{x}}_{k,t+r\eta},\hat{\mathbf{x}}_{k,r\eta})}\left[\left\|\nabla\log p_ {k,S-(t+\tau\eta)}(\hat{\mathbf{x}}_{k,t+\tau\eta})-\mathbf{v}_{k,r\eta}^{+}( \hat{\mathbf{x}}_{k,r\eta})\right\|^{2}\right]\mathrm{d}t.\]
+
+**Lemma F.4** (Variant of Lemma 10 in Cheng & Bartlett (2018)).: _Suppose \(-\log p_{*}\) is \(m\)-strongly convex function, for any distribution with density function \(p\), we have_
+
+\[\mathrm{KL}\left(p\|p_{*}\right)\leq\frac{1}{2m}\int p(\mathbf{x})\left\|\nabla \log\frac{p(\mathbf{x})}{p_{*}(\mathbf{x})}\right\|^{2}\mathrm{d}\mathbf{x}.\]
+
+_By choosing \(p(\mathbf{x})=g^{2}(\mathbf{x})p_{*}(\mathbf{x})/\mathbb{E}_{p_{*}}\left[g^{2}(\mathbf{x})\right]\) for the test function \(g\colon\mathbb{R}^{d}\to\mathbb{R}\) and \(\mathbb{E}_{p_{*}}\left[g^{2}(\mathbf{x})\right]<\infty\), we have_
+
+\[\mathbb{E}_{p_{*}}\left[g^{2}\log g^{2}\right]-\mathbb{E}_{p_{*}}\left[g^{2} \right]\log\mathbb{E}_{p_{*}}\left[g^{2}\right]\leq\frac{2}{m}\mathbb{E}_{p_{* }}\left[\left\|\nabla g\right\|^{2}\right],\]
+
+_which implies \(p_{*}\) satisfies \(m\)-log-Sobolev inequality._
+
+**Lemma F.5**.: _(Corollary 3.1 in Chafai (2004)) If \(\nu,\tilde{\nu}\) satisfy LSI with constants \(\alpha,\tilde{\alpha}>0\), respectively, then \(\nu*\tilde{\nu}\) satisfies LSI with constant \((\frac{1}{\alpha}+\frac{1}{\alpha})^{-1}\)._
+
+**Lemma F.6** (Lemma 16 in Vempala & Wibisono (2019)).: _Suppose a probability distribution \(p\) satisfies LSI with constant \(\mu>0\). Let a map \(T\colon\mathbb{R}^{d}\to\mathbb{R}^{d}\), be a differentiable L-Lipschitz map. Then, \(\tilde{p}=T_{\#}p\) satisfies LSI with constant \(\mu/L^{2}\)_
+
+**Lemma F.7** (Lemma 17 in Vempala & Wibisono (2019)).: _Suppose a probability distribution \(p\) satisfies LSI with a constant \(\mu\). For any \(t>0\), the probability distribution \(\tilde{p}_{t}=p*\mathcal{N}(\mathbf{0},\mathbf{t}\mathbf{I})\) satisfies LSI with the constant \((\mu^{-1}+t)^{-1}\)._
+
+**Lemma F.8** (Theorem 8 in Vempala & Wibisono (2019)).: _Suppose \(p\propto\exp(-f)\) is \(\mu\) strongly log concave and \(L\)-smooth. If we conduct ULA with the step size satisfying \(\eta\leq 1/L\), then, for any iteration number, the underlying distribution of the output particle satisfies LSI with a constant larger than \(\mu/2\)._
+
+Proof.: Suppose we run ULA from \(\mathbf{x}_{0}\sim p_{0}\) to \(\mathbf{x}_{k}\sim p_{k}\) where the LSI constant of \(p_{k}\) is denoted as \(\mu_{k}\). When the step size of ULA satisfies \(0<\eta\leq 1/L\), due to the strong convexity of \(p\), the map \(\mathbf{x}\mapsto\mathbf{x}-\eta\nabla f(\mathbf{x})\) is \((1-\eta\mu)\)-Lipschitz. Combining the LSI property of \(p_{k}\) and Lemma F.6, the distribution of \(\mathbf{x}_{k}-\eta\nabla f(\mathbf{x}_{k})\) satisfies LSI with a constant \(\mu_{k}/(1-\eta\mu)^{2}\). Then, by Lemma F.7, \(\mathbf{x}_{k+1}=\mathbf{x}_{k}-\eta\nabla f(\mathbf{x}_{k})+\sqrt{2\eta} \mathcal{N}(0,\mathbf{I})\sim p_{k+1}\) satisfies \(\mu_{k+1}\)-LSI with
+
+\[\frac{1}{\mu_{k+1}}\leq\frac{(1-\eta\mu)^{2}}{\mu_{k}}+2\eta.\]
+
+For any \(k\), if there is \(\mu_{k}\geq\mu/2\), with the setting of \(\eta\), i.e., \(\eta\leq 1/L\leq 1/\mu\), then
+
+\[\frac{1}{\mu_{k+1}}\leq\frac{(1-\eta\mu)^{2}}{\mu/2}+2\eta=\frac{2}{\mu}-2\eta (1-\eta\mu)\leq\frac{2}{\mu}.\]
+
+It means for any \(k^{\prime}>k\), we have \(\mu_{k^{\prime}}\geq\mu/2\). By requiring the LSI constant of initial distribution, i.e., \(p_{0}\) to satisfy \(\mu_{0}\geq\mu/2\), we have the underlying distribution of the output particle satisfies LSI with a constant larger than \(\mu/2\). Hence, the proof is completed. 
+
+**Lemma F.9**.: _If \(\nu\) satisfies a log-Sobolev inequality with log-Sobolev constant \(\mu\) then every \(1\)-Lipschitz function \(f\) is integrable with respect to \(\nu\) and satisfies the concentration inequality_
+
+\[\nu\left\{f\geq\mathbb{E}_{\nu}[f]+t\right\}\leq\exp\left(-\frac{\mu t^{2}}{2 }\right).\]
+
+Proof.: According to Lemma F.10, it suffices to prove that for any \(1\)-Lipschitz function \(f\) with expectation \(\mathbb{E}_{\nu}[f]=0\),
+
+\[\mathbb{E}\left[e^{\lambda f}\right]\leq e^{\lambda^{2}/(2\mu)}.\]
+
+To prove this, it suffices, by a routine truncation and smoothing argument, to prove it for bounded, smooth, compactly supported functions \(f\) such that \(\left\|\nabla f\right\|\leq 1\). Assume that \(f\) is such a function. Then for every \(\lambda\geq 0\) the log-Sobolev inequality implies
+
+\[\mathrm{Ent}_{\nu}\left(e^{\lambda f}\right)\leq\frac{2}{\mu}\mathbb{E}_{\nu} \left[\left\|\nabla e^{\lambda f/2}\right\|^{2}\right],\]
+
+which is written as
+
+\[\mathbb{E}_{\nu}\left[\lambda fe^{\lambda f}\right]-\mathbb{E}_{\nu}\left[e^{ \lambda f}\right]\log\mathbb{E}\left[e^{\lambda f}\right]\leq\frac{\lambda^{2 }}{2\mu}\mathbb{E}_{\nu}\left[\left\|\nabla f\right\|^{2}e^{\lambda f}\right].\]
+
+With the notation \(\varphi(\lambda)=\mathbb{E}\left[e^{\lambda f}\right]\) and \(\psi(\lambda)=\log\varphi(\lambda)\), the above inequality can be reformulated as
+
+\[\lambda\varphi^{\prime}(\lambda)\leq \varphi(\lambda)\log\varphi(\lambda)+\frac{\lambda^{2}}{2\mu} \mathbb{E}_{\nu}\left[\left\|\nabla f\right\|^{2}e^{\lambda f}\right]\] \[\leq \varphi(\lambda)\log\varphi(\lambda)+\frac{\lambda^{2}}{2\mu} \varphi(\lambda),\]
+
+where the last step follows from the fact \(\left\|\nabla f\right\|\leq 1\). Dividing both sides by \(\lambda^{2}\varphi(\lambda)\) gives
+
+\[\left(\frac{\log(\varphi(\lambda))}{\lambda}\right)^{\prime}\leq\frac{1}{2\mu}.\]
+
+Denoting that the limiting value \(\frac{\log(\varphi(\lambda))}{\lambda}\mid_{\lambda=0}=\lim_{\lambda\to 0^{+}} \frac{\log(\varphi(\lambda))}{\lambda}=\mathbb{E}_{\nu}[f]=0\), we have
+
+\[\frac{\log(\varphi(\lambda))}{\lambda}=\int_{0}^{\lambda}\big{(}\frac{\log( \varphi(t))}{t}\big{)}^{\prime}dt\leq\frac{\lambda}{2\mu},\]
+
+which implies that
+
+\[\psi(\lambda)\leq\frac{\lambda^{2}}{2\mu}\Longrightarrow\varphi(\lambda)\leq \exp\left(\frac{\lambda^{2}}{2\mu}\right)\]
+
+Then the proof can be completed by a trivial argument of Lemma F.10. 
+
+**Lemma F.10**.: _Let \(\mathbf{x}\) be a real random variable. If there exist constants \(C,A<\infty\) such that \(\mathbb{E}\left[e^{\lambda\mathbf{x}}\right]\leq Ce^{A\lambda^{2}}\) for all \(\lambda>0\) then_
+
+\[\mathbb{P}\left\{\mathbf{x}\geq t\right\}\leq C\exp\left(-\frac{t^{2}}{4A}\right)\]Proof.: According to the non-decreasing property of exponential function \(e^{\lambda\mathbf{x}}\), we have
+
+\[\mathbb{P}\left\{\mathbf{x}\geq t\right\}=\mathbb{P}\left\{e^{\lambda\mathbf{x}} \geq e^{\lambda t}\right\}\leq\frac{\mathbb{E}\left[e^{\lambda\mathbf{x}} \right]}{e^{\lambda t}}\leq C\exp\left(A\lambda^{2}-\lambda t\right),\]
+
+The first inequality follows from Markov inequality, and the second follows from the given conditions. By minimizing the RHS, i.e., choosing \(\lambda=t/(2A)\), the proof is completed. 
+
+**Lemma F.11**.: _Suppose \(q\) is a distribution which satisfies LSI with constant \(\mu\), then its variance satisfies_
+
+\[\int q(\mathbf{x})\left\|\mathbf{x}-\mathbb{E}_{q}\left[\mathbf{x}\right]\right\|^{2} \mathrm{d}\mathbf{x}\leq\frac{d}{\mu}.\]
+
+Proof.: It is known that LSI implies Poincare inequality with the same constant, i.e., \(\mu\), which means if for all smooth function \(g\colon\mathbb{R}^{d}\to\mathbb{R}\),
+
+\[\mathrm{var}_{q}\left(g(\mathbf{x})\right)\leq\frac{1}{\mu}\mathbb{E}_{q} \left[\left\|\nabla g(\mathbf{x})\right\|^{2}\right].\]
+
+In this condition, we suppose \(\mathbf{b}=\mathbb{E}_{q}[\mathbf{x}]\), and have the following equation
+
+\[\int q(\mathbf{x})\left\|\mathbf{x}-\mathbb{E}_{q}\left[\mathbf{x}\right] \right\|^{2}\mathrm{d}\mathbf{x}=\int q(\mathbf{x})\left\|\mathbf{x}-\mathbf{b}\right\|^{2} \mathrm{d}\mathbf{x}\] \[= \int\sum_{i=1}^{d}q(\mathbf{x})\left(\mathbf{x}_{i}-\mathbf{b}_{i}\right)^{2} \mathrm{d}\mathbf{x}=\sum_{i=1}^{d}\int q(\mathbf{x})\left(\langle\mathbf{x},\mathbf{e}_{i} \rangle-\langle\mathbf{b},\mathbf{e}_{i}\rangle\right)^{2}\mathrm{d}\mathbf{x}\] \[= \sum_{i=1}^{d}\int q(\mathbf{x})\left(\langle\mathbf{x},\mathbf{e}_{i} \rangle-\mathbb{E}_{q}\left[\langle\mathbf{x},\mathbf{e}_{i}\rangle\right]\right)^ {2}\mathrm{d}\mathbf{x}=\sum_{i=1}^{d}\mathrm{var}_{q}\left(g_{i}(\mathbf{x})\right)\]
+
+where \(g_{i}(\mathbf{x})\) is defined as \(g_{i}(\mathbf{x}):=\langle\mathbf{x},\mathbf{e}_{i}\rangle\) and \(\mathbf{e}_{i}\) is a one-hot vector ( the \(i\)-th element of \(\mathbf{e}_{i}\) is \(1\) others are \(0\)). Combining this equation and Poincare inequality, for each \(i\), we have
+
+\[\mathrm{var}_{q}\left(g_{i}(\mathbf{x})\right)\leq\frac{1}{\mu}\mathbb{E}_{q} \left[\left\|\mathbf{e}_{i}\right\|^{2}\right]=\frac{1}{\mu}.\]
+
+Hence, the proof is completed. 
+
+**Lemma F.12**.: _(Lemma 12 in Vempala & Wibisono (2019)) Suppose \(p\propto\exp(-f)\) satisfies Talagrand's inequality with constant \(\mu\) and is \(L\)-smooth. For any \(p^{\prime}\),_
+
+\[\mathbb{E}_{p^{\prime}}\left[\left\|\nabla f(\mathbf{x})\right\|^{2}\right] \leq\frac{4L^{2}}{\mu}\mathrm{KL}\left(p^{\prime}\|p\right)+2Ld.\]
+
+## Appendix G Empirical Results
+
+**Problem settings.** We consider the target distribution defined on \(\mathbb{R}^{2}\) to be a mixture of Gaussian distributions with 6 modals. Meanwhile, we draw \(1,000\) particles from the target distribution shown in Fig 3 and used MMD (with RBF kernel) as the metric.
+
+Figure 3: The 1000 particles sampled from the target distribution, which utilized as the criterion by using MMD
+
+We compare the MMDs among three sample algorithms including ULA Neal (1992); Roberts & Tweedie (1996), DMC Huang et al. (2023), and RS-DMC when the number of gradient oracles are \(\{200,400,600,800,1600,3200\}\). Besides, we tuned hyper-parameters for all three algorithms and left their optimal choice in our code given in the latest supplementary material. Then, we show the final MMDs in Fig 4.
+
+Besides, to compare the behaviors of the three methods, we illustrate the particles when the algorithms return for different gradient complexity in Fig 5. We note that
+
+* ULA will quickly fall into some specific modals with an extremely high sampling error, measured in Maximum Mean Discrepancy (MMD), and is significantly worse than DMC and RS-DMC.
+* DMC will quickly cover the different modals. However, converging to their means will be slower than RS-DMC.
+* RS-DMCwill quickly cover the different modes and converge to their means. Compared to DMC, it requires much fewer gradient complexities to achieve a similar sampling error. For instance, RS-DMC with 800 gradient complexity can outperform DMC with over 3200.
+
+Figure 5: Illustration of the returned particles for ULA, DMC, and RS-DMC. The first row is returned by ULA, the second is DMC and the last is from RS-DMC. Experimental results show that ULA converges fast in the local regions of modes, while it suffers from the problem of covering all modes. DMC can cover most modes with few gradient oracles but converge slowly in local regions. RS-DMC takes advantage of both ULA and DMC, which can cover most modes and admit a relatively faster local convergence.
+
+\begin{table}
+\begin{tabular}{c c c c c} Var & ULA & DMC & RS-DMC & ground truth \\ \hline Modal 0 & 0.0337 & 0.0337 & 0.0332 & 0.0217 \\ Modal 1 & 0.0574 & 0.0311 & 0.0314 & 0.0188 \\ Modal 2 & 0.0459 & 0.0299 & 0.0324 & 0.0196 \\ Modal 3 & 0.0394 & 0.0338 & 0.0287 & 0.0184 \\ Modal 4 & 0.0449 & 0.0330 & 0.0289 & 0.0174 \\ Modal 5 & 0.0409 & 0.0321 & 0.0306 & 0.0220 \\ \hline \end{tabular}
+\end{table}
+Table 4: The comparison of variance of different modals when gradient complexity is chosen as \(200\). The experimental results show both DMC and RS-DMCcan achieve better variance estimation. In some remote modals, the gap between ULA and DMC/RS-DMCwill be even larger than that between RS-DMCand ground truth.
+
+Figure 6: Distribution of the samples generated by ULA, DMC, and RS-DMC, where the gradient complexity is set to be \(200\).
+
+\begin{table}
+\begin{tabular}{c c c c}  & ULA & DMC & RS-DMC \\ \hline MMD loss & 1.386 & 0.129 & 0.112 \\ \hline \end{tabular}
+\end{table}
+Table 3: The comparison of MMD in the good resemblance of modals’ variances when gradient complexity is chosen as 200.

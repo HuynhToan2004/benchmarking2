@@ -1,0 +1,879 @@
+# DiffEnc: Variational Diffusion
+
+with a Learned Encoder
+
+Anonymous authors
+
+Paper under double-blind review
+
+###### Abstract
+
+Diffusion models may be viewed as hierarchical variational autoencoders (VAEs) with two improvements: _parameter sharing_ for the conditional distributions in the generative process and _efficient_ computation of the loss as independent terms over the hierarchy. We consider two changes to the diffusion model that retain these advantages while adding flexibility to the model. Firstly, we introduce a data- and depth-dependent mean function in the diffusion process, which leads to a modified diffusion loss. Our proposed framework, DiffEnc, achieves state-of-the-art likelihood on CIFAR-10. Secondly, we let the ratio of the noise variance of the reverse encoder process and the generative process be a free _weight parameter_ rather than being fixed to 1. This leads to theoretical insights: For a finite depth hierarchy, the evidence lower bound (ELBO) can be used as an objective for a weighted diffusion loss approach and for optimizing the noise schedule specifically for inference. For the infinite-depth hierarchy, on the other hand, the weight parameter has to be 1 to have a well-defined ELBO.
+
+## 1 Introduction
+
+Diffusion models (Sohl-Dickstein et al., 2015; Song & Ermon, 2019; Ho et al., 2020) are versatile generative models that have risen to prominence in recent years thanks to their state-of-the-art performance in the generation of images (Dhariwal & Nichol, 2021; Karras et al., 2022), video (Ho et al., 2022; Hoppe et al., 2022; Harvey et al., 2022), speech (Kong et al., 2020; Jeong et al., 2021; Chen et al., 2020), and music (Huang et al., 2023; Schneider et al., 2023). In particular, in image generation, diffusion models are state of the art both in terms of visual quality (Karras et al., 2022; Kim et al., 2022; Zheng et al., 2022; Hoogeboom et al., 2023; Kingma & Gua, 2023; Lou & Ermon, 2023) and density estimation (Kingma et al., 2021; Nichol & Dhariwal, 2021; Song et al., 2021).
+
+Diffusion models can be seen as a time-indexed hierarchy over latent variables generated sequentially, conditioning only on the latent vector from the previous step. As such, diffusion models can be understood as hierarchical variational autoencoders (VAEs) (Kingma & Welling, 2013; Rezende et al., 2014; Sonderby et al., 2016) with three restrictions: (1) the _forward diffusion process_--the _inference model_ in variational inference--is fixed and remarkably simple; (2) the _generative model is Markovian_--each (time-indexed) layer of latent variables is generated conditioning only on the previous layer; (3) _parameter sharing_--all steps of the generative model share the same parameters. The simplicity of the forward process (1) and the Markov property of the generative model (2) allow the evidence lower bound (ELBO) to be expressed as an expectation over the layers of random variables, i.e., an expectation over time from the stochastic process perspective. Thanks to the heavy parameter sharing in the generative model (3), this expectation can be estimated effectively with a
+
+Figure 1: Overview of DiffEnc compared to standard diffusion models. The effect of the encoding has been amplified 5x for the sake of illustration.
+
+single Monte Carlo sample. These properties taken together make diffusion models highly scalable and flexible, despite the constraints discussed above.
+
+_In this work, we relax assumption (1) to improve the flexibility of diffusion models while retaining their scalability._ Specifically, we shift away from assuming a constant diffusion process, while still maintaining sufficient simplicity to express the ELBO as an expectation over time. We introduce a _time-dependent encoder_ that parameterizes the mean of the diffusion process: instead of the original image \(\mathbf{x}\), the learned denoising model is tasked with predicting \(\mathbf{x}_{t}\), which is the encoded image at time \(t\). Crucially, this encoder is exclusively employed during the training phase and not utilized during the sampling process. As a result, the proposed class of diffusion models, _DiffEnc_, is more flexible than standard diffusion models without affecting sampling time. To arrive at the negative log likelihood loss for DiffEnc, Eq. (18), we will first show how we can introduce a time-dependent encoder to the diffusion process and how this introduces an extra term in the loss if we use the usual expression for the mean in the generative model, Section 3. We then show how we can counter this extra term, using a certain parametrization of the encoder, Section 4.
+
+We conduct experiments on CIFAR-10 and MNIST with two different parameterizations of the encoder and find that, with one of them, DiffEnc achieves state-of-the-art likelihood on CIFAR-10. Inspecting the encoder, we observe that the changes to \(\mathbf{x}_{t}\) are significantly different for early and late timesteps, demonstrating the non-trivial, time-dependent behavior of the encoder (see Fig. 2).
+
+In addition, we investigate the relaxation of a common assumption in diffusion models: That the variance of the generative process, \(\sigma_{P}^{2}\), is equal to the variance of the reverse formulation of the forward diffusion process, \(\sigma_{Q}^{2}\). This introduces an additional term in the diffusion loss, which can be interpreted as a weighted loss (with time-dependent weights \(w_{t}\)). We then analytically derive the optimal \(\sigma_{P}^{2}\). While this is relevant when training in discrete time (i.e., with a finite number of layers) or when sampling, we prove that the ELBO is maximized in the continuous-time limit when the variances are equal (in fact, the ELBO diverges if the variances are not equal).
+
+Our main contributions can be summarized as follows:
+
+* We define a new, more powerful class of diffusion models--named _DiffEnc_--by introducing a time-dependent encoder in the diffusion process. This encoder improves the flexibility of diffusion models but does not affect sampling time, as it is only needed during training.
+* We analyse the assumption of forward and backward variances being equal, and prove that (1) by relaxing this assumption, the diffusion loss can be interpreted as a weighted loss, and (2) in continuous time, the optimal ELBO is achieved when the variances are equal--in fact, if the variances are not equal in continuous time, the ELBO is not well-defined.
+* We perform extensive density estimation experiments and show that DiffEnc achieves state-of-the-art likelihood on CIFAR-10.
+
+The paper is organized as follows: In Section 2 we introduce the notation and framework from Variational Diffusion Models (VDM; Kingma et al., 2021); in Section 3 we derive the general formulation of DiffEnc by introducing a depth-dependent encoder; in Section 4 we introduce the encoder parameterizations used in our experiments and modify the generative model to account for the change in the diffusion loss due to the encoder; in Section 5 we present our experimental results.
+
+Figure 2: Changes induced by the encoder on the encoded image at different timesteps: \((\mathbf{x}_{t}-\mathbf{x}_{s})/(t-s)\) for \(t=0.4,0.6,0.8,1.0\) and \(s=t-0.1\). Changes have been summed over the channels with red and blue denoting positive and negative changes, respectively. For \(t\to 1\), global properties such as approximate position of objects are encoded, where for smaller \(t\) changes are more fine-grained and tend to enhance high-contrast within objects and/or between object and background.
+
+## 2 Preliminaries on Variational Diffusion Models
+
+We begin by introducing the VDM formulation (Kingma et al., 2021) of diffusion models. We define a hierarchical generative model with \(T+1\) layers of latent variables:
+
+\[p_{\mathbf{\theta}}(\mathbf{x},\mathbf{z})=p(\mathbf{x}|\mathbf{z}_{0})p(\mathbf{z}_ {1})\prod_{i=1}^{T}p_{\mathbf{\theta}}(\mathbf{z}_{s(i)}|\mathbf{z}_{t(i)}) \tag{1}\]
+
+with \(\mathbf{x}\in\mathcal{X}\) a data point, \(\mathbf{\theta}\) the model parameters, \(s(i)=\frac{i-1}{T}\), \(t(i)=\frac{i}{T}\), and \(p(\mathbf{z}_{1})=\mathcal{N}(\mathbf{0},\mathbf{I})\). In the following, we will drop the index \(i\) and assume \(0\leq s<t\leq 1\). We define a diffusion process \(q\) with marginal distribution:
+
+\[q(\mathbf{z}_{t}|\mathbf{x})=\mathcal{N}(\alpha_{t}\mathbf{x},\sigma_{t}^{2} \mathbf{I}) \tag{2}\]
+
+where \(t\in[0,1]\) is the time index and \(\alpha_{t},\sigma_{t}\) are positive scalar functions of \(t\). Requiring Eq. (2) to hold for any \(s\) and \(t\), the conditionals turns out to be:
+
+\[q(\mathbf{z}_{t}|\mathbf{z}_{s})=\mathcal{N}(\alpha_{t|\mathbf{z}_{s}}\mathbf{ z}_{s},\sigma_{t|s}^{2}\mathbf{I})\;,\]
+
+where
+
+\[\alpha_{t|s}=\frac{\alpha_{t}}{\alpha_{s}}\;,\;\sigma_{t|s}^{2}=\sigma_{t}^{2} -\alpha_{t|s}^{2}\sigma_{s}^{2}\,.\]
+
+Using Bayes' rule, we can reverse the direction of the diffusion process:
+
+\[q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})=\mathcal{N}(\mathbf{\mu}_{Q},\sigma_{Q }^{2}\mathbf{I}) \tag{3}\]
+
+with
+
+\[\sigma_{Q}^{2}=\frac{\sigma_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}},\;\mathbf{ \mu}_{Q}=\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{z}_{t}+\frac {\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\mathbf{x}\;. \tag{4}\]
+
+We can now express the diffusion process in a way that mirrors the generative model in Eq. (1):
+
+\[q(\mathbf{z}|\mathbf{x})=q(\mathbf{z}_{1}|\mathbf{x})\prod_{i=1}^{T}q(\mathbf{ z}_{s(i)}|\mathbf{z}_{t(i)},\mathbf{x}) \tag{5}\]
+
+and we can define one step of the generative process in the same functional form as Eq. (3):
+
+\[p_{\mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t})=\mathcal{N}(\mathbf{\mu}_{P}, \sigma_{P}^{2}\mathbf{I})\]
+
+with
+
+\[\mathbf{\mu}_{P}=\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{z}_{t}+ \frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\hat{\mathbf{x}}_{\mathbf{\theta} }(\mathbf{z}_{t},t)\;, \tag{6}\]
+
+where \(\hat{\mathbf{x}}_{\mathbf{\theta}}\) is a learned model with parameters \(\mathbf{\theta}\). In a diffusion model, the denoising variance \(\sigma_{P}^{2}\) is usually chosen to be equal to the reverse diffusion process variance: \(\sigma_{P}^{2}=\sigma_{Q}^{2}\). While initially we do not make this assumption, we will prove this to be optimal in the continuous-time limit. Following VDM, we parameterize the noise schedule through the signal-to-noise ratio (\(\mathrm{SNR}\)):
+
+\[\mathrm{SNR}(t)\equiv\frac{\alpha_{t}^{2}}{\sigma_{t}^{2}}\]
+
+and its logarithm: \(\lambda_{t}\equiv\log\mathrm{SNR}(t)\). We will use the variance-preserving formulation in all our experiments: \(\alpha_{t}^{2}=1-\sigma_{t}^{2}=\text{sigmoid}(\lambda_{t})\).
+
+The evidence lower bound (ELBO) of the model defined above is:
+
+\[\log p_{\mathbf{\theta}}(\mathbf{x})\geq\mathbb{E}_{q(\mathbf{z}|\mathbf{x})}\left[ \frac{p_{\mathbf{\theta}}(\mathbf{x}|\mathbf{z})p_{\mathbf{\theta}}(\mathbf{z})}{q( \mathbf{z}|\mathbf{x})}\right]\equiv\mathrm{ELBO}(\mathbf{x})\]
+
+The loss \(\mathcal{L}\equiv-\mathrm{ELBO}\) is the sum of a reconstruction (\(\mathcal{L}_{0}\)), diffusion (\(\mathcal{L}_{T}\)), and latent (\(\mathcal{L}_{1}\)) loss:
+
+\[\mathcal{L} =\mathcal{L}_{0}+\mathcal{L}_{T}+\mathcal{L}_{1}\] \[\mathcal{L}_{0} =-\mathbb{E}_{q(\mathbf{z}_{0}|\mathbf{x})}\left[\log p(\mathbf{x} |\mathbf{z}_{0})\right]\] \[\mathcal{L}_{1} =D_{\mathrm{KL}}(q(\mathbf{z}_{1}|\mathbf{x})||p(\mathbf{z}_{1}))\;,\]where the expressions for \(\mathcal{L}_{0}\) and \(\mathcal{L}_{1}\) are derived in Appendix D. Thanks to the matching factorization of the generative and reverse noise processes--see Eqs. (1) and (5)--and the availability of \(q(\mathbf{z}_{t}|\mathbf{x})\) in closed form because \(q\) is Markov and Gaussian, the diffusion loss \(\mathcal{L}_{T}\) can be written as a sum or as an expectation over the layers of random variables:
+
+\[\mathcal{L}_{T}(\mathbf{x}) =\sum_{i=1}^{T}\mathbb{E}_{q(\mathbf{z}_{t(i)}|\mathbf{x})}\left[D _{\mathrm{KL}}(q(\mathbf{z}_{s(i)}|\mathbf{z}_{t(i)},\mathbf{x})\|p_{\mathbf{ \theta}}(\mathbf{z}_{s(i)}|\mathbf{z}_{t(i)}))\right] \tag{7}\] \[=T\,\mathbb{E}_{t\sim U\{1,T\},q(\mathbf{z}_{t(i)}|\mathbf{x})} \left[D_{\mathrm{KL}}(q(\mathbf{z}_{s(i)}|\mathbf{z}_{t(i)},\mathbf{x})\|p_{ \mathbf{\theta}}(\mathbf{z}_{s(i)}|\mathbf{z}_{t(i)}))\right]\;, \tag{8}\]
+
+where \(U\{1,T\}\) is the uniform distribution over the indices 1 through \(T\). Since all distributions are Gaussian, the KL divergence has a closed-form expression (see Appendix E):
+
+\[D_{\mathrm{KL}}(q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})\|p_{\mathbf{\theta}}( \mathbf{z}_{s}|\mathbf{z}_{t}))=\frac{d}{2}\left(w_{t}-1-\log w_{t}\right)+ \frac{w_{t}}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\;, \tag{9}\]
+
+where the green part is the difference from using \(\sigma_{P}^{2}\neq\sigma_{Q}^{2}\) instead of \(\sigma_{P}^{2}=\sigma_{Q}^{2}\), and we have defined the weighting function
+
+\[w_{t}=\frac{\sigma_{Q,t}^{2}}{\sigma_{P,t}^{2}}\]
+
+and the dependency of \(\sigma_{Q,t}^{2}\) and \(\sigma_{P,t}^{2}\) on \(s\) is left implicit, since the step size \(t-s=\frac{1}{T}\) is fixed. The optimal generative variance can be computed in closed-form (see Appendix F):
+
+\[\sigma_{P}^{2}=\sigma_{Q}^{2}+\frac{1}{d}\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{ t})}\left[\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\right]\;.\]
+
+## 3 DiffEnc
+
+The main component of DiffEnc is the time-dependent encoder, which we will define as \(\mathbf{x}_{t}\equiv\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\), where \(\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\) is some function with parameters \(\mathbf{\phi}\) dependent on \(\mathbf{x}\) and \(t\) through \(\lambda_{t}\equiv\log\mathrm{SNR}(t)\). The generalized version of Eq. (2) is then:
+
+\[q(\mathbf{z}_{t}|\mathbf{x})=\mathcal{N}(\alpha_{t}\mathbf{x}_{t},\sigma_{t}^{ 2}\mathbf{I})\;. \tag{10}\]
+
+Fig. 1 visualizes this change to the diffusion process, and a diagram is provided in Appendix A. Requiring that the process is consistent upon marginalization, i.e., \(q(\mathbf{z}_{t}|\mathbf{x})=\int q(\mathbf{z}_{t}|\mathbf{z}_{s},\mathbf{x}) q(\mathbf{z}_{s}|\mathbf{x})\mathrm{d}\mathbf{z}_{s}\), leads to the following conditional distributions (see Appendix B):
+
+\[q(\mathbf{z}_{t}|\mathbf{z}_{s},\mathbf{x})=\mathcal{N}(\alpha_{t|\mathbf{z} _{s}}\mathbf{z}_{s}+\alpha_{t}(\mathbf{x}_{t}-\mathbf{x}_{s}),\sigma_{t|s}^{2 }\mathbf{I})\;, \tag{11}\]
+
+where an additional mean shift term is introduced by the depth-dependent encoder. As in Section 2, we can derive the reverse process (see Appendix C):
+
+\[q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})=\mathcal{N}(\mathbf{\mu}_{Q},\sigma_ {Q}^{2}\mathbf{I}) \tag{12}\]
+
+\[\mathbf{\mu}_{Q}=\frac{\alpha_{t|\sigma_{Q}^{2}}\mathbf{z}_{t}}{\sigma_{t}^{2}} \mathbf{z}_{t}+\frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\mathbf{x}_{t }+\alpha_{s}(\mathbf{x}_{s}-\mathbf{x}_{t}) \tag{13}\]
+
+with \(\sigma_{Q}^{2}\) given by Eq. (4). We show how we parameterize the encoder in Section 4.
+
+Infinite-depth limit.Kingma et al. (2021) derived the continuous-time limit of the diffusion loss, that is, the loss in the limit of \(T\to\infty\). We can extend that result to our case. Using \(\mu_{Q}\) from Eq. (13) and \(\mu_{P}\) from Eq. (6), the KL divergence in the unweighted case, i.e., \(\frac{1}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\), can be rewritten in the following way, as shown in Appendix G:
+
+\[\frac{1}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}=-\frac{1}{2} \Delta\mathrm{SNR}\left\|\hat{\mathbf{x}}_{\mathbf{\theta}}(\mathbf{z}_{t},t)- \mathbf{x}_{\mathbf{\phi}}(\lambda_{t})-\mathrm{SNR}(s)\frac{\Delta\mathbf{x}}{ \Delta\mathrm{SNR}}\right\|_{2}^{2}\;,\]
+
+where \(\Delta\mathbf{x}\equiv\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})-\mathbf{x}_{\mathbf{ \phi}}(\lambda_{s})\) and similarly for the \(\mathrm{SNR}\). In Appendix G, we also show that, as \(T\to\infty\), the expression for the optimal \(\sigma_{P}\) tends to \(\sigma_{Q}\) and the additional term in the diffusion loss arising from allowing \(\sigma_{P}^{2}\neq\sigma_{Q}^{2}\) tends to 0. This result is in accordance with prior work on variational approaches to stochastic processes (Archambeau et al., 2007). We have shown that, in the continuous limit, the ELBO has to be an unweighted loss (in the sense that \(w_{t}=1\)). In the remainder of the paper, we will use the continuous formulation and thus set \(w_{t}=1\). It is of interest to consider optimized weighted losses for a finite number of layers, however, we leave this for future research.
+
+The infinite-depth limit of the diffusion loss, \(\mathcal{L}_{\infty}(\mathbf{x})\equiv\lim_{T\to\infty}\mathcal{L}_{T}( \mathbf{x})\), becomes (Appendix G):
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{t\sim U(0,1)}\mathbb{ E}_{q(\mathbf{z}_{t}|\mathbf{x})}\left[\frac{d\mathrm{SNR}(t)}{dt}\left\|\hat{ \mathbf{x}}_{\mathbf{\theta}}(\mathbf{z}_{t},t)-\mathbf{x}_{\mathbf{\phi}}(\lambda_{ t})-\frac{d\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right\|_{2}^{2} \right]\;. \tag{14}\]
+
+\(\mathcal{L}_{\infty}(\mathbf{x})\) thus is very similar to the standard continuous-time diffusion loss from VDM, though with an additional gradient stemming from the mean shift term. In Section 4, we will develop a modified generative model to counter this extra term. In Appendix H, we derive the stochastic differential equation (SDE) describing the generative model of DiffEnc in the infinite-depth limit.
+
+## 4 Parameterization of the Encoder and Generative Model
+
+We now turn to the parameterization of the encoder \(\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\). The reconstruction and latent losses impose constraints on how the encoder should behave at the two ends of the hierarchy of latent variables: The likelihood we use is constructed such that the reconstruction loss, derived in Appendix D, is minimized when \(\mathbf{x}_{\mathbf{\phi}}(\lambda_{0})=\mathbf{x}\). Likewise, the latent loss is minimized by \(\mathbf{x}_{\mathbf{\phi}}(\lambda_{1})=\mathbf{0}\). In between, for \(0<t<1\), a non-trivial encoder can improve the diffusion loss.
+
+We propose two related parameterizations of the encoder: a trainable one, which we will denote by \(\mathbf{x}_{\mathbf{\phi}}\), and a simpler, non-trainable one, \(\mathbf{x}_{\text{nt}}\), where \(nt\) stands for non-trainable. Let \(\mathbf{y}_{\mathbf{\phi}}(\mathbf{x},\lambda_{t})\) be a neural network with parameters \(\mathbf{\phi}\), denoted \(\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})\) for brevity. We define the trainable encoder as
+
+\[\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})=(1-\sigma_{t}^{2})\mathbf{x}+\sigma_{t}^{2 }\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})=\alpha_{t}^{2}\mathbf{x}+\sigma_{t}^{2} \mathbf{y}_{\mathbf{\phi}}(\lambda_{t}) \tag{15}\]
+
+and the non-trainable encoder as
+
+\[\mathbf{x}_{\text{nt}}(\lambda_{t})=\alpha_{t}^{2}\mathbf{x}\;. \tag{16}\]
+
+More motivation for these parameterizations can be found in Appendix I. The trainable encoder \(\mathbf{x}_{\mathbf{\phi}}\) is initialized with \(\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})=0\), so at the start of training it acts as the non-trainable encoder \(\mathbf{x}_{\text{nt}}\) (but differently from the VDM, which corresponds to the identity encoder).
+
+To better fit the infinite-depth diffusion loss in Eq. (14), we define a new mean, \(\mathbf{\mu}_{P}\), of the generative model \(p_{\mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t})\) which is a modification of Eq. (6). Concretely, we would like to introduce a counterterm in \(\mathbf{\mu}_{P}\) that, when taking the continuous-limit, approximately counters \(\frac{d\mathbf{x}_{\mathbf{\theta}}(\lambda_{t})}{d\lambda_{t}}\). This term should be expressed in terms of \(\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})\) rather than \(\mathbf{x}_{\mathbf{\phi}}\). For the non-trainable encoder, we have
+
+\[\frac{d\mathbf{x}_{\text{nt}}(\lambda_{t})}{d\lambda_{t}}=\alpha_{t}^{2}\sigma _{t}^{2}\mathbf{x}=\sigma_{t}^{2}\mathbf{x}_{\text{nt}}(\lambda_{t})\;.\]
+
+Therefore, for the non-trainable encoder, we can use \(\sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})\) as an approximation of \(\frac{d\mathbf{x}_{\text{nt}}(\lambda_{t})}{d\lambda_{t}}\). The trainable encoder is more complicated because it also contains the derivative of \(\mathbf{y}_{\mathbf{\phi}}\) that we cannot as straightforwardly express in terms of \(\hat{\mathbf{x}}_{\mathbf{\theta}}\). We therefore choose to approximate \(\frac{d\mathbf{x}_{\mathbf{\theta}}(\lambda_{t})}{d\lambda_{t}}\) the same way as \(\frac{d\mathbf{x}_{\mathbf{\theta}}(\lambda_{t})}{d\lambda_{t}}\). We leave it for future work to explore different strategies for approximating this gradient. Since we use the same approximation for both encoders, in the following we will write \(\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\) for both.
+
+With the chosen counterterm, which in the continuous limit should approximately cancel out the effect of the mean shift term in Eq. (13), the new mean, \(\mathbf{\mu}_{P}\), is defined as:
+
+\[\mathbf{\mu}_{P}=\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{z}_{t}+ \frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\hat{\mathbf{x}}_{\mathbf{\theta} }(\lambda_{t})+\alpha_{s}(\lambda_{s}-\lambda_{t})\sigma_{t}^{2}\hat{\mathbf{ x}}_{\mathbf{\theta}}(\lambda_{t}) \tag{17}\]Similarly to above, we derive the infinite-depth diffusion loss when the encoder is parameterized by Eq. (15) by taking the limit of \(\mathcal{L}_{T}\) for \(T\to\infty\) (see Appendix J):
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U[0, 1]}\left[\frac{de^{\lambda_{t}}}{dt}\left\|\hat{\mathbf{x}}_{\mathbf{\theta}}( \mathbf{z}_{t},\lambda_{t})+\sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}( \mathbf{z}_{t},\lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})-\frac{d\mathbf{ x}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right\|_{2}^{2}\right]\;, \tag{18}\]
+
+where \(\mathbf{z}_{t}=\alpha_{t}\mathbf{x}_{t}+\sigma_{t}\mathbf{\epsilon}\) with \(\mathbf{\epsilon}\sim\mathcal{N}(\mathbf{0},\mathbf{I})\).
+
+\(\mathbf{v}\)-parameterization.In our experiments we use the \(\mathbf{v}\)-prediction parameterization (Salimans and Ho, 2022) for our loss, which means that for the trainable encoder we use the loss
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U [0,1]}\left[\lambda_{t}^{\prime}\alpha_{t}^{2}\left\|\mathbf{v}_{t}-\hat{ \mathbf{v}}_{\mathbf{\theta}}+\sigma_{t}\left(\hat{\mathbf{x}}_{\mathbf{\theta}}( \lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})+\mathbf{y}_{\mathbf{\phi}}(\lambda _{t})-\frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right)\right\|_ {2}^{2}\right] \tag{19}\]
+
+and for the non-trainable encoder, we use
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U [0,1]}\left[\lambda_{t}^{\prime}\alpha_{t}^{2}\left\|\mathbf{v}_{t}-\hat{ \mathbf{v}}_{\mathbf{\theta}}+\sigma_{t}\left(\hat{\mathbf{x}}_{\mathbf{\theta}}( \lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\right)\right\|_{2}^{2}\right]\;. \tag{20}\]
+
+Derivations of Eqs. (19) and (20) are in Appendix K. We note that when using the \(\mathbf{v}\)-parametrization, as \(t\) tends to \(0\), the loss becomes the same as for the \(\mathbf{\epsilon}\)-prediction parameterization. On the other hand, when \(t\) tends to \(1\), the loss has the different behavior depending on the encoder: For the trainable encoder, we have that \(\hat{\mathbf{v}}_{\mathbf{\theta}}\approx\frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t })}{d\lambda_{t}}\), suggesting that the encoder can in principle guide the diffusion model. See Appendix L for a more detailed discussion.
+
+## 5 Experiments
+
+In this section, we present our experimental setup and discuss the results.
+
+Experimental Setup.We evaluated variants of DiffEnc against a standard VDM baseline on CIFAR-10 (Krizhevsky et al., 2009) and MNIST (LeCun et al., 1998). The learned prediction function is implemented as a U-Net (Ronneberger et al., 2015) consisting of convolutional ResNet blocks without any downsampling, following VDM (Kingma et al., 2021). The trainable encoder in DiffEnc is implemented with the same overall U-Net architecture, but with downsampling to resolutions
+
+\begin{table}
+\begin{tabular}{l c c c} \hline \hline
+**Model** & **Type** & **CIFAR-10** & **ImageNet 32\(\times\)32** \\ \hline Flow Matching OT (Lipman et al., 2022) & Flow & \(2.99\) & \(3.53\) \\ NVAE (Vahdat and Kautz, 2020) & VAE & \(2.91\) & \(3.92^{*}\) \\ VDVAE (Child, 2020) & VAE & \(2.87\) & \(3.80^{*}\) \\ Image Transformer (Parmar et al., 2018) & AR & \(2.90\) & \(3.77^{*}\) \\ ScoreFlow (Song et al., 2021) & Diff & \(2.83\) & \(3.76^{*}\) \\ Sparse Transformer (Child et al., 2019) & AR & \(2.80\) & \(-\) \\ Reflected Diffusion Models (Lou and Ermon, 2023) & Diff & \(2.68\) & \(3.74^{*}\) \\ VDM (Kingma et al., 2021) _(10M steps)_ & Diff & \(2.65\) & \(3.72^{*}\) \\ ARDM (Hoogeboom et al., 2021) & AR & \(2.64\) & \(-\) \\ \hline \multicolumn{4}{l}{_Our experiments (8M and 1M steps)_} \\ \multicolumn{4}{l}{VDM with \(\mathbf{v}\)-parameterization} & Diff & \(2.64\) & \(\underline{3.52}\) \\ DiffEnc Trainable (ours) & Diff & \(\underline{2.62}\) & \(\underline{3.52}\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 1: Comparison of bits per dimension (BPD) on CIFAR-10 with other work. Types of models are Continuous Flow (Flow), Variational Auto Encoders (VAE), Autoregressive models (AR) and Diffusion models (Diff). We only compare with results achieved without data augmentation. DiffEnc with a trainable encoder achieves SOTA likelihood. Results on ImageNet marked with \(*\) are on the (Van Den Oord et al., 2016) version of ImageNet which is no longer officially available. Results without \(*\) are on the (Chrabaszcz et al., 2017) version of ImageNet, which is from the official ImageNet website.
+
+16x16 and 8x8. We will denote the models trained in our experiments by VDMv-\(n\), DiffEnc-\(n\)-\(m\), and DiffEnc-\(n\)-\(n\)-nt, where: VDMv is a VDM model with \(\nu\) parameterization, \(n\) and \(m\) are the number of ResNet blocks in the "downsampling" part of the \(\nu\)-prediction U-Net and of the encoder U-Net respectively, and _nt_ indicates a non-trainable encoder for DiffEnc.
+
+For our noise schedule, we used a linear log SNR schedule: \(\lambda_{t}=\lambda_{max}-(\lambda_{max}-\lambda_{min})\cdot t\). For the large models, VDMv-32 and DiffEnc-32-4, we fixed the endpoints, \(\lambda_{max}\) and \(\lambda_{min}\), to the ones Kingma et al. (2021) found were optimal. For the models with 8 ResNet blocks in the main U-Net (VDMv-8, DiffEnc-8-2 and DiffEnc-8-nt), we also experimented with learning the SNR endpoints. We trained all our models with either \(3\) or \(5\) seeds depending on the computational cost of the experiments. See more details on model structure and training in Appendix M and on datasets in Appendix N.
+
+Results.As we see in Table 1 the DiffEnc-32-4 model achieves a lower BPD score than previous work and the VDMv-32. Since we do not use the encoder when sampling, this result means that the encoder is useful for learning a better generative model--with higher likelihoods--while sampling time is not adversely affected. We also see that VDMv-32 after 8M steps achieved a likelihood bound of \(2.64\) BPD (bits per dimension), which is better than the result reported by Kingma et al. (2021) for the \(\epsilon\)-parameterization after 10M steps. Thus, the \(\nu\)-parameterization gives an improved likelihood in itself. Table 2 shows that the difference in the total loss comes mainly from the improvement in diffusion loss for DiffEnc-32-4, which points to the encoder being helpful in the diffusion process. We provide Fig. 2, since it can be difficult to see what the encoder is doing directly from the encodings. From the heatmaps, we see that the encoder has learnt to do something different from how it was initialised and that is acts differently over \(t\), making finer changes in earlier timesteps and more global changes in later timesteps. See Appendix S for more details. We note that the improvement in total loss is significant, since we get a p-value of \(0.03\) for a t-test on whether the mean loss over random seeds is lower for DiffEnc-32-4 than for VDMv-32. Some samples from DiffEnc-8-2, DiffEnc-32-4, and VDMv-32 are shown in Fig. 3. More samples from DiffEnc-32-4 and VDMv-32 are provided in Appendix P. See Fig. 4 in the appendix for examples of encoded MNIST images. DiffEnc-32-4 and VDMv-32 have similar FID scores as shown in Table 6.
+
+For all models with a trainable encoder, we see that the diffusion loss is the same or better than the VDM baseline (see Tables 2 to 4 and 5). We interpret this as the trainable encoder being able
+
+\begin{table}
+\begin{tabular}{c c c c c} \hline \hline
+**Model** & **Total** & **Latent** & **Diffusion** & **Reconstruction** \\ \hline VDMv-32 & \(2.641\pm 0.003\) & \(0.0012\pm 0.0\) & \(2.629\pm 0.003\) & \(0.01\pm(4\times 10^{-6})\) \\ DiffEnc-32-4 & \(2.620\pm 0.006\) & \(0.0007\pm(3\times 10^{-6})\) & \(2.609\pm 0.006\) & \(0.01\pm(4\times 10^{-6})\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 2: Comparison of the different components of the loss for DiffEnc-32-4 and VDMv-32 with fixed noise schedule on CIFAR-10. All quantities are in bits per dimension (BPD) with standard error over 3 seeds, and models are trained for 8M steps.
+
+Figure 3: Comparison of unconditional samples of models. The small model struggles to make realistic images, while the large models are significantly better, as expected. For some images, details differ between the two large models, for others they disagree on the main element of the image. An example where the models make two different cars in column 9. An example where DiffEnc-32-4 makes a car and VDMv-32 makes a frog in column 7.
+
+to preserve the most important signal as \(t\to 1\) in all cases. This is supported by the results we get from the non-trainable encoder, which only removes signal, where the diffusion loss is always worse than the baseline. We also see that, for a fixed noise schedule, the latent loss of the trainable encoder model is always better than the VDM. When using a fixed noise schedule, the minimal and maximal SNR is set to ensure small reconstruction and latent losses. It is therefore natural that the diffusion loss (the part dependent on how well the model can predict the noisy image), is the part that dominates the total loss. This means that a lower latent loss does not necessarily have a considerable impact on the total loss. However, Lin et al. (2023) pointed out that a high latent loss might lead to poor generated samples. Therefore, it might be relevant to train a model which has a lower latent loss than another model if it can achieve the same diffusion loss. From Tables 3 and 4, we see that this is possible using a fixed noise schedule and a small trainable encoder. For results on a larger encoder with a small model see Appendix Q.
+
+For the trainable noise schedule, the mean total losses of the models are all lower than their fixed-schedule counterparts. Thus, all models can make use of this additional flexibility. For the fixed noise schedule, the reconstruction loss is the same for all three types of models, due to how our encoder is parameterized.
+
+## 6 Related Work
+
+_DDPM:_ Sohl-Dickstein et al. (2015) defined score-based diffusion models inspired by nonequilibrium thermodynamics. Ho et al. (2020) showed that diffusion models 1) are equivalent to score-based models and 2) can be viewed as hierarchical variational autoencoders with a diffusion encoder and parameter sharing in the generative hierarchy. Song et al. (2020) defined diffusion models using an SDE.
+
+_DDPM with encoder:_ To the best of our knowledge, only few previous papers consider modifications of the diffusion process encoder. Blurring diffusion models (Hoogeboom & Salimans, 2022; Rissanen et al., 2022) combines the added noise with a blurring of the image dependent on the timestep. This blurring can be seen as a Gaussian encoder with a mean which is linear in the data, but with a not necessarily iid noise. The encoder parameters are set by the heat dissipation basis (the discrete cosine transform) and time. Our encoder is a learned non-linear function of the data and time and
+
+\begin{table}
+\begin{tabular}{c c c c c c} \hline \hline
+**Model** & **Noise** & **Total** & **Latent** & **Diffusion** & **Reconstruction** \\ \hline VDMv-8 & fixed & \(0.381\pm 0.003\) & \(0.0045\pm 0.0\) & \(0.371\pm 0.003\) & \(0.006\pm(3\times 10^{-5})\) \\  & trainable & \(0.378\pm 0.001\) & \(0.0040\pm(6\times 10^{-5})\) & \(0.371\pm 0.003\) & \(0.001\pm(2\times 10^{-5})\) \\ DiffEnc-8-2 & fixed & \(0.378\pm 0.001\) & \(0.0009\pm(3\times 10^{-6})\) & \(0.371\pm 0.001\) & \(0.006\pm(3\times 10^{-5})\) \\  & trainable & \(0.373\pm 0.002\) & \(0.0064\pm(7\times 10^{-5})\) & \(0.366\pm 0.002\) & \(0.001\pm(3\times 10^{-5})\) \\ DiffEnc-8-nt & fixed & \(0.389\pm 0.003\) & \(1.6\times 10^{-5}\pm 0.0\) & \(0.383\pm 0.003\) & \(0.006\pm(4\times 10^{-5})\) \\  & trainable & \(0.385\pm 0.002\) & \(0.0020\pm(4\times 10^{-5})\) & \(0.381\pm 0.002\) & \(0.002\pm(2\times 10^{-5})\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 4: Comparison of the different components of the loss for DiffEnc-8-2, DiffEnc-8-nt and VDMv-8 on MNIST. All quantities are in bits per dimension (BPD), with standard error, 5 seeds, 1.4M steps. Noise schedules are either fixed or with trainable endpoints.
+
+\begin{table}
+\begin{tabular}{c c c c c c} \hline \hline
+**Model** & **Noise** & **Total** & **Latent** & **Diffusion** & **Reconstruction** \\ \hline VDMv-8 & fixed & \(2.792\pm 0.004\) & \(0.0012\pm 0.0\) & \(2.780\pm 0.004\) & \(0.010\pm(1\times 10^{-5})\) \\  & trainable & \(2.790\pm 0.004\) & \(0.0032\pm(2\times 10^{-5})\) & \(2.784\pm 0.004\) & \(0.003\pm(4\times 10^{-5})\) \\ DiffEnc-8-2 & fixed & \(2.792\pm 0.004\) & \(0.0006\pm(3\times 10^{-5})\) & \(2.781\pm 0.004\) & \(0.010\pm(1\times 10^{-5})\) \\  & trainable & \(2.789\pm 0.004\) & \(0.0034\pm(3\times 10^{-5})\) & \(2.782\pm 0.004\) & \(0.003\pm(3\times 10^{-5})\) \\ DiffEnc-8-nt & fixed & \(2.798\pm 0.004\) & \((1.6\times 10^{-5})\pm 0.0\) & \(2.787\pm 0.004\) & \(0.010\pm(1\times 10^{-5})\) \\  & trainable & \(2.795\pm 0.004\) & \(0.0009\pm(8\times 10^{-6})\) & \(2.791\pm 0.004\) & \(0.003\pm(7\times 10^{-5})\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 3: Comparison of the different components of the loss for DiffEnc-8-2, DiffEnc-8-nt and VDMv-8 on CIFAR-10. All quantities are in bits per dimension (BPD), with standard error, 5 seeds, 1.4M steps. Noise schedules are either fixed or with trainable endpoints.
+
+therefore more general than blurring. Daras et al. (2022) propose introducing a more general linear corruption process, where both blurring and masking for example can be added before the noise. Latent diffusion (Rombach et al., 2022) uses a learned depth-independent encoder/decoder to map deterministically between the data and a learned latent space and perform the diffusion in the latent space. Abstreiter et al. (2021) and Preechakul et al. (2022) use an additional encoder that computes a small semantic representation of the image. This representation is then used as conditioning in the diffusion model and is therefore orthogonal to our work. Singhal et al. (2023) propose to learn the noising process: for \(\mathbf{z}_{t}=\alpha_{t}\mathbf{x}+\beta_{t}\epsilon\), they propose to learn \(\alpha_{t}\) and \(\beta_{t}\).
+
+_Concurrent work:_Bartosh et al. (2023) also propose to add a time-dependent transformation to the data in the diffusion model. However, there is a difference in the target for the predictive function, since in our case \(\hat{\mathbf{x}}_{\mathbf{\theta}}\) predicts the transformed data, \(\mathbf{x}_{\mathbf{\phi}}\), while in their case \(\hat{\mathbf{x}}_{\mathbf{\theta}}\) predicts data \(\mathbf{x}^{\prime}\) such that the transformation of \(\mathbf{x}^{\prime}\), \(f_{\phi}(\mathbf{x}^{\prime},t)\), is equal to the transformation of the real data \(f_{\phi}(\mathbf{x},t)\). This might, according to their paper, make the prediction model learn something within the data distribution even for \(t\) close to \(1\).
+
+_Learned generative process variance:_Both Nichol and Dhariwal (2021) and Dhariwal and Nichol (2021) learn the generative process variance, \(\sigma_{P}\). Dhariwal and Nichol (2021) observe that it allows for sampling with fewer steps without a large drop in sample quality and Nichol and Dhariwal (2021) argue that it could have a positive effect on the likelihood. Neither of these works are in a continuous-time setting, which is the setting we derived our theoretical results for.
+
+## 7 Limitations and Future Work
+
+As shown above, adding a trained time-dependent encoder can improve the likelihood of a diffusion model, at the cost of a longer training time. Although our approach does not increase sampling time, it must be noted that sampling is still significantly slower than, e.g., for generative adversarial networks (Goodfellow et al., 2014). Techniques for more efficient sampling in diffusion models (Watson et al., 2021; Salimans and Ho, 2022; Song et al., 2020; Lu et al., 2022; Berthelot et al., 2023; Luhman and Luhman, 2021; Liu et al., 2022) can be directly applied to our method.
+
+Introducing the trainable encoder opens up an interesting new direction for representation learning. It should be possible to distill the time-dependent transformations to get smaller time-dependent representations of the images. It would be interesting to see what such representations could tell us about the data. It would also be interesting to explore whether adding conditioning to the encoder will lead to different transformations for different classes of images.
+
+As shown in (Theis et al., 2015) likelihood and visual quality of samples are not directly linked. Therefore it is important to remember which metric a model is trained to optimize when choosing the application. Since we show that our model can achieve good results when optimized to maximize likelihood, and likelihood is important in the context of semi-supervised learning, it would be an interesting to use this kind of model for classification in a semi-supervised setting.
+
+Our approach could be combined with various existing methods, e.g., latent diffusion (Vahdat et al., 2021; Rombach et al., 2022) or discriminator guidance (Kim et al., 2022). If one were to succeed in making the smaller representations from the encoder, one might also combine it with consistency regularization (Sinha and Dieng, 2021) to improve the learned representations.
+
+## 8 Conclusion
+
+We presented DiffEnc, a generalization of diffusion models with a time-dependent encoder in the diffusion process. DiffEnc increases the flexibility of diffusion models while retaining the same computational requirements for sampling. Moreover, we theoretically derived the optimal variance of the generative process and proved that, in the continuous-time limit, it must be equal to the diffusion variance for the ELBO to be well-defined. We defer the investigation of its application to sampling or discrete-time training to future work. Empirically, we showed that DiffEnc achieves state-of-the-art likelihood on CIFAR-10, and that the data transformation learned by the encoder is non-trivial and time-dependent. Interesting avenues for future research include applying improvements to diffusion models that are orthogonal to our proposed method, such as latent diffusion models, model distillation, classifier-free guidance, and different sampling strategies.
+
+### Ethics Statement
+
+Since diffusion models have been shown to memorize training examples and since it is possible to extract these examples (Carlini et al., 2023), diffusion models pose a privacy and copyright risk especially if trained on data scraped from the internet. To the best of our knowledge our work neither improves nor worsens these security risks. Therefore, work still remains on how to responsibly deploy diffusion models with or without a time-dependent encoder.
+
+### Reproducibility Statement
+
+The presented results are obtained using the setup described in Section 5. More details on models and training are discussed in Appendix M. Code will be publicly released upon acceptance, including a description of setting up the environment with correct versioning. Scripts are supplied for recreating all results present in the paper. The main equations behind these results are Eqs. (19) and (20), which are the diffusion losses used when including our trainable and non-trainable encoder, respectively.
+
+## References
+
+* Abstreiter et al. (2021) Korbinian Abstreiter, Sarthak Mittal, Stefan Bauer, Bernhard Scholkopf, and Arash Mehrjou. Diffusion-based representation learning. _arXiv preprint arXiv:2105.14257_, 2021.
+* Archambeau et al. (2007) Cedric Archambeau, Dan Cornford, Manfred Opper, and John Shawe-Taylor. Gaussian process approximations of stochastic differential equations. In _Gaussian Processes in Practice_, pp. 1-16. PMLR, 2007.
+* Bartosh et al. (2023) Grigory Bartosh, Dmitry Vetrov, and Christian A. Naesseth. Neural diffusion models, 2023.
+* Berthelot et al. (2023) David Berthelot, Arnaud Autef, Jierui Lin, Dian Ang Yap, Shuangfei Zhai, Siyuan Hu, Daniel Zheng, Walter Talbot, and Eric Gu. Tract: Denoising diffusion models with transitive closure time-distillation. _arXiv preprint arXiv:2303.04248_, 2023.
+* Carlini et al. (2023) Nicolas Carlini, Jamie Hayes, Milad Nasr, Matthew Jagielski, Vikash Sehwag, Florian Tramer, Borja Balle, Daphne Ippolito, and Eric Wallace. Extracting training data from diffusion models. In _32nd USENIX Security Symposium (USENIX Security 23)_, pp. 5253-5270, 2023.
+* Chen et al. (2020) Nanxin Chen, Yu Zhang, Heiga Zen, Ron J Weiss, Mohammad Norouzi, and William Chan. Wavegrad: Estimating gradients for waveform generation. _arXiv preprint arXiv:2009.00713_, 2020.
+* Child (2020) Rewon Child. Very deep vaes generalize autoregressive models and can outperform them on images. _arXiv preprint arXiv:2011.10650_, 2020.
+* Child et al. (2019) Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse transformers. _arXiv preprint arXiv:1904.10509_, 2019.
+* Chrabaszcz et al. (2017) Patryk Chrabaszcz, Ilya Loshchilov, and Frank Hutter. A downsampled variant of imagenet as an alternative to the cifar datasets. _arXiv preprint arXiv:1707.08819_, 2017.
+* Daras et al. (2022) Giannis Daras, Mauricio Delbracio, Hossein Talebi, Alexandros G Dimakis, and Peyman Milanfar. Soft diffusion: Score matching for general corruptions. _arXiv preprint arXiv:2209.05442_, 2022.
+* Dhariwal and Nichol (2021) Prafulla Dhariwal and Alexander Nichol. Diffusion models beat GANs on image synthesis. _Advances in neural information processing systems_, 34:8780-8794, 2021.
+* Goodfellow et al. (2014) Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil Ozair, Aaron Courville, and Yoshua Bengio. Generative adversarial nets. _Advances in neural information processing systems_, 27, 2014.
+* Harvey et al. (2022) William Harvey, Saeid Naderiparizi, Vaden Masrani, Christian Weilbach, and Frank Wood. Flexible diffusion modeling of long videos. _Advances in Neural Information Processing Systems_, 35:27953-27965, 2022.
+
+* Ho et al. (2020) Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. In H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin (eds.), _Advances in Neural Information Processing Systems_, volume 33, pp. 6840-6851. Curran Associates, Inc., 2020. URL [https://proceedings.neurips.cc/paper/2020/file/4c5bcfec8584af0d967flab10179ca4b-Paper.pdf](https://proceedings.neurips.cc/paper/2020/file/4c5bcfec8584af0d967flab10179ca4b-Paper.pdf).
+* Ho et al. (2022) Jonathan Ho, William Chan, Chitwan Saharia, Jay Whang, Ruiqi Gao, Alexey Gritsenko, Diederik P Kingma, Ben Poole, Mohammad Norouzi, David J Fleet, et al. Imagen video: High definition video generation with diffusion models. _arXiv preprint arXiv:2210.02303_, 2022.
+* Hoogeboom & Salimans (2022) Emiel Hoogeboom and Tim Salimans. Blurring diffusion models. _arXiv preprint arXiv:2209.05557_, 2022.
+* Hoogeboom et al. (2021) Emiel Hoogeboom, Alexey A Gritsenko, Jasmin Bastings, Ben Poole, Rianne van den Berg, and Tim Salimans. Autoregressive diffusion models. _arXiv preprint arXiv:2110.02037_, 2021.
+* Hoogeboom et al. (2023) Emiel Hoogeboom, Jonathan Heek, and Tim Salimans. simple diffusion: End-to-end diffusion for high resolution images. _arXiv preprint arXiv:2301.11093_, 2023.
+* Hoppe et al. (2022) Tobias Hoppe, Arash Mehrjou, Stefan Bauer, Didrik Nielsen, and Andrea Dittadi. Diffusion models for video prediction and infilling. _Transactions on Machine Learning Research_, 2022.
+* Huang et al. (2023) Qingqing Huang, Daniel S Park, Tao Wang, Timo I Denk, Andy Ly, Nanxin Chen, Zhengdong Zhang, Zhishuai Zhang, Jiahui Yu, Christian Frank, et al. Noise2music: Text-conditioned music generation with diffusion models. _arXiv preprint arXiv:2302.03917_, 2023.
+* Jeong et al. (2021) Myeonghun Jeong, Hyeongju Kim, Sung Jun Cheon, Byoung Jin Choi, and Nam Soo Kim. Diff-tts: A denoising diffusion model for text-to-speech. _arXiv preprint arXiv:2104.01409_, 2021.
+* Karras et al. (2022) Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-based generative models. _Advances in Neural Information Processing Systems_, 35:26565-26577, 2022.
+* Kim et al. (2022) Dongjun Kim, Yeongmin Kim, Wanmo Kang, and Il-Chul Moon. Refining generative process with discriminator guidance in score-based diffusion models. _arXiv preprint arXiv:2211.17091_, 2022.
+* Kingma & Gua (2023) Diederik Kingma and Ruiqi Gua. Vdm++: Variational diffusion models for high-quality synthesis. _arXiv preprint arXiv:2303.00848_, 2023. URL [https://arxiv.org/abs/2303.00848](https://arxiv.org/abs/2303.00848).
+* Kingma et al. (2021) Diederik Kingma, Tim Salimans, Ben Poole, and Jonathan Ho. Variational diffusion models. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman Vaughan (eds.), _Advances in Neural Information Processing Systems_, volume 34, pp. 21696-21707. Curran Associates, Inc., 2021. URL [https://proceedings.neurips.cc/paper/2021/file/b578f2a52a0229873fefc2a4b06377fa-Paper.pdf](https://proceedings.neurips.cc/paper/2021/file/b578f2a52a0229873fefc2a4b06377fa-Paper.pdf).
+* Kingma & Welling (2013) Diederik P Kingma and Max Welling. Auto-encoding variational bayes. _arXiv preprint arXiv:1312.6114_, 2013.
+* Kong et al. (2020) Zhifeng Kong, Wei Ping, Jiaji Huang, Kexin Zhao, and Bryan Catanzaro. Diffwave: A versatile diffusion model for audio synthesis. _arXiv preprint arXiv:2009.09761_, 2020.
+* Krizhevsky et al. (2009) Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+* LeCun et al. (1998) Yann LeCun, Leon Bottou, Yoshua Bengio, and Patrick Haffner. Gradient-based learning applied to document recognition. _Proceedings of the IEEE_, 86(11):2278-2324, 1998.
+* Lin et al. (2023) Shanchuan Lin, Bingchen Liu, Jiashi Li, and Xiao Yang. Common diffusion noise schedules and sample steps are flawed. _arXiv preprint arXiv:2305.08891_, 2023.
+* Lipman et al. (2022) Yaron Lipman, Ricky TQ Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le. Flow matching for generative modeling. _arXiv preprint arXiv:2210.02747_, 2022.
+* Liu et al. (2022) Xingchao Liu, Chengyue Gong, and Qiang Liu. Flow straight and fast: Learning to generate and transfer data with rectified flow. _arXiv preprint arXiv:2209.03003_, 2022.
+
+* Lou and Ermon (2023) Aaron Lou and Stefano Ermon. Reflected diffusion models. _arXiv preprint arXiv:2304.04740_, 2023.
+* Lu et al. (2022) Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver: A fast ode solver for diffusion probabilistic model sampling in around 10 steps. _Advances in Neural Information Processing Systems_, 35:5775-5787, 2022.
+* Luhman & Luhman (2021) Eric Luhman and Troy Luhman. Knowledge distillation in iterative generative models for improved sampling speed. _arXiv preprint arXiv:2101.02388_, 2021.
+* Nichol & Dhariwal (2021) Alexander Quinn Nichol and Prafulla Dhariwal. Improved denoising diffusion probabilistic models. In _International Conference on Machine Learning_, pp. 8162-8171. PMLR, 2021.
+* Parmar et al. (2018) Niki Parmar, Ashish Vaswani, Jakob Uszkoreit, Lukasz Kaiser, Noam Shazeer, Alexander Ku, and Dustin Tran. Image transformer. In _International conference on machine learning_, pp. 4055-4064. PMLR, 2018.
+* Preechakul et al. (2022) Konpat Preechakul, Nattanat Chatthee, Suttisak Wizadwongsa, and Supasorn Suwajanakorn. Diffusion autoencoders: Toward a meaningful and decodable representation. In _Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition_, pp. 10619-10629, 2022.
+* Rezende et al. (2014) Danilo Jimenez Rezende, Shakir Mohamed, and Daan Wierstra. Stochastic backpropagation and approximate inference in deep generative models. In _International conference on machine learning_, pp. 1278-1286. PMLR, 2014.
+* Rissanen et al. (2022) Severi Rissanen, Markus Heinonen, and Arno Solin. Generative modelling with inverse heat dissipation. _arXiv preprint arXiv:2206.13397_, 2022.
+* Rombach et al. (2022) Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bjorn Ommer. High-resolution image synthesis with latent diffusion models. In _Proceedings of the IEEE/CVF conference on computer vision and pattern recognition_, pp. 10684-10695, 2022.
+* Ronneberger et al. (2015) Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-net: Convolutional networks for biomedical image segmentation. In _Medical Image Computing and Computer-Assisted Intervention-MICCAI 2015: 18th International Conference, Munich, Germany, October 5-9, 2015, Proceedings, Part III 18_, pp. 234-241. Springer, 2015.
+* Salimans & Ho (2022) Tim Salimans and Jonathan Ho. Progressive distillation for fast sampling of diffusion models. _arXiv preprint arXiv:2202.00512_, 2022.
+* Schneider et al. (2023) Flavio Schneider, Zhijing Jin, and Bernhard Scholkopf. Mo\(\backslash\)' usai: Text-to-music generation with long-context latent diffusion. _arXiv preprint arXiv:2301.11757_, 2023.
+* Singhal et al. (2023) Raghav Singhal, Mark Goldstein, and Rajesh Ranganath. Where to diffuse, how to diffuse, and how to get back: Automated learning for multivariate diffusions. _arXiv preprint arXiv:2302.07261_, 2023.
+* Sinha & Dieng (2021) Samarth Sinha and Adji Bousso Dieng. Consistency regularization for variational auto-encoders. _Advances in Neural Information Processing Systems_, 34:12943-12954, 2021.
+* Sohl-Dickstein et al. (2015) Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning using nonequilibrium thermodynamics. In _International Conference on Machine Learning_, pp. 2256-2265. PMLR, 2015.
+* Sonderby et al. (2016) Casper Kaae Sonderby, Tapani Raiko, Lars Maaloe, Soren Kaae Sonderby, and Ole Winther. Ladder variational autoencoders. _Advances in neural information processing systems_, 29, 2016.
+* Song et al. (2020a) Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. In _International Conference on Learning Representations_, 2020a.
+* Song & Ermon (2019) Yang Song and Stefano Ermon. Generative modeling by estimating gradients of the data distribution. _Advances in neural information processing systems_, 32, 2019.
+* Song et al. (2020b) Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based generative modeling through stochastic differential equations. _arXiv preprint arXiv:2011.13456_, 2020b.
+
+* Song et al. (2021) Yang Song, Conor Durkan, Iain Murray, and Stefano Ermon. Maximum likelihood training of score-based diffusion models. _Advances in Neural Information Processing Systems_, 34:1415-1428, 2021.
+* Theis et al. (2015) Lucas Theis, Aaron van den Oord, and Matthias Bethge. A note on the evaluation of generative models. _arXiv preprint arXiv:1511.01844_, 2015.
+* Vahdat & Kautz (2020) Arash Vahdat and Jan Kautz. Nvae: A deep hierarchical variational autoencoder. _Advances in neural information processing systems_, 33:19667-19679, 2020.
+* Vahdat et al. (2021) Arash Vahdat, Karsten Kreis, and Jan Kautz. Score-based generative modeling in latent space. _Advances in Neural Information Processing Systems_, 34:11287-11302, 2021.
+* Van Den Oord et al. (2016) Aaron Van Den Oord, Nal Kalchbrenner, and Koray Kavukcuoglu. Pixel recurrent neural networks. In _International conference on machine learning_, pp. 1747-1756. PMLR, 2016.
+* Watson et al. (2021) Daniel Watson, Jonathan Ho, Mohammad Norouzi, and William Chan. Learning to efficiently sample from diffusion probabilistic models. _arXiv preprint arXiv:2106.03802_, 2021.
+* Zheng et al. (2022) Guangcong Zheng, Shengming Li, Hui Wang, Taiping Yao, Yang Chen, Shouhong Ding, and Xi Li. Entropy-driven sampling and training scheme for conditional diffusion generation. In _European Conference on Computer Vision_, pp. 754-769. Springer, 2022.
+
+Overview of diffusion model with and without encoder
+
+The typical diffusion approach can be illustrated with the following diagram:
+
+where \(0\leq s<t\leq 1\). We introduce an encoder \(f_{\mathbf{\phi}}:\mathcal{X}\times[0,1]\rightarrow\mathcal{Y}\) with parameters \(\mathbf{\phi}\), that maps \(\mathbf{x}\) and a time \(t\in[0,1]\) to a latent space \(\mathcal{Y}\). In this work, \(\mathcal{Y}\) has the same dimensions as the original image space. For brevity, we denote the encoded data as \(\mathbf{x}_{t}\equiv f_{\mathbf{\phi}}(\mathbf{x},t)\). The following diagram illustrates the process including the encoder:
+
+## Appendix B Proof that \(\mathbf{z}_{t}\) given \(\mathbf{x}\) has the correct form
+
+Proof that we can write
+
+\[q(\mathbf{z}_{t}|\mathbf{x})=\mathcal{N}(\alpha_{t}\mathbf{x}_{t},\sigma_{t}^{2 }\mathbf{I}) \tag{21}\]
+
+for any \(t\) when using the definition \(q(\mathbf{z}_{0}|\mathbf{x}_{0})=q(\mathbf{z}_{0}|\mathbf{x})\) and Eq. (11).
+
+Proof.: By induction:
+
+The definition of \(q(\mathbf{z}_{0}|\mathbf{x}_{0})=q(\mathbf{z}_{0}|\mathbf{x})\) gives us our base case.
+
+To take a step, we assume \(q(\mathbf{z}_{s}|\mathbf{x}_{s})=q(\mathbf{z}_{s}|\mathbf{x})\) can be written as
+
+\[q(\mathbf{z}_{s}|\mathbf{x})=\mathcal{N}(\alpha_{s}\mathbf{x}_{s},\sigma_{s}^{ 2}\mathbf{I}) \tag{22}\]
+
+and take a \(t>s\).
+
+Then a sample from \(q(\mathbf{z}_{s}|\mathbf{x})\) can be written as
+
+\[\mathbf{z}_{s}=\alpha_{s}\mathbf{x}_{s}+\sigma_{s}\mathbf{\epsilon}_{s} \tag{23}\]
+
+where \(\mathbf{\epsilon}_{s}\) is from a standard normal distribution, \(\mathcal{N}(\mathbf{0},\mathbf{I})\) and a sample from \(q(\mathbf{z}_{t}|\mathbf{z}_{s},\mathbf{x}_{t},\mathbf{x}_{s})=q(\mathbf{z}_{ t}|\mathbf{z}_{s},\mathbf{x})\) can be written as
+
+\[\mathbf{z}_{t}=\alpha_{t|s}\mathbf{z}_{s}+\alpha_{t}(\mathbf{x}_{t}-\mathbf{x} _{s})+\sigma_{t|s}\mathbf{\epsilon}_{t|s} \tag{24}\]
+
+where \(\mathbf{\epsilon}_{t|s}\) is from a standard normal distribution, \(\mathcal{N}(\mathbf{0},\mathbf{I})\). Using the definition of \(\mathbf{z}_{s}\), we get
+
+\[\mathbf{z}_{t} =\alpha_{t|s}(\alpha_{s}\mathbf{x}_{s}+\sigma_{s}\mathbf{\epsilon}_{s} )+\alpha_{t}(\mathbf{x}_{t}-\mathbf{x}_{s})+\sigma_{t|s}\mathbf{\epsilon}_{t|s}\] \[=\alpha_{t}\mathbf{x}_{s}+\alpha_{t|s}\sigma_{s}\mathbf{\epsilon}_{s} +\alpha_{t}\mathbf{x}_{t}-\alpha_{t}\mathbf{x}_{s}+\sigma_{t|s}\mathbf{\epsilon}_{ t|s} \tag{25}\] \[=\alpha_{t}\mathbf{x}_{t}+\alpha_{t|s}\sigma_{s}\mathbf{\epsilon}_{s} +\sigma_{t|s}\mathbf{\epsilon}_{t|s}\]Since \(\alpha_{t|s}\sigma_{s}\mathbf{\epsilon}_{s}\) and \(\sigma_{t|s}\mathbf{\epsilon}_{t|s}\) describe two normal distributions, a sample from the sum can be written as
+
+\[\sqrt{\alpha_{t|s}^{2}\sigma_{s}^{2}+\sigma_{t|s}^{2}}\mathbf{\epsilon}_{t} \tag{26}\]
+
+where \(\mathbf{\epsilon}_{t}\) is from a standard normal distribution, \(\mathcal{N}(\mathbf{0},\mathbf{I})\). So we can write our sample \(\mathbf{z}_{t}\) as
+
+\[\mathbf{z}_{t} =\alpha_{t}\mathbf{x}_{t}+\sqrt{\alpha_{t|s}^{2}\sigma_{s}^{2}+ \sigma_{t|s}^{2}}\mathbf{\epsilon}_{t}\] \[=\alpha_{t}\mathbf{x}_{t}+\sqrt{\alpha_{t|s}^{2}\sigma_{s}^{2}+ \sigma_{t}^{2}-\alpha_{t|s}^{2}\sigma_{s}^{2}}\mathbf{\epsilon}_{t} \tag{27}\] \[=\alpha_{t}\mathbf{x}_{t}+\sigma_{t}\mathbf{\epsilon}_{t}\]
+
+Thus we get
+
+\[q(\mathbf{z}_{t}|\mathbf{x})=\mathcal{N}(\alpha_{t}\mathbf{x}_{t},\sigma_{t}^{ 2}\mathbf{I}) \tag{28}\]
+
+for any \(0\leq t\leq 1\). We have defined going from \(\mathbf{x}\) to \(\mathbf{z}_{t}\) as going through \(f\). 
+
+## Appendix C Proof that the reverse process has the correct form
+
+To see that
+
+\[q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x}_{t},\mathbf{x}_{s})=\mathcal{N}( \mathbf{\mu}_{Q},\sigma_{Q}^{2}\mathbf{I}) \tag{29}\]
+
+with
+
+\[\sigma_{Q}^{2}=\frac{\sigma_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}} \tag{30}\]
+
+and
+
+\[\mathbf{\mu}_{Q}=\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{z}_{t}+ \frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\mathbf{x}_{t}+\alpha_{s}( \mathbf{x}_{s}-\mathbf{x}_{t}) \tag{31}\]
+
+is the right form for the reverse process, we take a sample \(z_{s}\) from \(q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x}_{t},\mathbf{x}_{s})\) and a sample \(z_{t}\) from \(q(z_{t}|x)\). These have the forms:
+
+\[z_{t} =\alpha_{t}\mathbf{x}_{t}+\sigma_{t}\mathbf{\epsilon}_{t} \tag{32}\] \[z_{s} =\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{z}_{t}+ \frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\mathbf{x}_{t}+\alpha_{s}( \mathbf{x}_{s}-\mathbf{x}_{t})+\sigma_{Q}^{2}\mathbf{\epsilon}_{Q} \tag{33}\]
+
+We show that given \(z_{t}\) we get \(z_{s}\) from \(q(z_{s}|x)\) as in Eq. (10).
+
+\[z_{s} =\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\left(\alpha_{t} \mathbf{x}_{t}+\sigma_{t}\mathbf{\epsilon}_{t}\right)+\frac{\alpha_{s}\sigma_{t|s} ^{2}}{\sigma_{t}^{2}}\mathbf{x}_{t}+\alpha_{s}(\mathbf{x}_{s}-\mathbf{x}_{t})+ \sigma_{Q}^{2}\mathbf{\epsilon}_{Q} \tag{34}\] \[=\frac{\alpha_{t}\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}} \mathbf{x}_{t}+\frac{\alpha_{s}\left(\sigma_{t}^{2}-\alpha_{t|s}^{2}\sigma_{s }^{2}\right)}{\sigma_{t}^{2}}\mathbf{x}_{t}+\alpha_{s}(\mathbf{x}_{s}-\mathbf{x }_{t})+\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\sigma_{t}\mathbf{\epsilon }_{t}+\sigma_{Q}^{2}\mathbf{\epsilon}_{Q} \tag{35}\]
+
+Since \(\alpha_{t}=\alpha_{s}\alpha_{t|s}\) we have
+
+\[z_{s} =\frac{\alpha_{s}\alpha_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}} \mathbf{x}_{t}+\frac{\alpha_{s}\left(\sigma_{t}^{2}-\alpha_{t|s}^{2}\sigma_{s }^{2}\right)}{\sigma_{t}^{2}}\mathbf{x}_{t}+\alpha_{s}(\mathbf{x}_{s}-\mathbf{x }_{t})+\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\sigma_{t}\mathbf{\epsilon }_{t}+\sigma_{Q}^{2}\mathbf{\epsilon}_{Q} \tag{37}\] \[=\frac{\alpha_{s}\sigma_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}} \mathbf{x}_{t}-\frac{\alpha_{s}\alpha_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}} \mathbf{x}_{t}+\frac{\alpha_{s}\sigma_{t}^{2}}{\sigma_{t}^{2}}\mathbf{x}_{t}+ \alpha_{s}(\mathbf{x}_{s}-\mathbf{x}_{t})+\frac{\alpha_{t|s}\sigma_{s}^{2}}{ \sigma_{t}^{2}}\sigma_{t}\mathbf{\epsilon}_{t}+\sigma_{Q}^{2}\mathbf{\epsilon}_{Q}\] (38) \[=\alpha_{s}\mathbf{x}_{t}+\alpha_{s}(\mathbf{x}_{s}-\mathbf{x}_{t} )+\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\sigma_{t}\mathbf{\epsilon}_{t }+\sigma_{Q}^{2}\mathbf{\epsilon}_{Q}\] (39) \[=\alpha_{s}\mathbf{x}_{s}+\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma _{t}^{2}}\sigma_{t}\mathbf{\epsilon}_{t}+\sigma_{Q}^{2}\mathbf{\epsilon}_{Q} \tag{40}\]We now use that \(\sigma_{Q}^{2}=\frac{\sigma_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}}\) and the sum rule of variances, \(\sigma_{X+Y}^{2}=\sigma_{X}^{2}+\sigma_{Y}^{2}+2COV(X,Y)\), where the covariance is zero since \(\mathbf{\epsilon}_{t}\) and \(\mathbf{\epsilon}_{Q}\) are independent.
+
+\[z_{s} =\alpha_{s}\mathbf{x}_{s}+\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma _{t}^{2}}\mathbf{\epsilon}_{t}\mathbf{\epsilon}_{t}+\sigma_{Q}^{2}\mathbf{\epsilon}_{Q} \tag{42}\] \[=\alpha_{s}\mathbf{x}_{s}+\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma _{t}^{2}}\mathbf{\epsilon}_{t}+\frac{\sigma_{t|s}\sigma_{s}}{\sigma_{t}}\mathbf{ \epsilon}_{Q}\] (43) \[=\alpha_{s}\mathbf{x}_{s}+\sqrt{\frac{\sigma_{t|s}^{2}\sigma_{s}^ {4}}{\sigma_{t}^{2}}}+\frac{\sigma_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}}\bm {\epsilon}_{s}\] (44) \[=\alpha_{s}\mathbf{x}_{s}+\sqrt{\frac{\sigma_{t|s}^{2}\sigma_{s}^ {4}}{\sigma_{t}^{2}}}+\frac{(\sigma_{t}^{2}-\alpha_{t|s}^{2}\sigma_{s}^{2}) \sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{\epsilon}_{s}\] (45) \[=\alpha_{s}\mathbf{x}_{s}+\sqrt{\frac{\sigma_{t}^{2}\sigma_{s}^{2 }}{\sigma_{t}^{2}}}\mathbf{\epsilon}_{s}\] (46) \[=\alpha_{s}\mathbf{x}_{s}+\sigma_{s}\mathbf{\epsilon}_{s} \tag{47}\]
+
+Where \(\mathbf{\epsilon}_{s}\) is from a standard Gaussian distribution.
+
+## Appendix D The latent and reconstruction loss
+
+### Latent Loss
+
+Since \(q(z_{1}|\mathbf{x})=\mathcal{N}(\alpha_{1}\mathbf{x}_{1},\sigma_{1}^{2} \mathbf{I})\) and \(p(z_{1})=\mathcal{N}(\mathbf{0},\mathbf{I})\), the latent loss, \(D_{\text{KL}}(q(z_{1}|\mathbf{x})||p(z_{1}))\), is the KL divergence of two normal distributions. For normal distributions \(\mathcal{N}_{0},\mathcal{N}_{1}\) with means \(\mathbf{\mu}_{0},\mathbf{\mu}_{1}\) and variances \(\Sigma_{0},\Sigma_{1}\), the KL divergence between them is given by
+
+\[D_{\text{KL}}(\mathcal{N}_{0}||\mathcal{N}_{1})=\frac{1}{2}\left( \operatorname{tr}\left(\Sigma_{1}^{-1}\Sigma_{0}\right)-d+(\mathbf{\mu}_{1}-\mathbf{ \mu}_{0})^{T}\Sigma_{1}^{-1}(\mathbf{\mu}_{1}-\mathbf{\mu}_{0})+\log\left(\frac{ \det\Sigma_{1}}{\det\Sigma_{0}}\right)\right)\,, \tag{48}\]
+
+where \(d\) is the dimension. Therefore we have:
+
+\[D_{\text{KL}}(q(z_{1}|\mathbf{x})||p(z_{1})) =\frac{1}{2}\left(\operatorname{tr}\left(\sigma_{1}^{2}\mathbf{I }\right)-d+||0-\alpha_{1}\mathbf{x}_{1}||^{2}+\log\left(\frac{1}{\det\sigma_ {1}^{2}\mathbf{I}}\right)\right) \tag{49}\] \[=\frac{1}{2}\left(||\alpha_{1}\mathbf{x}_{1}||^{2}+d\left(\sigma _{1}^{2}-\log\sigma_{1}^{2}-1\right)\right)\] (50) \[=\frac{1}{2}\left(\sum_{i=1}^{d}\left(\alpha_{1}^{2}\mathbf{x}_{ 1,i}^{2}+\sigma_{1}^{2}-\log\sigma_{1}^{2}-1\right)\right)\,. \tag{51}\]
+
+The last line is used in our implementation.
+
+### Reconstruction Loss
+
+The reconstruction loss is given by
+
+\[\mathcal{L}_{0}=\mathbb{E}_{q(z_{0}|\mathbf{x})}\left[-\log p(\mathbf{x}|z_{0} )\right] \tag{52}\]
+
+In practice, we find this by getting the log probabilities of each pixel value given \(z_{0}\) and summing up the log probabilities of the actual pixel values of \(\mathbf{x}\).
+
+## Appendix E Diffusion loss
+
+The diffusion loss is
+
+\[\mathcal{L}_{T}(\mathbf{x})=\sum_{i=1}^{T}\mathbb{E}_{q(z_{t(i)}|\mathbf{x})}D _{\text{KL}}(q(\mathbf{z}_{s(i)}|\mathbf{z}_{t(i)},\mathbf{x})||p_{\mathbf{\theta }}(\mathbf{z}_{s(i)}|\mathbf{z}_{t(i)}))\;, \tag{54}\]
+
+where \(s(i),t(i)\) are the values of \(0\leq s<t\leq 1\) corresponding to the \(i\)th timestep.
+
+### Assuming non-equal variances in the diffusion and generative processes
+
+In this section we let
+
+\[p_{\mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t}) =\mathcal{N}(\mathbf{\mu}_{P},\sigma_{P}^{2}\mathbf{I}) \tag{55}\] \[q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x}) =\mathcal{N}(\mathbf{\mu}_{Q},\sigma_{Q}^{2}\mathbf{I})\;, \tag{56}\]
+
+where we might have \(\sigma_{P}\neq\sigma_{Q}\). We then get for the KL divergence, where \(d\) is the dimension,
+
+\[D_{\mathrm{KL}}(q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})\|p_{ \mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t}))=D_{\mathrm{KL}}(\mathcal{N}( \mathbf{z}_{s};\mathbf{\mu}_{Q},\sigma_{Q}^{2}\mathbf{I})\|\mathcal{N}(\mathbf{z}_ {s};\mathbf{\mu}_{P},\sigma_{P}^{2}\mathbf{I}))\] \[=\frac{1}{2}\left(\mathrm{tr}\left(\frac{\sigma_{Q}^{2}}{\sigma_{ P}^{2}}\mathbf{I}\right)-d+(\mathbf{\mu}_{P}-\mathbf{\mu}_{Q})^{T}\frac{1}{\sigma_{P}^{2}} \mathbf{I}(\mathbf{\mu}_{P}-\mathbf{\mu}_{Q})+\log\frac{\det\sigma_{P}^{2}\mathbf{I}} {\det\sigma_{Q}^{2}\mathbf{I}}\right)\] \[=\frac{1}{2}\left(d\frac{\sigma_{Q}^{2}}{\sigma_{P}^{2}}-d+\frac{ 1}{\sigma_{P}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}+\log\frac{(\sigma_{P}^ {2})^{d}}{(\sigma_{Q}^{2})^{d}}\right)\] \[=\frac{d}{2}\left(\frac{\sigma_{Q}^{2}}{\sigma_{P}^{2}}-1+\log \frac{\sigma_{P}^{2}}{\sigma_{Q}^{2}}\right)+\frac{1}{2\sigma_{P}^{2}}\|\mathbf{\mu }_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\;. \tag{57}\]
+
+If we define
+
+\[w_{t}=\frac{\sigma_{Q}^{2}}{\sigma_{P}^{2}} \tag{58}\]
+
+Then we can write the KL divergence as
+
+\[D_{\mathrm{KL}}(q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})\|p_{ \mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t}))=\frac{d}{2}\left(w_{t}-1-\log w_{ t}\right)+\frac{w_{t}}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2} \tag{59}\]
+
+Using our definition of \(\mathbf{\mu}_{P}\)
+
+\[\mathbf{\mu}_{P}=\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}} \mathbf{z}_{t}+\frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\hat{\mathbf{x}}_{ \mathbf{\theta}}(\lambda_{t})+\alpha_{s}(\lambda_{s}-\lambda_{t})(\sigma_{t}^{2} \hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})) \tag{60}\]
+
+we can rewrite the second term of the loss as:
+
+\[\frac{w_{t}}{\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2} \tag{61}\] \[=\frac{w_{t}}{2\sigma_{Q}^{2}}\left\|\frac{\alpha_{s}\sigma_{t|s} ^{2}}{\sigma_{t}^{2}}\left(\hat{\mathbf{x}}_{\mathbf{\theta}}(t)-\mathbf{x}_{\mathbf{\phi} }(\lambda_{t})\right)+\alpha_{s}\left((\lambda_{s}-\lambda_{t})\sigma_{t}^{2} \hat{\mathbf{x}}_{\mathbf{\theta}}(t)-(\mathbf{x}_{\mathbf{\phi}}(\lambda_{s})-\mathbf{x}_ {\mathbf{\phi}}(\lambda_{t}))\right)\right\|_{2}^{2}\;,\]
+
+Where we have dropped the dependence on \(\lambda\) from our notation of \(\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})\) and \(\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\), to make the equation fit on the page.
+
+### Assuming equal variances in the diffusion and generative processes
+
+If we let
+
+\[p_{\mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t}) =\mathcal{N}(\mathbf{\mu}_{P},\sigma_{Q}^{2}\mathbf{I}) \tag{62}\] \[q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x}) =\mathcal{N}(\mathbf{\mu}_{Q},\sigma_{Q}^{2}\mathbf{I}) \tag{63}\]
+
+we get for the KL divergence
+
+\[D_{\mathrm{KL}}(q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})\|p_{ \mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t}))=D_{\mathrm{KL}}(\mathcal{N}( \mathbf{z}_{s};\mathbf{\mu}_{Q},\sigma_{Q}^{2}\mathbf{I})\|\mathcal{N}(\mathbf{z}_ {s};\mathbf{\mu}_{P},\sigma_{Q}^{2}\mathbf{I}))\] \[=\frac{1}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\] \[=\frac{1}{2\sigma_{Q}^{2}}\left\|\frac{\alpha_{s}\sigma_{t|s}^{2 }}{\sigma_{t}^{2}}\left(\hat{\mathbf{x}}_{\mathbf{\theta}}(t)-\mathbf{x}_{\mathbf{\phi} }(\lambda_{t})\right)+\alpha_{s}\left((\lambda_{s}-\lambda_{t})\sigma_{t}^{2} \hat{\mathbf{x}}_{\mathbf{\theta}}(t)-(\mathbf{x}_{\mathbf{\phi}}(\lambda_{s})-\mathbf{x }_{\mathbf{\phi}}(\lambda_{t}))\right)\right\|_{2}^{2}. \tag{64}\]Optimal variance for the generative model
+
+In this section, we compute the optimal variance \(\sigma_{P}^{2}\) of the generative model in closed-form.
+
+Consider the expectation over the data distribution of the KL divergence in the diffusion loss (Appendix E):
+
+\[\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{t})}\left[D_{\mathrm{KL}}(q( \mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})\|p_{\mathbf{\theta}}(\mathbf{z}_{s}| \mathbf{z}_{t}))\right]=\frac{d}{2}\left(\frac{\sigma_{Q}^{2}}{\sigma_{P}^{2}} -1+\log\frac{\sigma_{P}^{2}}{\sigma_{Q}^{2}}\right)+\frac{1}{2\sigma_{P}^{2}} \mathbb{E}_{q(\mathbf{x},\mathbf{z}_{t})}\left[\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{ 2}^{2}\right] \tag{65}\]
+
+and differentiate it w.r.t. \(\sigma_{P}^{2}\):
+
+\[\frac{dD_{\mathrm{KL}}}{d\sigma_{P}^{2}} =\frac{d}{2}\left(-\frac{\sigma_{Q}^{2}}{\sigma_{P}^{4}}+\frac{1} {\sigma_{Q}^{2}}\frac{\sigma_{Q}^{2}}{\sigma_{P}^{2}}\right)-\frac{1}{2\sigma _{P}^{4}}\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{t})}\left[\|\mathbf{\mu}_{P}-\mathbf{\mu} _{Q}\|_{2}^{2}\right] \tag{66}\] \[=\frac{1}{2\sigma_{P}^{4}}\left(d\sigma_{P}^{2}-d\sigma_{Q}^{2}- \mathbb{E}_{q(\mathbf{x},\mathbf{z}_{t})}\left[\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{ 2}^{2}\right]\right) \tag{67}\]
+
+The derivative is zero when:
+
+\[\sigma_{P}^{2}=\sigma_{Q}^{2}+\frac{1}{d}\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{ t})}\left[\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\right] \tag{68}\]
+
+Since the second derivative of the KL at this value of \(\sigma_{P}^{2}\) is positive, this is a minimum of the KL divergence.
+
+## Appendix G Diffusion loss in continuous time without counterterm
+
+In this section, we consider the DiffEnc diffusion process with mean shift term, coupled with the original VDM generative process (see Section 3). We show that in the continuous-time limit the optimal variance \(\sigma_{P}^{2}\) tends to \(\sigma_{Q}^{2}\) and the resulting diffusion loss simplifies to the standard VDM diffusion loss. We finally derive the diffusion loss in the continuous-time limit.
+
+We start by rewriting the diffusion loss as expectation, using constant step size \(\tau\equiv 1/T\) and denoting \(t_{i}\equiv i/T\):
+
+\[\mathcal{L}_{T}(\mathbf{x}) =T\,\mathbb{E}_{i\sim U\{1,T\}}\mathbb{E}_{q(\mathbf{z}_{t_{i}}| \mathbf{x})}\left[D_{\mathrm{KL}}(q(\mathbf{z}_{t_{i}-\tau}|\mathbf{z}_{t_{i}},\mathbf{x})\|p_{\mathbf{\theta}}(\mathbf{z}_{t_{i}-\tau}|\mathbf{z}_{t_{i}}))\right] \tag{69}\] \[=T\,\mathbb{E}_{t\sim U\{\tau,2\tau,\dots,1\}}\mathbb{E}_{q( \mathbf{z}_{t}|\mathbf{x})}\left[D_{\mathrm{KL}}(q(\mathbf{z}_{t-\tau}|\mathbf{ z}_{t},\mathbf{x})\|p_{\mathbf{\theta}}(\mathbf{z}_{t-\tau}|\mathbf{z}_{t}))\right]\;, \tag{70}\]
+
+where we dropped indices and directly sample the discrete rv \(t\).
+
+The KL divergence can be calculated in closed form (Appendix E) because all distributions are Gaussian:
+
+\[D_{\mathrm{KL}}(q(\mathbf{z}_{t-\tau}|\mathbf{z}_{t},\mathbf{x})\|p_{\mathbf{ \theta}}(\mathbf{z}_{t-\tau}|\mathbf{z}_{t}))=\frac{d}{2}\left(w_{t}-1-\log w_ {t}\right)+\frac{w_{t}}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\;, \tag{71}\]
+
+where we have defined the weighting function
+
+\[w_{t}=\frac{\sigma_{Q,t}^{2}}{\sigma_{P,t}^{2}} \tag{72}\]
+
+Insert this in the diffusion loss:
+
+\[\mathcal{L}_{T}(\mathbf{x})=\mathbb{E}_{t\sim U\{\tau,2\tau,\dots,1\}}\left[ \frac{d}{2\tau}(w_{t}-1-\log w_{t})+\frac{1}{\tau}\,\mathbb{E}_{q(\mathbf{z}_ {t}|\mathbf{x})}\left[\frac{w_{t}}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q }\|_{2}^{2}\right]\right] \tag{73}\]
+
+Given the optimal value for the noise variance in the generative model derived above (Appendix F):
+
+\[\sigma_{P}^{2}=\sigma_{Q}^{2}+\frac{1}{d}\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{ t})}\left[\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\right]\]we get the optimal \(w_{t}\):
+
+\[w_{t}^{-1}=1+\frac{1}{\sigma_{Q}^{2}d}\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{t})} \left[\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\right]\;.\]
+
+Using the following definitions:
+
+\[\mathbf{\mu}_{Q}=\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{z}_{t}+ \frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\mathbf{x}_{t}+\alpha_{s}( \mathbf{x}_{s}-\mathbf{x}_{t})\]
+
+\[\mathbf{\mu}_{P}=\frac{\alpha_{t|s}\sigma_{s}^{2}}{\sigma_{t}^{2}}\mathbf{z}_{t}+ \frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\hat{\mathbf{x}}_{\mathbf{\theta} }(\mathbf{z}_{t},t)\]
+
+\[\sigma_{Q}^{2}=\frac{\sigma_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}}\]
+
+\[\sigma_{t|s}^{2}=\sigma_{t}^{2}-\frac{\alpha_{t}^{2}}{\alpha_{s}^{2}}\sigma_{ s}^{2}\]
+
+and these intermediate results:
+
+\[\frac{1}{\sigma_{Q}^{2}}\frac{\alpha_{s}^{2}\sigma_{t|s}^{4}}{\sigma_{t}^{4}}= \mathrm{SNR}(s)-\mathrm{SNR}(t)\]
+
+\[\frac{\sigma_{t|s}^{2}}{\sigma_{t}^{2}}=1-\frac{\alpha_{t}^{2}\sigma_{s}^{2}}{ \alpha_{s}^{2}\sigma_{t}^{2}}=\frac{\mathrm{SNR}(s)-\mathrm{SNR}(t)}{\mathrm{ SNR}(s)}\]
+
+we can write:
+
+\[\frac{\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}}{2\sigma_{Q}^{2}} =\frac{1}{2\sigma_{Q}^{2}}\left\|\frac{\alpha_{s}\sigma_{t|s}^{2} }{\sigma_{t}^{2}}\mathbf{x}_{t}+\alpha_{s}(\mathbf{x}_{s}-\mathbf{x}_{t})- \frac{\alpha_{s}\sigma_{t|s}^{2}}{\sigma_{t}^{2}}\hat{\mathbf{x}}_{\mathbf{\theta} }(\mathbf{z}_{t},t)\right\|_{2}^{2}\] \[=\frac{1}{2\sigma_{Q}^{2}}\frac{\alpha_{s}^{2}\sigma_{t|s}^{4}}{ \sigma_{t}^{4}}\left\|\mathbf{x}_{t}+\frac{\sigma_{t}^{2}}{\sigma_{t|s}^{2}}( \mathbf{x}_{s}-\mathbf{x}_{t})-\hat{\mathbf{x}}_{\mathbf{\theta}}(\mathbf{z}_{t},t )\right\|_{2}^{2}\] \[=-\frac{1}{2}\Delta\mathrm{SNR}\left\|\mathbf{x}_{t}+\frac{ \mathrm{SNR}(s)}{\Delta\mathrm{SNR}}\Delta\mathbf{x}-\hat{\mathbf{x}}_{\mathbf{ \theta}}(\mathbf{z}_{t},t)\right\|_{2}^{2}\]
+
+where we used the shorthand \(\Delta\mathrm{SNR}\equiv\mathrm{SNR}(t)-\mathrm{SNR}(s)\) and \(\Delta\mathbf{x}\equiv\mathbf{x}_{t}-\mathbf{x}_{s}\).
+
+The optimal \(w_{t}\) tends to 1.The optimal \(w_{t}\) can be rewritten as follows:
+
+\[w_{t}^{-1} =1+\frac{1}{\sigma_{Q}^{2}}\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{ t})}\left[\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\right] \tag{74}\] \[=1-\frac{\Delta\mathrm{SNR}}{d}\mathbb{E}_{q(\mathbf{x},\mathbf{z }_{t})}\left[\left\|\mathbf{x}_{t}+\frac{\mathrm{SNR}(s)}{\Delta\mathrm{SNR}} \Delta\mathbf{x}-\hat{\mathbf{x}}_{\mathbf{\theta}}(\mathbf{z}_{t},t)\right\|_{2} ^{2}\right] \tag{75}\]
+
+As \(T\rightarrow\infty\), or equivalently \(s\to t\) and \(\tau=s-t\to 0\), the optimal \(w_{t}\) tends to 1, corresponding to the unweighted case (forward and backward variance are equal).
+
+The first term of diffusion loss tends to zero.Define:
+
+\[\nu=\frac{\Delta\mathrm{SNR}}{d}\mathbb{E}_{q(\mathbf{x},\mathbf{z}_{t})}\left[ \left\|\mathbf{x}_{t}+\frac{\mathrm{SNR}(s)}{\Delta\mathrm{SNR}}\Delta\mathbf{ x}-\hat{\mathbf{x}}_{\mathbf{\theta}}(\mathbf{z}_{t},t)\right\|_{2}^{2}\right]\]
+
+such that the optimal \(w_{t}\) is given by
+
+\[w_{t}^{-1}=1-\nu\]
+
+Then we are interested in the term
+
+\[w_{t}-1-\log w_{t}=\frac{\nu}{1-\nu}+\log(1-\nu)\]As \(\tau\to 0\), we have
+
+\[\Delta\mathrm{SNR} =\tau\,\frac{d\mathrm{SNR}(t)}{dt}+\mathcal{O}(\tau^{2})\] \[\Delta\mathbf{x} =\tau\,\frac{d\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})}{dt}+\mathcal{O} (\tau^{2})\] \[\nu =\frac{\tau}{d}\,\frac{d\mathrm{SNR}(t)}{dt}\mathbb{E}_{q( \mathbf{x},\mathbf{z}_{t})}\left[\left\|\mathbf{x}_{t}+\frac{d\mathbf{x}_{\mathbf{ \phi}}(\lambda_{t})}{d\log\mathrm{SNR}}-\hat{\mathbf{x}}_{\mathbf{\theta}}(\mathbf{ z}_{t},t)\right\|_{2}^{2}\right]+\mathcal{O}(\tau^{2})\]
+
+Since \(\nu\to 0\), we can write a series expansion around \(\nu=0\):
+
+\[w_{t}-1-\log w_{t} =\frac{1}{2}\nu^{2}+\mathcal{O}(\nu^{3})\] \[=\mathcal{O}(\tau^{2})\]
+
+_The first term of the weighted diffusion loss \(\mathcal{L}_{T}\) is then 0, since as \(\tau\to 0\) we get:_
+
+\[\frac{d}{2\tau}\,\mathbb{E}_{t\sim U\{\tau,2\tau,\ldots,1\}}\left[w_{t}-1-\log w _{t}\right]=\mathcal{O}(\tau) \tag{76}\]
+
+Note that, had we simply used \(w_{t}=1+\mathcal{O}(\tau)\), we would only be able to prove that this term in the loss is finite, but not whether it is zero. Here, we showed that the additional term in the loss actually tends to zero as \(T\rightarrow\infty\).
+
+In fact, we can also observe that, if \(\sigma_{P}\neq\sigma_{Q}\) and therefore \(w_{t}-1-\log w_{t}>0\), the first term in the diffusion loss diverges in the continuous-time limit, so the ELBO is not well-defined.
+
+Continuous-time limit of the diffusion loss.We saw that, as \(\tau\to 0\), \(w_{t}\to 1\) and the first term in the diffusion loss \(\mathcal{L}_{T}\) tends to zero. The limit of \(\mathcal{L}_{T}\) then becomes
+
+\[\mathcal{L}_{\infty}(\mathbf{x}) =\lim_{T\rightarrow\infty}\mathcal{L}_{T}(\mathbf{x}) \tag{77}\] \[=\lim_{T\rightarrow\infty}\mathbb{E}_{t\sim U\{\tau,2\tau,\ldots,1 \}}\mathbb{E}_{q(\mathbf{z}_{t}|\mathbf{x})}\left[\frac{1}{2\tau\sigma_{Q}^{2} }\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2}\right]\] (78) \[=\lim_{T\rightarrow\infty}\mathbb{E}_{t\sim U\{\tau,2\tau,\ldots, 1\}}\mathbb{E}_{q(\mathbf{z}_{t}|\mathbf{x})}\left[-\frac{1}{2\tau}\frac{d \mathrm{SNR}(t)}{dt}\tau\left\|\mathbf{x}_{t}+\frac{\mathrm{SNR}(t)\frac{d \mathbf{x}_{\mathbf{\phi}}(\lambda_{t})}{dt}\tau}{\frac{d\mathrm{SNR}(t)}{dt}\tau }-\hat{\mathbf{x}}_{\mathbf{\theta}}(\mathbf{z}_{t},t)\right\|_{2}^{2}\right]\] (79) \[=-\frac{1}{2}\mathbb{E}_{t\sim U(0,1)}\mathbb{E}_{q(\mathbf{z}_{ t}|\mathbf{x})}\left[\frac{d\mathrm{SNR}(t)}{dt}\left\|\mathbf{x}_{t}+\frac{d \mathbf{x}_{\mathbf{\phi}}(\lambda_{t})}{d\log\mathrm{SNR}}-\hat{\mathbf{x}}_{\bm {\theta}}(\mathbf{z}_{t},t)\right\|_{2}^{2}\right] \tag{80}\]
+
+## Appendix H DiffEnc as an SDE
+
+A diffusion model may be seen as a discretization of an SDE. The same is true for the depth dependent encoder model. The forward process Eq. (11) can be written as
+
+\[\mathbf{z}_{t}=\alpha_{t|\mathbf{z}}\mathbf{z}_{s}+\alpha_{t}(\mathbf{x}_{\bm {\phi}}(t)-\mathbf{x}_{\mathbf{\phi}}(s))+\sigma_{t|s}\mathbf{\epsilon}. \tag{81}\]
+
+Let \(0<\Delta t<1\) such that \(t=s+\Delta t\). If we consider the first term after the equality sign we see that
+
+\[\frac{\alpha_{t}}{\alpha_{s}} =\frac{\alpha_{s}+\alpha_{t}-\alpha_{s}}{\alpha_{s}} \tag{82}\] \[=1+\frac{\alpha_{t}-\alpha_{s}}{\alpha_{s}\Delta t}\Delta t \tag{83}\]So we get that
+
+\[\mathbf{z}_{t}-\mathbf{z}_{s}=\frac{\alpha_{t}-\alpha_{s}}{\alpha_{t}\Delta t} \mathbf{z}_{s}\Delta t+\alpha_{t}(\mathbf{x}_{\mathbf{\phi}}(t)-\mathbf{x}_{\mathbf{ \phi}}(s))+\sigma_{t|s}\mathbf{\epsilon} \tag{84}\]
+
+Considering the second term, we get
+
+\[\alpha_{t}(\mathbf{x}_{\mathbf{\phi}}(t)-\mathbf{x}_{\mathbf{\phi}}(s))=\alpha_{t}\frac {\mathbf{x}_{\mathbf{\phi}}(t)-\mathbf{x}_{\mathbf{\phi}}(s)}{\Delta t}\Delta t \tag{85}\]
+
+So if we define
+
+\[f_{\Delta t}(\mathbf{z}_{s},s)=\frac{\alpha_{t}-\alpha_{s}}{\alpha_{t}\Delta t} \mathbf{z}_{s}+\alpha_{t}\frac{\mathbf{x}_{\mathbf{\phi}}(t)-\mathbf{x}_{\mathbf{\phi} }(s)}{\Delta t} \tag{86}\]
+
+we can write
+
+\[\mathbf{z}_{t}-\mathbf{z}_{s}=f_{\Delta t}(\mathbf{z}_{s},s)\Delta t+\sigma_{ t|t}\mathbf{\epsilon} \tag{87}\]
+
+We will now consider \(\sigma_{t|t}^{2}\) to be able to rewrite \(\sigma_{t|s}\mathbf{\epsilon}\)
+
+\[\sigma_{t|t}^{2} =\sigma_{t}^{2}-\frac{\alpha_{t}^{2}}{\alpha_{s}^{2}}\sigma_{s}^{2} \tag{88}\] \[=\alpha_{t}^{2}\left(\frac{\sigma_{t}^{2}}{\alpha_{t}^{2}}-\frac {\sigma_{s}^{2}}{\alpha_{s}^{2}}\right)\] (89) \[=\alpha_{t}^{2}\left(\frac{\sigma_{t}^{2}}{\alpha_{t}^{2}}-\frac {\sigma_{s}^{2}}{\alpha_{s}^{2}}\right)\frac{\Delta t}{\Delta t} \tag{90}\]
+
+Thus, if we define
+
+\[g_{\Delta t}(s)=\sqrt{\alpha_{t}^{2}\left(\frac{\sigma_{t}^{2}}{\alpha_{t}^{2 }}-\frac{\sigma_{s}^{2}}{\alpha_{s}^{2}}\right)\frac{1}{\Delta t}} \tag{91}\]
+
+we can write
+
+\[\mathbf{z}_{t}-\mathbf{z}_{s}=f_{\Delta t}(\mathbf{z}_{s},s)\Delta t+g_{\Delta t }(s)\sqrt{\Delta t}\mathbf{\epsilon} \tag{92}\]
+
+We can now take the limit \(\Delta t\to 0\) using the definition \(t=s+\Delta t\):
+
+\[f_{\Delta t}(\mathbf{z}_{s},s) \rightarrow\frac{1}{\alpha_{s}}\frac{d\alpha_{s}}{ds}\mathbf{z}_{ s}+\alpha_{s}\frac{d\mathbf{x}_{\mathbf{\phi}}(s)}{ds}=\frac{d\log\alpha_{s}}{ds} \mathbf{z}_{s}+\alpha_{s}\frac{d\mathbf{x}_{\mathbf{\phi}}(s)}{ds} \tag{93}\] \[g_{\Delta t}(s) \rightarrow\sqrt{\alpha_{s}^{2}\left(\frac{d\sigma_{s}^{2}/\alpha _{s}^{2}}{ds}\right)} \tag{94}\]
+
+So if we use these limits to define the functions
+
+\[\mathbf{f}(\mathbf{z}_{t},t,\mathbf{x}) =\frac{1}{\alpha_{t}}\frac{d\alpha_{t}}{dt}\mathbf{z}_{t}+\alpha _{t}\frac{d\mathbf{x}_{\mathbf{\phi}}(t)}{dt} \tag{95}\] \[g(t) =\alpha_{t}\sqrt{\frac{d\sigma_{t}^{2}/\alpha_{t}^{2}}{dt}}. \tag{96}\]
+
+we can write the forward stochastic process when using a time dependent encoder as
+
+\[d\mathbf{z}= \mathbf{f}(\mathbf{z}_{t},t,\mathbf{x})dt+g(t)d\mathbf{w} \tag{97}\]
+
+where \(d\mathbf{w}\) is the increment of a Wiener process over time \(\Delta t\). The diffusion process of DiffEnc in the continuous-time limit is therefore similar to the usual SDE for diffusion models (Song et al., 2020b), with an additional contribution to the drift term.
+
+Given the drift and the diffusion coefficient we can write the generative model as a reverse-time SDE (Song et al., 2020b):
+
+\[d\mathbf{z}=\left[\mathbf{f}(\mathbf{z}_{t},t,\mathbf{x})-g^{2}(t)\nabla_{ \mathbf{z}_{t}}\log p(\mathbf{z}_{t})\right]dt+g(t)d\bar{\mathbf{w}}\, \tag{98}\]
+
+where \(d\bar{\mathbf{w}}\) is a reverse-time Wiener process.
+
+## Appendix I Motivation for choice of parameterization for the encoder
+
+As mentioned in Section 4, we would like our encoding to be helpful for the reconstruction loss at \(t=0\) and for the latent loss at \(t=1\). Multiplying the data with \(\alpha_{t}\) will give us these properties, since it will be close to the identity at \(t=0\) and send everything to \(0\) at \(t=1\). Instead of just multiplying with \(\alpha_{t}\), we choose to use \(\alpha_{t}^{2}\), since we still get the desirable properties for \(t=0\) and \(t=1\), but it makes some of the mathematical expressions nicer (for example the derivative). Thus, we arrive at the non-trainable parameterization
+
+\[\mathbf{x}_{\text{nt}}(\lambda_{t})=\alpha_{t}^{2}\mathbf{x} \tag{99}\]
+
+At \(t=1\), we see that all the values of \(\mathbf{x}_{\text{nt}}(\lambda_{t})\) are very close to \(0\), which should be easy to approximate from \(z_{1}=\alpha_{1}^{3}\mathbf{x}+\sigma_{1}\mathbf{\epsilon}\), since it will just be the mean of the values in \(z_{1}\). Note that this parameterization gives us a lower latent loss, since the values of \(\alpha_{t}^{3}\mathbf{x}\) are closer to zero than the values of \(\alpha_{t}\mathbf{x}\). However, this is not the same as just using a smaller minimum \(\lambda_{t}\) in the original formulation, since in the original formulation the diffusion model would still be predicting \(\mathbf{x}\) and not \(\alpha_{t}^{2}\mathbf{x}\approx 0\) at \(t=1\). There is still a problem with this formulation, since if we look at what happens between \(t=0\) and \(t=1\) we see that at some point, we will be attempting to approximate \(v_{t}=\alpha_{t}\mathbf{\epsilon}-\sigma_{t}\mathbf{x}_{\text{nt}}(x,\lambda_{t})\) from a very noisy \(\mathbf{z}_{t}\) while the values of \(\mathbf{x}_{\text{nt}}(x,\lambda_{t})\) are still very small. In other words, since \(\mathbf{z}_{t}\) is a noisy version of \(\mathbf{x}_{\text{nt}}(x,\lambda_{t})\) and \(\mathbf{x}_{\text{nt}}(x,\lambda_{t})\) has very small values there will not be much signal, but as we move away from \(t=1\), \(0\) will also become a worse and worse approximation.
+
+This is why we introduce the trainable encoder
+
+\[\mathbf{x}_{\mathbf{\phi}}(\lambda_{t}) =\mathbf{x}-\sigma_{t}^{2}\mathbf{x}+\sigma_{t}^{2}\mathbf{y}_{ \mathbf{\phi}}(\mathbf{x},\lambda_{t}) \tag{100}\] \[=\alpha_{t}^{2}\mathbf{x}+\sigma_{t}^{2}\mathbf{y}_{\mathbf{\phi}}( \mathbf{x},\lambda_{t}) \tag{101}\]
+
+Here we allow the inner encoder \(\mathbf{y}_{\mathbf{\phi}}(\mathbf{x},\lambda_{t})\) to add signal dependent on the image at the same pace as we are removing signal via the \(-\sigma_{t}^{2}\mathbf{x}\) term. This should give us a better diffusion loss between \(t=0\) and \(t=1\), but still has \(\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\) very close to \(\mathbf{x}\) at \(t=0\).
+
+## Appendix J Continuous-time limit of the diffusion loss with an encoder
+
+### Rewriting the loss using SNR
+
+We can express the KL divergence in terms of the SNR:
+
+\[\mathrm{SNR}(t)=\frac{\alpha_{t}^{2}}{\sigma_{t}^{2}}\;. \tag{102}\]
+
+We pull \(\frac{\alpha_{s}\sigma_{t}^{2}}{\sigma_{t}^{2}}\) outside, expand \(\sigma_{Q}^{2}\), and use the definition of the SNR to get:
+
+\[\frac{1}{2\sigma_{Q}^{2}}\frac{\alpha_{s}^{2}\sigma_{t|s}^{4}}{ \sigma_{t}^{4}}=\frac{1}{2}\left(\mathrm{SNR}(s)-\mathrm{SNR}(t)\right) \tag{103}\]
+
+We also see that
+
+\[\frac{\sigma_{t|s}^{2}}{\sigma_{t}^{2}}=\frac{\sigma_{t}^{2}- \alpha_{t|s}^{2}\sigma_{s}^{2}}{\sigma_{t}^{2}}=1-\frac{\alpha_{t}^{2}\sigma _{s}^{2}}{\alpha_{s}^{2}\sigma_{t}^{2}}=1-\frac{\mathrm{SNR}(t)}{\mathrm{SNR }(s)}=\frac{\mathrm{SNR}(s)-\mathrm{SNR}(t)}{\mathrm{SNR}(s)}\;. \tag{104}\]
+
+Inserting this back into Eq. (64), we get:
+
+\[\frac{1}{2\sigma_{Q}^{2}}\|\mathbf{\mu}_{P}-\mathbf{\mu}_{Q}\|_{2}^{2} \tag{105}\] \[=\frac{1}{2}\left(\mathrm{SNR}(s)-\mathrm{SNR}(t)\right).\] (106) \[\left\|\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\mathbf{x}_{ \mathbf{\phi}}(\lambda_{t})+\frac{\mathrm{SNR}(s)\left((\lambda_{s}-\lambda_{t}) \sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-(\mathbf{x}_{\mathbf{ \phi}}(\lambda_{s})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t}))\right)}{\mathrm{SNR}( s)-\mathrm{SNR}(t)}\right\|_{2}^{2}\]The KL divergence is then:
+
+\[D_{\mathrm{KL}}(q(\mathbf{z}_{s}|\mathbf{z}_{t},\mathbf{x})\|p_{ \mathbf{\theta}}(\mathbf{z}_{s}|\mathbf{z}_{t})) \tag{107}\] \[=\frac{1}{2}\left(\mathrm{SNR}(s)-\mathrm{SNR}(t)\right).\] \[\left\|\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\mathbf{x}_{ \mathbf{\phi}}(\lambda_{t})+\frac{\mathrm{SNR}(s)\left((\lambda_{s}-\lambda_{t}) \sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-(\mathbf{x}_{\mathbf{ \phi}}(\lambda_{s})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t}))\right)}{\mathrm{SNR}( s)-\mathrm{SNR}(t)}\right\|_{2}^{2}\]
+
+with \(s=\frac{i-1}{T}\) and \(t=\frac{i}{T}\).
+
+### Taking the limit
+
+If we rewrite everything in the loss from Eq. (107) to be with respect to \(\lambda_{t}\), we get
+
+\[\mathcal{L}_{T}(\mathbf{x}) =\frac{T}{2}\mathbb{E}_{\mathbf{\epsilon},i\sim U\{1,T\}}\left[(e^{ \lambda_{s}}-e^{\lambda_{t}})\right. \tag{108}\] \[\left\|\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\mathbf{x}_{ \mathbf{\phi}}(\lambda_{t})+\frac{e^{\lambda_{s}}\left((\lambda_{s}-\lambda_{t}) \sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-(\mathbf{x}_{\mathbf{ \phi}}(\lambda_{s})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t}))\right)}{e^{\lambda_{s }}-e^{\lambda_{t}}}\right\|_{2}^{2}\]
+
+Where \(s=(i-1)/T\) and \(t=i/T\). We now want to take the continuous limit. Outside the norm we get the derivative with respect to \(t\), inside the norm, we want the derivative w.r.t. \(\lambda_{t}\). First we consider
+
+\[\frac{e^{\lambda_{s}}-e^{\lambda_{t}}}{\frac{1}{T}} \tag{109}\]
+
+For \(T\rightarrow\infty\) and see that
+
+\[\frac{e^{\lambda_{s}}-e^{\lambda_{t}}}{\frac{1}{T}}\rightarrow-\frac{de^{ \lambda_{t}}}{dt}=-e^{\lambda_{t}}\cdot\lambda_{t}^{\prime} \tag{110}\]
+
+Where \(\lambda_{t}^{\prime}\) is the derivative of \(\lambda_{t}\) w.r.t. \(t\). Inside the norm we get for \(s\to t\) that
+
+\[e^{\lambda_{s}}\frac{\lambda_{t}-\lambda_{s}}{-(e^{\lambda_{t}}- e^{\lambda_{s}})}\frac{-(\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})-\mathbf{x}_{\mathbf{ \phi}}(\lambda_{s}))}{\lambda_{t}-\lambda_{s}} \to e^{\lambda_{t}}\frac{-1}{\frac{-d\mathbf{x}_{\mathbf{\phi}}( \lambda_{t})}{d\lambda_{t}}} \tag{111}\] \[=\frac{e^{\lambda_{t}}}{e^{\lambda_{t}}}\frac{d\mathbf{x}_{\mathbf{ \phi}}(\lambda_{t})}{d\lambda_{t}}\] (112) \[=\frac{d\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}} \tag{113}\]
+
+and
+
+\[\frac{e^{\lambda_{s}}}{e^{\lambda_{s}}-e^{\lambda_{t}}}(\lambda_{ s}-\lambda_{t})\sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t}) =e^{\lambda_{s}}\frac{-(\lambda_{t}-\lambda_{s})}{-(e^{\lambda_{t }}-e^{\lambda_{s}})}\sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t}) \tag{114}\] \[\to e^{\lambda_{t}}\frac{1}{e^{\lambda_{t}}}\sigma_{t}^{2} \hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})=\sigma_{t}^{2}\hat{\mathbf{x}}_{ \mathbf{\theta}}(\lambda_{t}) \tag{115}\]
+
+So we get the loss
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U [0,1]}\left[\lambda_{t}^{\prime}e^{\lambda_{t}}\left\|\hat{\mathbf{x}}_{\mathbf{ \theta}}(\lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})+\sigma_{t}^{2}\hat{ \mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\frac{d\mathbf{x}_{\mathbf{\phi}}(\lambda_{t })}{d\lambda_{t}}\right\|_{2}^{2}\right] \tag{116}\]
+
+## Appendix K Using the v Parameterization in the DiffEnc Loss
+
+In the following subsections we describe the \(\mathbf{v}\)-prediction parameterization (Salimans and Ho, 2022) and derive the \(\mathbf{v}\)-prediction loss for the proposed model, DiffEnc. We start by defining:
+
+\[\mathbf{v}_{t} =\alpha_{t}\mathbf{\epsilon}-\sigma_{t}\mathbf{x}_{\mathbf{\phi}}(\lambda_ {t}) \tag{117}\] \[\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t}) =\alpha_{t}\hat{\mathbf{\theta}}-\sigma_{t}\hat{\mathbf{x}}_{\mathbf{ \theta}}(\lambda_{t}) \tag{118}\]which give us (see Appendix K.1):
+
+\[\mathbf{x}_{\mathbf{\phi}}(\lambda_{t}) =\alpha_{t}\mathbf{x}_{t}-\sigma_{t}\mathbf{v}_{t} \tag{119}\] \[\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t}) =\alpha_{t}\mathbf{x}_{t}-\sigma_{t}\hat{\mathbf{v}}_{\mathbf{\theta}}( \lambda_{t}) \tag{120}\]
+
+where we learn the \(\mathbf{v}\)-prediction function \(\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})=\hat{\mathbf{v}}_{\mathbf{\theta}}( \mathbf{z}_{\lambda_{t}},\lambda_{t})\). In Appendix K.2 we show that, using this parameterization in Eq. (18), the loss becomes:
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U [0,1]}\left[\lambda_{t}^{\prime}\alpha_{t}^{2}\left\|\mathbf{v}_{\mathbf{\phi}}( \lambda_{t})-\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})+\sigma_{t}\hat{\mathbf{ x}}_{\mathbf{\theta}}(\lambda_{t})-\frac{1}{\sigma_{t}}\frac{d\mathbf{x}_{\mathbf{\phi}}( \lambda_{t})}{d\lambda_{t}}\right\|_{2}^{2}\right]. \tag{121}\]
+
+As shown in Appendix K.3, the diffusion loss for the trainable encoder from Eq. (15) becomes:
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U [0,1]}\left[\lambda_{t}^{\prime}\alpha_{t}^{2}\left\|\mathbf{v}_{t}-\hat{ \mathbf{v}}_{\mathbf{\theta}}+\sigma_{t}\left(\hat{\mathbf{x}}_{\mathbf{\theta}}( \lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})+\mathbf{y}_{\mathbf{\phi}}( \lambda_{t})-\frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right) \right\|_{2}^{2}\right] \tag{122}\]
+
+and for the non-trainable encoder:
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U [0,1]}\left[\lambda_{t}^{\prime}\alpha_{t}^{2}\left\|\mathbf{v}_{t}-\hat{ \mathbf{v}}_{\mathbf{\theta}}+\sigma_{t}\left(\hat{\mathbf{x}}_{\mathbf{\theta}}( \lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})\right)\right\|_{2}^{2}\right]. \tag{123}\]
+
+Eqs. (122) and (123) are the losses we use in our experiments.
+
+### Rewriting the v parameterization
+
+In the v parameterization of the loss from (Salimans & Ho, 2022), \(v_{t}\) is defined as
+
+\[v_{t}=\alpha_{t}\mathbf{\epsilon}-\sigma_{t}\mathbf{x} \tag{124}\]
+
+We use the generalization
+
+\[v_{t}=\alpha_{t}\mathbf{\epsilon}-\sigma_{t}\mathbf{x}_{\mathbf{\phi}}(x,\lambda_{t}) \tag{125}\]
+
+Note that since
+
+\[\mathbf{x}_{\mathbf{\phi}}(x,\lambda_{t})=(z_{t}-\sigma_{t}\mathbf{\epsilon})/\alpha_{t} \tag{126}\]
+
+and
+
+\[\alpha_{t}^{2}+\sigma_{t}^{2}=1 \tag{127}\]
+
+we get
+
+\[\mathbf{x}_{\mathbf{\phi}}(x,\lambda_{t}) =(z_{t}-\sigma_{t}\mathbf{\epsilon})/\alpha_{t} \tag{128}\] \[=((\alpha_{t}^{2}+\sigma_{t}^{2})z_{t}-\sigma_{t}(\alpha_{t}^{2} +\sigma_{t}^{2})\mathbf{\epsilon})/\alpha_{t}\] (129) \[=\left(\alpha_{t}+\frac{\sigma_{t}^{2}}{\alpha_{t}}\right)z_{t}- \left(\sigma_{t}\alpha_{t}+\frac{\sigma_{t}^{3}}{\alpha_{t}}\right)\mathbf{\epsilon}\] (130) \[=\alpha_{t}z_{t}+\frac{\sigma_{t}^{2}}{\alpha_{t}}z_{t}-\sigma_{ t}\alpha_{t}\mathbf{\epsilon}-\frac{\sigma_{t}^{3}}{\alpha_{t}}\mathbf{\epsilon}\] (131) \[=\alpha_{t}z_{t}-\sigma_{t}\left(\alpha_{t}\mathbf{\epsilon}-\frac{ \sigma_{t}}{\alpha_{t}}z_{t}+\frac{\sigma_{t}^{2}}{\alpha_{t}}\mathbf{\epsilon}\right)\] (132) \[=\alpha_{t}z_{t}-\sigma_{t}\left(\alpha_{t}\mathbf{\epsilon}-\frac{ \sigma_{t}}{\alpha_{t}}(z_{t}-\sigma_{t}\mathbf{\epsilon})\right)\] (133) \[=\alpha_{t}z_{t}-\sigma_{t}\left(\alpha_{t}\mathbf{\epsilon}-\sigma_{ t}\mathbf{x}_{\mathbf{\phi}}(x,\lambda_{t})\right)\] (134) \[=\alpha_{t}z_{t}-\sigma_{t}v_{t} \tag{135}\]
+
+So
+
+\[\mathbf{x}_{\mathbf{\phi}}(x,\lambda_{t})=\alpha_{t}z_{t}-\sigma_{t}v_{t} \tag{137}\]
+
+Therefore we define
+
+\[\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})=\alpha_{t}\hat{\mathbf{\epsilon}}_{\bm {\theta}}-\sigma_{t}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t}) \tag{138}\]
+
+which in the same way gives us
+
+\[\hat{\mathbf{x}}_{\mathbf{\theta}}(\mathbf{z}_{\lambda_{t}},\lambda_{t})=\alpha_{t }z_{t}-\sigma_{t}\hat{\mathbf{v}}_{\mathbf{\theta}} \tag{139}\]
+
+where we learn \(\hat{\mathbf{v}}_{\mathbf{\theta}}\).
+
+### v parameterization in continuous diffusion loss
+
+For the \(\mathbf{v}\) parameterization we have
+
+\[\mathbf{v}_{\mathbf{\phi}}(\lambda_{t})=\alpha_{t}\mathbf{\epsilon}-\sigma_{t}\mathbf{x} _{\mathbf{\phi}}(\lambda_{t}) \tag{140}\]
+
+where \(\mathbf{\epsilon}\) is from a standard normal distribution, \(\mathcal{N}(\mathbf{0},\mathbf{I})\), and
+
+\[\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})=\alpha_{t}z_{t}-\sigma_{t} \mathbf{v}_{\mathbf{\phi}}(\lambda_{t}) \tag{141}\]
+
+So we will set
+
+\[\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})=\alpha_{t}z_{t}-\sigma _{t}\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t}) \tag{142}\]
+
+and
+
+\[\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})=\alpha_{t}\mathbf{\hat{e} }_{\mathbf{\theta}}-\sigma_{t}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t}) \tag{143}\]
+
+where we learn \(\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})\). If we rewrite the second term within the square brackets of Eq. (116) using the \(\mathbf{v}\) parameterization, we get:
+
+\[\lambda^{\prime}(t)e^{\lambda_{t}}\left\|\hat{\mathbf{x}}_{\mathbf{ \theta}}(\lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})+\sigma_{t}^{2}\hat{ \mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\frac{d\mathbf{x}_{\mathbf{\phi}}(\lambda_ {t})}{d\lambda_{t}}\right\|_{2}^{2} \tag{144}\] \[=\lambda^{\prime}(t)e^{\lambda_{t}}\left\|\sigma_{t}\mathbf{v}_{ \mathbf{\phi}}(\lambda_{t})-\sigma_{t}\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})+ \sigma_{t}^{2}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\frac{d\mathbf{x}_{ \mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right\|_{2}^{2}\] (145) \[=\lambda^{\prime}(t)\alpha_{t}^{2}\left\|\mathbf{v}_{\mathbf{\phi}}( \lambda_{t})-\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})+\sigma_{t}\hat{ \mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\frac{1}{\sigma_{t}}\frac{d\mathbf{x}_{ \mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right\|_{2}^{2} \tag{146}\]
+
+So we get the loss
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{ \epsilon},t\sim U[0,1]}\left[\lambda^{\prime}(t)\alpha_{t}^{2}\left\|\mathbf{v }_{\mathbf{\phi}}(\lambda_{t})-\hat{\mathbf{v}}_{\mathbf{\theta}}(\lambda_{t})+\sigma _{t}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\frac{1}{\sigma_{t}}\frac{d \mathbf{x}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right\|_{2}^{2}\right] \tag{147}\]
+
+### v parameterization of continuous diffusion loss with encoder
+
+We recall our two parameterizations of the encoder
+
+\[\mathbf{x}_{\mathbf{\phi}}(\lambda_{t}) =\mathbf{x}-\sigma_{t}^{2}\mathbf{x}+\sigma_{t}^{2}\mathbf{y}_{ \mathbf{\phi}}(\mathbf{x},\lambda_{t}) \tag{148}\] \[=\alpha_{t}^{2}\mathbf{x}+\sigma_{t}^{2}\mathbf{y}_{\mathbf{\phi}}( \mathbf{x},\lambda_{t}) \tag{149}\]
+
+and
+
+\[\mathbf{x}_{\text{nt}}(\lambda_{t})=\alpha_{t}^{2}\mathbf{x} \tag{150}\]
+
+We see that
+
+\[\frac{d\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}=\alpha_ {t}^{2}\sigma_{t}^{2}\mathbf{x}+\sigma_{t}^{2}\frac{d\mathbf{y}_{\mathbf{\phi}}( \lambda_{t})}{d\lambda_{t}}-\alpha_{t}^{2}\sigma_{t}^{2}\mathbf{y}_{\mathbf{\phi}} \tag{151}\]
+
+and
+
+\[\frac{d\mathbf{x}_{\text{nt}}(\lambda_{t})}{d\lambda_{t}}=\alpha_ {t}^{2}\sigma_{t}^{2}\mathbf{x} \tag{152}\]as mentioned before. We first consider the loss for our trainable encoder. Focusing on the part of Eq. (121) inside the norm, and dropping the dependencies on \(\lambda_{t}\) for brevity, we get
+
+\[\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \hat{\mathbf{x}}_{\mathbf{\theta}}-\frac{1}{\sigma_{t}}\frac{d\mathbf{x}_{\mathbf{\phi} }(\lambda_{t})}{d\lambda_{t}} \tag{153}\] \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \hat{\mathbf{x}}_{\mathbf{\theta}}-\frac{1}{\sigma_{t}}\left(\alpha_{t}^{2}\sigma_{ t}^{2}\mathbf{x}+\sigma_{t}^{2}\frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})}{d \lambda_{t}}-\alpha_{t}^{2}\sigma_{t}^{2}\mathbf{y}_{\mathbf{\phi}}\right)\] (154) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \hat{\mathbf{x}}_{\mathbf{\theta}}-\alpha_{t}^{2}\sigma_{t}\mathbf{x}-\sigma_{t} \frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}+\alpha_{t}^{2}\sigma _{t}\mathbf{y}_{\mathbf{\phi}}\] (155) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}-\alpha_{t}^{2}\mathbf{x}-\frac{d\mathbf{y }_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}+\alpha_{t}^{2}\mathbf{y}_{\mathbf{\phi}}\right)\] (156) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}-\alpha_{t}^{2}\mathbf{x}+(1-\sigma_{t}^{2 })\mathbf{y}_{\mathbf{\phi}}-\frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_ {t}}\right)\] (157) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}-\alpha_{t}^{2}\mathbf{x}-\sigma_{t}^{2} \mathbf{y}_{\mathbf{\phi}}+\mathbf{y}_{\mathbf{\phi}}-\frac{d\mathbf{y}_{\mathbf{\phi}}( \lambda_{t})}{d\lambda_{t}}\right)\] (158) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}-\mathbf{x}_{\mathbf{\phi}}+\mathbf{y}_{\mathbf{ \phi}}-\frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right) \tag{159}\]
+
+So for the trainable encoder, we get the loss
+
+\[\mathcal{L}_{\infty}(\mathbf{x}) =-\frac{1}{2}\mathbb{E}_{\mathbf{\epsilon},t\sim U[0,1]} \tag{160}\] \[\left[\lambda^{\prime}(t)\alpha_{t}^{2}\left\|\mathbf{v}_{t}- \hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t}\left(\hat{\mathbf{x}}_{\mathbf{\theta}} (\lambda_{t})-\mathbf{x}_{\mathbf{\phi}}(\lambda_{t})+\mathbf{y}_{\mathbf{\phi}}( \lambda_{t})-\frac{d\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})}{d\lambda_{t}}\right) \right\|_{2}^{2}\right]\]
+
+For the non-trainable encoder, if we again focus on the part of Eq. (121) inside the norm, and dropping the dependencies on \(\lambda_{t}\) for brevity, we get
+
+\[\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \hat{\mathbf{x}}_{\mathbf{\theta}}-\frac{1}{\sigma_{t}}\frac{d\mathbf{x}_{\text{nt }}(\lambda_{t})}{d\lambda_{t}} \tag{161}\] \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \hat{\mathbf{x}}_{\mathbf{\theta}}-\frac{1}{\sigma_{t}}\left(\alpha_{t}^{2} \sigma_{t}^{2}\mathbf{x}\right)\] (162) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}-\alpha_{t}^{2}\mathbf{x}\right)\] (163) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}-\alpha_{t}^{2}\mathbf{x}\right)\] (164) \[=\mathbf{v}_{\mathbf{\phi}}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}-\mathbf{x}_{\text{nt}}\right) \tag{165}\]
+
+So for the non-trainable encoder, we get the loss
+
+\[\mathcal{L}_{\infty}(\mathbf{x})=-\frac{1}{2}\mathbb{E}_{\mathbf{ \epsilon},t\sim U[0,1]}\left[\lambda^{\prime}(t)\alpha_{t}^{2}\left\|\mathbf{v }_{t}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t}\left(\hat{\mathbf{x}}_{\mathbf{ \theta}}(\lambda_{t})-\mathbf{x}_{\text{nt}}(\lambda_{t})\right)\right\|_{2}^{2}\right] \tag{166}\]
+
+## Appendix L Considering loss for early and late timesteps
+
+Let us consider what happens to the expression inside the norm from our loss Eq. (19) for \(t\) close to zero. We see that since \(\alpha_{t}\to 1\) and \(\sigma_{t}\to 0\) for \(t\to 0\) and \(\hat{\mathbf{v}}_{\mathbf{\theta}}=\alpha_{t}\hat{\mathbf{\epsilon}}_{\mathbf{\theta}}- \sigma_{t}\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})\), we get for the trainable encoder
+
+\[\left\|\mathbf{v}_{t}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\mathbf{x}_{\mathbf{\phi}}( \lambda_{t})+\mathbf{y}_{\mathbf{\phi}}(\lambda_{t})-\frac{d\mathbf{y}_{\mathbf{\phi}}( \lambda_{t})}{d\lambda_{t}}\right)\right\|_{2}^{2} \tag{167}\] \[\rightarrow\left\|\mathbf{v}_{t}-\hat{\mathbf{v}}_{\mathbf{\theta}} \right\|_{2}^{2}=\left\|\mathbf{\epsilon}-\hat{\mathbf{\epsilon}}_{\mathbf{\theta}}\right\|_ {2}^{2} \tag{168}\]
+
+and for the non-trainable encoder
+
+\[\left\|\mathbf{v}_{t}-\hat{\mathbf{v}}_{\mathbf{\theta}}+\sigma_{t} \left(\hat{\mathbf{x}}_{\mathbf{\theta}}(\lambda_{t})-\mathbf{x}_{\mathbf{\phi}}( \lambda_{t})\right)\right\|_{2}^{2} \tag{169}\] \[\rightarrow\left\|\mathbf{v}_{t}-\hat{\mathbf{v}}_{\mathbf{\theta}} \right\|_{2}^{2}=\left\|\mathbf{\epsilon}-\hat{\mathbf{\epsilon}}_{\mathbf{\theta}}\right\|_ {2}^{2} \tag{170}\]So we get the same objective as for the epsilon parameterization used in (Kingma et al., 2021) in both cases. On the other hand, since \(\sigma_{t}\to 1\) as \(t\to 1\), we get for the trainable encoder:
+
+\[\left\|\mathbf{v}_{t}-\hat{\mathbf{v}}_{\boldsymbol{\theta}}+\sigma _{t}\left(\hat{\mathbf{x}}_{\boldsymbol{\theta}}(\lambda_{t})-\mathbf{x}_{ \boldsymbol{\phi}}(\lambda_{t})+\mathbf{y}_{\boldsymbol{\phi}}(\lambda_{t})- \frac{d\mathbf{y}_{\boldsymbol{\phi}}(\lambda_{t})}{d\lambda_{t}}\right)\right\| _{2}^{2} \tag{171}\] \[\rightarrow\left\|\hat{\mathbf{x}}_{\boldsymbol{\theta}}(\lambda_ {t})-2\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})+\mathbf{y}_{\boldsymbol{\phi }}(\lambda_{t})-\frac{d\mathbf{y}_{\boldsymbol{\phi}}(\lambda_{t})}{d\lambda_{ t}}-\hat{\mathbf{v}}_{\boldsymbol{\theta}}\right\|_{2}^{2} \tag{172}\]
+
+Assuming \(\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})\approx\hat{\mathbf{x}}_{ \boldsymbol{\theta}}(\lambda_{t})\), this loss is small at \(t\approx 1\) if:
+
+\[\hat{\mathbf{v}}_{\boldsymbol{\theta}} \approx-\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})+\mathbf{y}_{ \boldsymbol{\phi}}(\lambda_{t})-\frac{d\mathbf{y}_{\boldsymbol{\phi}}(\lambda_ {t})}{d\lambda_{t}} \tag{173}\] \[=-\mathbf{x}+\sigma_{t}^{2}\mathbf{x}-\sigma_{t}^{2}\mathbf{y}_{ \boldsymbol{\phi}}(\mathbf{x},\lambda_{t})+\mathbf{y}_{\boldsymbol{\phi}}( \lambda_{t})-\frac{d\mathbf{y}_{\boldsymbol{\phi}}(\lambda_{t})}{d\lambda_{t}}\] (174) \[\approx-\mathbf{x}+\mathbf{x}-\mathbf{y}_{\boldsymbol{\phi}}( \lambda_{t})+\mathbf{y}_{\boldsymbol{\phi}}(\lambda_{t})-\frac{d\mathbf{y}_{ \boldsymbol{\phi}}(\lambda_{t})}{d\lambda_{t}}\] (175) \[=-\frac{d\mathbf{y}_{\boldsymbol{\phi}}(\lambda_{t})}{d\lambda_{ t}} \tag{176}\]
+
+So we are saying that at \(t=1\), \(\hat{\mathbf{v}}_{\boldsymbol{\theta}}\approx-\frac{d\mathbf{y}_{ \boldsymbol{\phi}}(\lambda_{t})}{d\lambda_{t}}\). Thus the encoder should be able to guide the diffusion model. For the non-trainable encoder, we get
+
+\[\left\|\mathbf{v}_{t}-\hat{\mathbf{v}}_{\boldsymbol{\theta}}+ \sigma_{t}\left(\hat{\mathbf{x}}_{\boldsymbol{\theta}}(\lambda_{t})-\mathbf{x }_{\boldsymbol{\phi}}(\lambda_{t})\right)\right\|_{2}^{2} \tag{177}\] \[\rightarrow\left\|-\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})+ \hat{\mathbf{x}}_{\boldsymbol{\theta}}(\lambda_{t})+\hat{\mathbf{x}}_{ \boldsymbol{\theta}}(\lambda_{t})-\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t}) \right\|_{2}^{2}\] (178) \[=\left\|2\hat{\mathbf{x}}_{\boldsymbol{\theta}}(\lambda_{t})-2 \mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})\right\|_{2}^{2} \tag{179}\]
+
+So in this case, we are just saying that \(\hat{\mathbf{x}}_{\boldsymbol{\theta}}(\lambda_{t})\) should be close to \(\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})\). However, note that since \(\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})=\alpha_{t}^{2}\mathbf{x}\), we have that \(\hat{\mathbf{x}}_{\boldsymbol{\theta}}(\lambda_{t})\approx\mathbf{x}_{ \boldsymbol{\phi}}(\lambda_{t})\approx 0\) for \(t=1\). So this is only saying that it should be easy to guess \(\mathbf{x}_{\boldsymbol{\phi}}(\lambda_{t})\approx 0\) for \(t\approx 1\), but it will not help the diffusion model guessing the signal, since there is no signal left in this case.
+
+## Appendix M Model structure and training
+
+Code will be made public after review.
+
+All our diffusion models use the same overall structure with \(n\) ResNet blocks, then a middle block of 1 ResNet, 1 self attention and 1 ResNet block, and in the end \(n\) more ResNet blocks. Our small diffusion models use \(n=8\) and our large models use \(n=32\). All ResNet blocks in the diffusion models preserve the dimensions of the original images (32x32 for CIFAR-10, 28x28 for MNIST) and have 128 out channels. We use both a fixed noise schedule with \(\lambda_{max}=13.3\) and \(\lambda_{min}=-5\) and a trainable noise schedule where we learn \(\lambda_{max}\) and \(\lambda_{min}\).
+
+For our encoder, we use a very similar overall structure as for the diffusion model. Here we have \(m\) ResNet blocks, then a middle block of 1 ResNet, 1 self attention and 1 ResNet block, and in the end \(m\) more ResNet blocks. However, for the encoder in the small models, we use maxpooling after each of the first \(m\) ResNet blocks and transposed convolution after the last \(m\) ResNet blocks, and for the encoder in the large models, we use maxpooling after every other of the first \(m\) ResNet blocks and transposed convolution after every other of the last \(n\) ResNet blocks. For the small models we use \(m=2\) and for the large models we use \(m=4\). We also trained small models on CIFAR-10 with encoder \(m=4\).
+
+We trained 5 seeds for the small models (diffusion model size 8), except for the diffusion model size 8 encoder size 4 on CIFAR-10 where we trained 3 seeds. We trained 3 seeds for the large models (diffusion model size 32).
+
+For all models we used a batch size of \(128\) and no gradient clipping.
+
+## Appendix N Datasets
+
+We considered three datasets:
+
+* MNIST: The MNIST dataset (LeCun et al., 1998) as fetched by the tensorflow_datasets package1. 60,000 images were used for training and 10,000 images for test. License: Unknown. Footnote 1: [https://www.tensorflow.org/datasets/catalog/cifar10](https://www.tensorflow.org/datasets/catalog/cifar10)
+* CIFAR-10: The CIFAR-10 dataset as fetched from the tensorflow_datasets package2. Originally collected by Krizhevsky et al. (2009). 50,000 images were used for training and 10,000 images for test. License: Unknown. Footnote 2: [https://www.tensorflow.org/datasets/catalog/cifar10](https://www.tensorflow.org/datasets/catalog/cifar10)
+* ImageNet 32\(\times\)32: The official downsampled version of ImageNet (Chrabaszcz et al., 2017) from the ImageNet website: [https://image-net.org/download-images.php](https://image-net.org/download-images.php).
+
+## Appendix O Encoder examples on MNIST
+
+Fig. 4 provides an example of the encodings we get from MNIST when using DiffEnc with a learned encoder.
+
+## Appendix P Samples from models
+
+Examples of samples from our large trained models, DiffEnc-32-4 and VDMv-32, can be seen in Fig. 5.
+
+## Appendix Q Using a Larger Encoder for a Small Diffusion Model
+
+As we can observe in Table 5, when the encoder's size is increased, the average diffusion loss is slightly smaller than that of VDM, albeit not significantly. We propose the following two potential
+
+Figure 4: Encoded MNIST images from DiffEnc-8-2. Encoded images are close to the identity up to \(t=0.7\). From \(t=0.8\) to \(t=0.9\) the encoder slightly blurs the numbers, and from \(t=0.9\) it makes the background lighter, but keeps the high contrast in the middle of the image. Intuitively, the encoder improves the latent loss by bringing the average pixel value close to 0.
+
+explanations for this phenomenon: (1) Longer training may be needed to achieve a significant difference. For DiffEnc-32-4 and VDMv-32, we saw different trends in the loss after about 2 million steps, where the loss of the DiffEnc models decreased more per step. However, it took more training with this trend to achieve a substantial divergence in diffusion loss. (2) a larger diffusion model may be required to fully exploit the encoder.
+
+## Appendix R FID Scores
+
+Although we did not optimize our model for the visual quality of samples, we provide FID scores of DiffEnc-32-4 and VDMv-32 on CIFAR-10 in Table 6. We see from these, that the FID scores for the two models are similar and that it makes a big difference to the score whether we use the train or test set to calculate it and how many samples we use from the model. The scores are better when using more samples from the model and better when calculating with respect to the train set that with respect to the test set.
+
+\begin{table}
+\begin{tabular}{c c c c c} \hline \hline
+**Model** & **FID 10K train** & **FID 10K test** & **FID 50K train** & **FID 50K test** \\ \hline VDMv-32 & \(14.8\pm 0.2\) & \(18.9\pm 0.2\) & \(11.2\pm 0.2\) & \(14.9\pm 0.2\) \\ DiffEnc-32-4 & \(14.6\pm 0.8\) & \(18.5\pm 0.7\) & \(11.1\pm 0.8\) & \(15.0\pm 0.7\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 6: Comparison of the mean FID scores with standard error for DiffEnc-32-4 and VDMv-32 on CIFAR-10 with fixed noise schedule after 8M steps. 3 seeds. We provide both FID scores on 10K and 50K samples and with respect to both train and test set.
+
+Figure 5: 100 unconditional samples from a DiffEnc-32-4 (above) and VDMv-32 (below) after 8 million training steps.
+
+\begin{table}
+\begin{tabular}{c c c c c} \hline \hline
+**Model** & **Total** & **Latent** & **Diffusion** & **Reconstruction** \\ \hline VDMv-8 & \(2.794\pm 0.004\) & \(0.0012\pm 0.0\) & \(2.782\pm 0.004\) & \(0.010\pm(1\times 10^{-5})\) \\ DiffEnc-8-4 & \(2.789\pm 0.002\) & \(0.0006\pm(2\times 10^{-6})\) & \(2.778\pm 0.002\) & \(0.010\pm(1\times 10^{-5})\) \\ \hline \hline \end{tabular}
+\end{table}
+Table 5: Comparison of the different components of the loss for DiffEnc-8-4 and VDMv-8 on CIFAR-10 with fixed noise schedule after 1.3M steps. All quantities are in bits per dimension (BPD), with standard error, 3 seeds for DiffEnc-8-4, 5 seeds for VDMv-8.
+
+## Appendix S Sum heatmap of all timesteps
+
+A heatmap over the changes to \(\mathbf{x}_{t}\) for all timesteps \(t\) and all ten CIFAR-10 classes can be found in Fig. 6. Recall in the following that all pixel values are scaled to the range \((-1,1)\) before they are given as input to the model. The DiffEnc model with a trainable encoder is initialized with \(\mathbf{y}_{\phi}(\lambda_{t})=0\), that is, with no contribution from the trainable part. This means that if we had made this heatmap at initialization, the images would be blue where values in the channels are more than 0, red where values are less than 0 and white where values are zero. However, we see that after training, the encoder has a different behaviour around edges for \(t<0.8\). For example, there is a white line in the middle of the cat in the second row which is not subtracted from, probably to preserve this edge in the image, and there is an extra "outline" around the whole cat. We also see that for \(t>0.8\), the encoder gets a much more general behaviour. In the fourth row, we see that the encoder adds to the entire middle of the image including the white line on the horse, which would have been subtracted from, if it had had the same behaviour as at initialisation. Thus, we see that the encoder learns to do something different from how it was initialised, and what it learns is different for different timesteps.
+
+Figure 6: Change of encoded image over a range of depths: \((\mathbf{x}_{t}-\mathbf{x}_{s})/(t-s)\) for \(t=0.1,...,1.0\) and \(s=t-0.1\). Changes have been summed over the channels with red and blue denoting positive and negative changes, respectively. For \(t\) closer to 0 the changes are finer and seem to be enhancing high-contrast edges, but for \(t\to 1\) they become more global.
