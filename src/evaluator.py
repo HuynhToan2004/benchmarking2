@@ -88,63 +88,125 @@ EXAMPLE OF MACRO_TOPIC FIELD:
 "macro_topic": "4. Experimental Design & Evaluation - Missing/Weak Baselines"""
         self.prompt_step2 = """
 SYSTEM PROMPT (STEP 2):
-You are an objective and rigorous academic adjudicator. You will be provided with the FULL TEXT of a submitted scientific paper and a JSON list of "Micro-flaws" raised by various reviewers.
+You are a strict and objective Meta-Reviewer in a top-tier Computer Science conference. You will be provided with the FULL TEXT of a submitted scientific paper and a JSON list of "Micro-flaws" raised by various reviewers.
 
 Your task is to independently verify each Micro-flaw against the paper's text.
-For EACH Micro-flaw, answer two questions based STRICTLY on the paper's content and the exact raw arguments provided:
-1. is_valid (True/False): Does this flaw actually exist in the paper? Is the reviewer's argument factually correct and a valid scientific criticism? (Return False if it's a hallucination, a misunderstanding, or an unreasonable request).
-2. severity ("Critical" / "Minor"): If valid, does this flaw severely undermine the paper's core claims, methodology, or results (Critical)? Or is it a surface-level issue like formatting, typos, or minor clarifications (Minor)? If is_valid is False, set severity to "None".
+For EACH Micro-flaw, answer two questions based STRICTLY on the paper's content:
+1. is_valid (True/False): Does this flaw actually exist in the paper? Is the reviewer's argument factually correct? (Return False if it's a hallucination, a misunderstanding, or an unreasonable request).
+2. severity ("Critical" / "Minor"): If valid, you MUST assign a strict severity label based on the predefined ontology below.
 
-OUTPUT FORMAT:
-You MUST output a valid JSON object strictly matching this schema:
+ONTOLOGY FOR SEVERITY MAPPING:
+Assign CRITICAL if the flaw falls into these categories:
+- Methodology & Theoretical Soundness: Weak Theoretical Justification/Proofs, Methodological Flaws, Strong/Unrealistic Assumptions, Lack of Intuition/Justification.
+- Experimental Design & Evaluation: Missing/Weak Baselines, Insufficient Experimental Validation, Questionable Evaluation Metrics, Limited/Biased Datasets.
+- Novelty & Contribution: Limited Novelty, Incremental Contribution Only, Lack of Significance/Impact.
+- Applicability & Reproducibility (Severe): General Applicability Issues, Scalability & Complexity Concerns, General Reproducibility Concerns.
+- Related Work (Severe): Missing Empirical Comparisons with Prior Work.
+
+Assign MINOR if the flaw falls into these categories:
+- Clarity & Presentation: General writing & Clarity issues, Unclear Math/Notations (ambiguous symbols, not fundamentally wrong math), Poor Figures/Tables Quality, Grammar & Typos.
+- Applicability & Limitations (Textual): Lack of Discussion on Limitations, Missing Broader Impact/Ethical Concerns.
+- Related Work & Citations: Missing Relevant Citations, Missing Recent/Concurrent Works.
+- Reproducibility & Open Science (Documentation): Insufficient Implementation Details (e.g., missing hyperparameters in the appendix), Missing Code/Data Repository.
+
+CRUCIAL RULE: Do not guess. If fixing the flaw requires the authors to run new experiments or correct core mathematical equations, it is CRITICAL. If it only requires editing the text, formatting, or adding a reference, it is MINOR. If is_valid is False, set severity to "None".
+
+OUTPUT FORMAT (Strict JSON):
 {
   "evaluations": {
     "F01": {
       "is_valid": true,
-      "severity": "Critical",
+      "severity": "Critical"
     },
-    "F02": { ... }
+    "F02": {
+      "is_valid": true,
+      "severity": "Minor"
+    }
   }
 }"""
 
+    # def step1_atomize_and_group(self, human_reviews: Dict[str, str], llm_review: str) -> dict:
+    #     """
+    #     Input: 
+    #         human_reviews: dict format {"Human_1": "text...", "Human_2": "text..."}
+    #         llm_review: string chứa review của LLM
+    #     """
+    #     # Trộn input
+    #     input_text = ""
+    #     for reviewer_id, review_text in human_reviews.items():
+    #         input_text += f"\n\n[REVIEWER: {reviewer_id}]\n{review_text}"
+    #     input_text += f"\n\n[REVIEWER: LLM_Reviewer]\n{llm_review}"
+
+    #     response = self.client.chat.completions.create(
+    #         model="gpt-5-mini",
+    #         response_format={"type": "json_object"}, # Ép trả về chuẩn JSON
+    #         messages=[
+    #             {"role": "system", "content": self.prompt_step1},
+    #             {"role": "user", "content": f"Here are the reviews to analyze:\n{input_text}"}
+    #         ],
+    #         # temperature=0.1,
+    #     )
+    #     return json.loads(response.choices[0].message.content)
+
+    # def step2_judge_flaws(self, paper_text: str, micro_flaws_json: dict) -> dict:
+    #     """
+    #     Input: Text của bài báo gốc và file JSON kết quả từ Step 1
+    #     """
+    #     flaws_str = json.dumps(micro_flaws_json, indent=2)
+    #     input_text = f"[PAPER TEXT]\n{paper_text[:20000]}...\n\n[MICRO-FLAWS]\n{flaws_str}" # Cắt bớt nếu paper quá dài so với context window
+
+    #     response = self.client.chat.completions.create(
+    #         model="gpt-4o", # Nên dùng model mạnh hơn cho bước này
+    #         response_format={"type": "json_object"},
+    #         messages=[
+    #             {"role": "system", "content": self.prompt_step2},
+    #             {"role": "user", "content": input_text}
+    #         ],
+    #         temperature=0.0,
+    #     )
+    #     return json.loads(response.choices[0].message.content)
     def step1_atomize_and_group(self, human_reviews: Dict[str, str], llm_review: str) -> dict:
         """
-        Input: 
-            human_reviews: dict format {"Human_1": "text...", "Human_2": "text..."}
-            llm_review: string chứa review của LLM
+        Gộp và phân tách các luận điểm đánh giá (Sử dụng gpt-5-mini)
         """
-        # Trộn input
         input_text = ""
         for reviewer_id, review_text in human_reviews.items():
             input_text += f"\n\n[REVIEWER: {reviewer_id}]\n{review_text}"
         input_text += f"\n\n[REVIEWER: LLM_Reviewer]\n{llm_review}"
 
+        print("  [INFO] Calling gpt-5-mini for Step 1 (Atomize & Group)...")
         response = self.client.chat.completions.create(
             model="gpt-5-mini",
-            response_format={"type": "json_object"}, # Ép trả về chuẩn JSON
+            response_format={"type": "json_object"}, 
             messages=[
                 {"role": "system", "content": self.prompt_step1},
                 {"role": "user", "content": f"Here are the reviews to analyze:\n{input_text}"}
             ],
-            # temperature=0.1,
+            # temperature=0.1, # Giữ temperature thấp để JSON ổn định
         )
         return json.loads(response.choices[0].message.content)
 
     def step2_judge_flaws(self, paper_text: str, micro_flaws_json: dict) -> dict:
         """
-        Input: Text của bài báo gốc và file JSON kết quả từ Step 1
+        Thẩm định lỗi và Gán nhãn Severity (Sử dụng gpt-5-mini)
         """
         flaws_str = json.dumps(micro_flaws_json, indent=2)
-        input_text = f"[PAPER TEXT]\n{paper_text[:20000]}...\n\n[MICRO-FLAWS]\n{flaws_str}" # Cắt bớt nếu paper quá dài so với context window
+        
+        # CẮT NGẮN CONTEXT: Đảm bảo không vượt quá giới hạn token của model mini
+        # Bạn có thể tăng con số 30000 lên nếu gpt-5-mini hỗ trợ context window lớn hơn
+        safe_paper_text = paper_text[:30000] 
+        
+        input_text = f"[PAPER TEXT]\n{safe_paper_text}\n\n[MICRO-FLAWS]\n{flaws_str}"
 
+        print("  [INFO] Calling gpt-5-mini for Step 2 (Judge & Label Severity)...")
         response = self.client.chat.completions.create(
-            model="gpt-4o", # Nên dùng model mạnh hơn cho bước này
+            model="gpt-5-mini", 
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": self.prompt_step2},
                 {"role": "user", "content": input_text}
             ],
-            temperature=0.0,
+            # temperature=0.0, # Đặt bằng 0.0 để model chấm điểm khách quan và nhất quán tuyệt đối
         )
         return json.loads(response.choices[0].message.content)
 

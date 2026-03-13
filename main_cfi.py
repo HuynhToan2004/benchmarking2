@@ -10,13 +10,14 @@ from src.utils import (
 )
 # Giả sử class ReviewEvaluatorPipeline và MetricsCalculator bạn đã lưu trong file evaluator.py
 from src.evaluator import ReviewEvaluatorPipeline, MetricsCalculator
-
+# Sửa lại dòng import này ở đầu file của bạn
+from src.cfi.metrics import DecoupledMetricsCalculator
 # --- CẤU HÌNH ĐƯỜNG DẪN TỪ HỆ THỐNG CỦA BẠN ---
 HUMAN_FOLDER = r".\data\Human_and_meta_reviews" 
 SEA_FOLDER = r".\data\SEA_reviews"
 MMD_FOLDER = r".\data\paper_nougat_mmd"
 OUTPUT_DIR = r".\output_cfi"
-API_KEY = "nhap api vo day ne"
+API_KEY = "dien api day"
 
 def process_single_paper(paper_id, h_path, llm_path, pipeline):
     print(f"\n--- Đang xử lý Paper ID: {paper_id} ---")
@@ -31,7 +32,6 @@ def process_single_paper(paper_id, h_path, llm_path, pipeline):
     human_reviews_dict = {}
     
     # Giả định human_data là một List các dict chứa review của từng người.
-    # Nếu cấu trúc file JSON của bạn khác, bạn cần điều chỉnh vòng for này một chút.
     human_list = human_data.get("reviews", []) if isinstance(human_data, dict) else human_data
     
     for idx, review_obj in enumerate(human_list):
@@ -52,10 +52,21 @@ def process_single_paper(paper_id, h_path, llm_path, pipeline):
     print(">> Step 2: LLM Judging True/False & Critical/Minor...")
     step2_evals = pipeline.step2_judge_flaws(paper_content, step1_flaws)
     
-    # 6. Tính toán Metrics
-    print(">> Step 3: Calculating Metrics...")
-    calculator = MetricsCalculator(step1_flaws, step2_evals)
-    report = calculator.generate_report(human_ids)
+    # 6. Tính toán Metrics bằng công thức Decoupled mới
+    print(">> Step 3: Calculating Decoupled Metrics...")
+    
+    # Tính N (Tổng số reviewer) = Số lượng Human + 1 (LLM)
+    total_reviewers = len(human_ids) + 1
+    
+    # Gọi class mới
+    calculator = DecoupledMetricsCalculator(
+        micro_flaws_json=step1_flaws, 
+        evaluations_json=step2_evals,
+        total_reviewers_count=total_reviewers
+    )
+    
+    # Sử dụng hàm generate_final_report thay cho generate_report cũ
+    report = calculator.generate_final_report(human_ids)
     
     # Trả về kết quả gộp để lưu lại
     return {
